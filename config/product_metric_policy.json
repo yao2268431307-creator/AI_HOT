@@ -1,0 +1,86 @@
+{
+  "version": "product-metrics-2026-07-rc2.7",
+  "status": "frozen_for_beta_collection",
+  "frozenAt": "2026-07-17T03:25:00+08:00",
+  "timezone": "Asia/Shanghai",
+  "dutyWindows": [
+    {
+      "weekdays": [0, 1, 2, 3, 4],
+      "start": "09:00",
+      "end": "18:00"
+    }
+  ],
+  "reviewableLifecycleStates": [
+    "detected",
+    "emerging",
+    "accelerating",
+    "established",
+    "cooling"
+  ],
+  "strongAlertAcceptanceWindowDutyMinutes": 540,
+  "firstTriageSlaMinutes": 15,
+  "activeReviewTargetSeconds": 300,
+  "minimumAlertQualityReviewCoverage": 1.0,
+  "minimumActiveReviewTelemetryCoverage": 0.95,
+  "minimumServerHeartbeatCoverage": 0.8,
+  "minimumServerMeasuredReviewSeconds": 5,
+  "foregroundIdleTimeoutSeconds": 60,
+  "foregroundTickCapSeconds": 5,
+  "targets": {
+    "strongAlertAcceptanceRate": 0.6,
+    "erroneousStrongAlertsPerWorkday": 3.0,
+    "erroneousStrongAlertRate": 0.3,
+    "firstTriageWithinSlaRate": 0.8
+  },
+  "minimumSamples": {
+    "strongAlerts": 30,
+    "alertWorkdays": 5,
+    "triageEvents": 50,
+    "completedReviews": 50
+  },
+  "manualEvaluation": {
+    "manualSchemaVersion": "manual-product-evaluation-v1.3",
+    "manualSchemaDigest": "sha256:100cddc27f0229b9313bdd253dc9274f1e4174cd3b943394ade4d7d28acfe8dd",
+    "preregistrationSchemaVersion": "manual-product-preregistration-v2",
+    "preregistrationSchemaDigest": "sha256:0a3d5bdb50d7812441d68fa5b523e1ab94bb2bcfc83dd079a34755d662f8657e",
+    "snapshotTimezone": "Asia/Shanghai",
+    "snapshotLocalTime": "09:00",
+    "snapshotTimeToleranceMinutes": 5,
+    "requiredThresholdVersion": "thresholds-2026-07-rc2",
+    "precisionAt5Target": 0.7,
+    "precisionAt5MinimumCiLow": 0.7,
+    "minimumSnapshots": 7,
+    "candidatesPerSnapshot": 5,
+    "intervalMethod": "bootstrap",
+    "confidenceLevel": 0.95,
+    "minimumBootstrapIterations": 1000,
+    "minimumDiscoveryLeadEvents": 30,
+    "minimumMedianDiscoveryLeadMinutes": 30,
+    "leadEligibilityRuleVersion": "lead-threshold-v1",
+    "leadMinimumAttention": 60,
+    "leadMinimumCoverage": 60,
+    "leadLifecycleStates": ["emerging", "accelerating", "established"]
+  },
+  "acceptanceMonitoring": {
+    "monitorVersion": "acceptance-monitor-v1.1",
+    "monitorDigest": "sha256:e315719ac7a4741c35bd4257860b8f45b2a13f4e2f83b4f6345ecb630ab75d83",
+    "keyringVersion": "acceptance-keys-2026-07-rc2.3",
+    "keyringDigest": "sha256:17fe0368defef907375ac86dfb9a721ece1eef7a8acb5cf27b920d7109d5826a",
+    "keyringFrozenAt": "2026-07-17T03:23:00+08:00",
+    "cadenceSeconds": 900,
+    "minimumDistinctConnectorFamilies": 4,
+    "requiredSignalFamilies": ["discussion", "behavior"],
+    "requireNonzeroConnectorObservations": true
+  },
+  "errorVerdicts": [
+    "insufficient_evidence",
+    "incorrect_cluster",
+    "out_of_scope"
+  ],
+  "notes": [
+    "Frozen before collection of a real Beta outcome set; demo and synthetic test rows are not acceptance evidence.",
+    "System-fault duplicate exclusions require an immutable Owner-authored exclusion record and are always reported separately.",
+    "Active review time is counted from authenticated, server-received heartbeat states only when a durable feedbackId is linked; client duration totals are ignored.",
+    "Server-observed heartbeat wall time is retained as an anti-understatement guardrail and is not itself evidence of foreground attention."
+  ]
+}

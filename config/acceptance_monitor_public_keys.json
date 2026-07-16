@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "acceptance-ed25519-keyring-v1",
+  "keyringVersion": "acceptance-keys-2026-07-rc2.3",
+  "frozenAt": "2026-07-17T03:23:00+08:00",
+  "schedulerKeys": [],
+  "reviewerKeys": [],
+  "baselineKeys": [],
+  "ledgerKeys": []
+}

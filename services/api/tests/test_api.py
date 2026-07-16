@@ -59,9 +59,15 @@ def test_radar_window_filters_event_timelines_and_old_events() -> None:
 
 def test_feedback_watchlist_and_unknown_event() -> None:
     with client() as http:
-        accepted = http.post("/api/v1/feedback", json={"eventId": "evt-open-model", "action": "confirm", "reason": "证据链完整且跨平台同步"})
+        context = http.get("/api/v1/events/evt-open-model").json()["decisionContext"]
+        accepted = http.post("/api/v1/feedback", json={"eventId": "evt-open-model", "action": "confirm", "reason": "证据链完整且跨平台同步", **context})
         assert accepted.status_code == 202
         assert accepted.json()["accepted"] is True
+        stale = http.post("/api/v1/feedback", json={
+            "eventId": "evt-open-model", "action": "reject", "reason": "stale context must not be rebound",
+            "queueEligibilityKey": "queue-key-does-not-exist",
+        })
+        assert stale.status_code == 409
 
         watched = http.post("/api/v1/watchlists", json={"eventId": "evt-open-model", "note": "持续观察"})
         assert watched.status_code == 201
@@ -113,6 +119,76 @@ def test_product_interactions_capture_review_funnel_without_trusting_workspace_i
         }).status_code == 404
 
 
+def test_operational_endpoints_report_duplicate_rate_and_collection_to_scoring_sla() -> None:
+    repository = InMemoryRepository()
+    current = datetime.now(timezone.utc)
+    repository.record_connector_run(
+        "rss", current - timedelta(minutes=2), current - timedelta(minutes=1),
+        "healthy", inserted=9, duplicates=1, coverage=90,
+    )
+    item = Observation(
+        id="sla-observation", platform="RSS", externalId="sla-observation", sourceId="source-a",
+        publishedAt=current - timedelta(minutes=12), collectedAt=current - timedelta(minutes=10),
+        language="en", title="SLA event", text="A processing latency fact", url="https://example.com/sla",
+        metrics={}, rawEvidenceRef="r2://raw/sla-observation", contentFingerprint="sla-fingerprint",
+        signalFamily="official", relation="original",
+    )
+    assert repository.save_observation_with_outbox(item)
+    revision = repository.claim_observation_processing(item.id)
+    assert revision == 1
+    repository.complete_observation_processing(item.id, revision)
+    duplicate = item.model_copy(update={
+        "id": "sla-observation-copy", "external_id": "sla-observation-copy",
+        "collected_at": current - timedelta(minutes=9), "raw_evidence_ref": "r2://raw/sla-observation-copy",
+    })
+    assert repository.save_observation_with_outbox(duplicate)
+
+    with TestClient(create_app(repository)) as http:
+        connector_payload = http.get("/api/v1/operations/connector-runs?hours=1").json()
+        rss = next(row for row in connector_payload["summary"] if row["connectorId"] == "rss")
+        assert rss["runs"] == 1
+        assert rss["duplicateRate"] == 0.1
+        assert rss["healthyRunRate"] == 1
+
+        pipeline = http.get("/api/v1/operations/pipeline-sla?hours=1").json()
+        assert pipeline["metricScope"] == "collection_to_scoring_completion"
+        assert pipeline["sample"] == 1
+        assert pipeline["within15Minutes"] == 1
+        assert pipeline["rate"] == 1
+        assert pipeline["passesTarget"] is True
+
+        quality = http.get("/api/v1/operations/data-quality?hours=1").json()
+        assert quality["metricScope"] == "persisted_within_connector_content_fingerprint_duplicates"
+        assert quality["sample"] == 2
+        assert quality["persistedDuplicates"] == 1
+        assert quality["rate"] == 0.5
+        assert quality["passesTarget"] is False
+
+
+def test_coalesced_processing_revisions_each_receive_a_completion_fact() -> None:
+    repository = InMemoryRepository()
+    current = datetime.now(timezone.utc)
+    first = Observation(
+        id="coalesced-observation", platform="GitHub", externalId="repo-a", sourceId="source-a",
+        publishedAt=current, collectedAt=current, language="en", title="Repository", text="metric revisions",
+        url="https://github.com/example/repo", metrics={"stars": 10},
+        rawEvidenceRef="r2://raw/coalesced-1", contentFingerprint="coalesced-fingerprint",
+        signalFamily="behavior", relation="original",
+    )
+    second = first.model_copy(update={
+        "collected_at": current + timedelta(minutes=1), "metrics": {"stars": 12},
+        "raw_evidence_ref": "r2://raw/coalesced-2",
+    })
+    assert repository.save_observation_with_outbox(first)
+    assert repository.save_observation_with_outbox(second)
+    revision = repository.claim_observation_processing(first.id)
+    assert revision == 2
+    repository.complete_observation_processing(first.id, revision)
+    history = repository.list_observation_processing_history(current - timedelta(minutes=1))
+    assert [row["revision"] for row in history] == [1, 2]
+    assert all(row["completedAt"] is not None for row in history)
+
+
 def test_role_enforcement_when_auth_is_enabled(monkeypatch) -> None:
     keys = {
         "viewer-key": {"subject": "viewer", "role": "VIEWER", "workspaceId": "workspace-a"},
@@ -125,9 +201,10 @@ def test_role_enforcement_when_auth_is_enabled(monkeypatch) -> None:
     with client() as http:
         assert http.get("/api/v1/radar").status_code == 401
         assert http.get("/api/v1/radar", headers={"X-API-Key": "viewer-key"}).status_code == 200
-        denied = http.post("/api/v1/feedback", headers={"X-API-Key": "viewer-key"}, json={"eventId": "evt-open-model", "action": "confirm", "reason": "viewer cannot edit"})
+        context = http.get("/api/v1/events/evt-open-model", headers={"X-API-Key": "analyst-key"}).json()["decisionContext"]
+        denied = http.post("/api/v1/feedback", headers={"X-API-Key": "viewer-key"}, json={"eventId": "evt-open-model", "action": "confirm", "reason": "viewer cannot edit", **context})
         assert denied.status_code == 403
-        allowed = http.post("/api/v1/feedback", headers={"X-API-Key": "analyst-key"}, json={"eventId": "evt-open-model", "action": "confirm", "reason": "analyst can edit"})
+        allowed = http.post("/api/v1/feedback", headers={"X-API-Key": "analyst-key"}, json={"eventId": "evt-open-model", "action": "confirm", "reason": "analyst can edit", **context})
         assert allowed.status_code == 202
         global_change = http.post(
             "/api/v1/events/evt-benchmark/behavior-applicability",
@@ -185,7 +262,7 @@ def test_revised_assessment_contract_exposes_na_masks_and_non_precise_strength()
         assert coverage["budget"] == {"currency": "CNY", "spent": 0, "limit": 2000, "remaining": 2000}
         youtube = next(item for item in coverage["connectors"] if item["id"] == "youtube")
         assert youtube["quotaUsed"] == 7200
-        assert youtube["rightsStatus"] == "experimental"
+        assert youtube["rightsStatus"] == "blocked"
 
 
 def test_analyst_can_explicitly_mark_research_behavior_not_applicable() -> None:

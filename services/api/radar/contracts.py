@@ -6,7 +6,7 @@ import ipaddress
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 def _clickable_http_url(value: str) -> str:
@@ -290,7 +290,7 @@ class ConnectorStatus(BaseModel):
     quota_used: float | None = Field(default=None, alias="quotaUsed", ge=0)
     quota_limit: float | None = Field(default=None, alias="quotaLimit", gt=0)
     cost_rmb_month: float | None = Field(default=None, alias="costRmbMonth", ge=0)
-    rights_status: Literal["active", "experimental", "blocked"] = Field(default="active", alias="rightsStatus")
+    rights_status: Literal["active", "pending", "experimental", "blocked"] = Field(default="pending", alias="rightsStatus")
 
     model_config = {"populate_by_name": True}
 
@@ -309,8 +309,16 @@ class FeedbackRequest(BaseModel):
     action: Literal["confirm", "reject", "observe", "merge", "split", "ignore"]
     reason: str = Field(min_length=3, max_length=2000)
     target_event_id: str | None = Field(default=None, alias="targetEventId")
+    queue_eligibility_key: str | None = Field(default=None, alias="queueEligibilityKey", min_length=8, max_length=128)
+    alert_delivery_key: str | None = Field(default=None, alias="alertDeliveryKey", min_length=8, max_length=256)
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def require_explicit_decision_context(self) -> FeedbackRequest:
+        if self.action in {"confirm", "reject", "observe"} and not self.queue_eligibility_key:
+            raise ValueError("triage feedback requires the queueEligibilityKey captured when detail opened")
+        return self
 
 
 class BehaviorApplicabilityRequest(BaseModel):
@@ -352,14 +360,162 @@ class WatchlistItem(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MetricIncidentRequest(BaseModel):
+    event_id: str = Field(alias="eventId", min_length=3, max_length=300)
+    target_key: str = Field(alias="targetKey", min_length=8, max_length=300)
+    canonical_key: str = Field(alias="canonicalKey", min_length=8, max_length=300)
+    cause: Literal["worker_retry_after_timeout", "delivery_ack_race", "provider_duplicate_callback"]
+    note: str = Field(min_length=3, max_length=1000)
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def different_delivery_keys(self) -> MetricIncidentRequest:
+        if self.target_key == self.canonical_key:
+            raise ValueError("targetKey and canonicalKey must differ")
+        return self
+
+
 class ProductInteractionRequest(BaseModel):
-    kind: Literal["detail_opened", "evidence_opened", "triage_submitted", "watch_toggled", "alert_acknowledged"]
+    kind: Literal[
+        "detail_opened",
+        "evidence_opened",
+        "triage_submitted",
+        "review_segment_closed",
+        "review_heartbeat",
+        "watch_toggled",
+        "alert_acknowledged",
+        "queue_eligible",
+        "alert_quality_reviewed",
+        "metric_exclusion_recorded",
+        "metric_exclusion_reinstated",
+    ]
     idempotency_key: str = Field(alias="idempotencyKey", min_length=8, max_length=128)
     session_id: str = Field(alias="sessionId", min_length=8, max_length=128)
     event_id: str | None = Field(default=None, alias="eventId", max_length=300)
     metadata: dict[str, str | float | bool] = Field(default_factory=dict, max_length=20)
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def validate_metric_metadata(self) -> ProductInteractionRequest:
+        metadata = self.metadata
+        if self.kind == "triage_submitted":
+            if metadata.get("action") not in {"confirm", "reject", "observe"}:
+                raise ValueError("triage_submitted requires a valid action")
+            if metadata.get("measurementVersion") == "server-heartbeat-v2":
+                required_v2 = {
+                    "feedbackId", "measurementVersion", "idleTimeoutSeconds", "tickCapSeconds",
+                    "reviewAttemptId", "queueEligibilityKey", "segmentId",
+                }
+                if not required_v2.issubset(metadata):
+                    raise ValueError("server-timed triage requires the complete timing envelope")
+                if not all(isinstance(metadata.get(key), str) and len(str(metadata[key])) >= 8 for key in ("feedbackId", "reviewAttemptId", "queueEligibilityKey", "segmentId")):
+                    raise ValueError("server-timed triage identifiers are invalid")
+                return self
+            timing_keys = {
+                "feedbackId", "activeSeconds", "externalWaitSeconds", "measurementVersion",
+                "idleTimeoutSeconds", "tickCapSeconds", "reviewAttemptId", "queueEligibilityKey",
+            }
+            if timing_keys & metadata.keys():
+                if not timing_keys.issubset(metadata):
+                    raise ValueError("timed triage requires the complete timing envelope")
+                if not isinstance(metadata.get("feedbackId"), str) or len(str(metadata["feedbackId"])) < 8:
+                    raise ValueError("timed triage requires feedbackId")
+                if not all(isinstance(metadata.get(key), str) and len(str(metadata[key])) >= 8 for key in ("reviewAttemptId", "queueEligibilityKey")):
+                    raise ValueError("timed triage requires reviewAttemptId and queueEligibilityKey")
+                if metadata.get("measurementVersion") not in {"foreground-active-v1", "server-heartbeat-v2"}:
+                    raise ValueError("timed triage requires a supported measurement version")
+                if metadata.get("measurementVersion") == "server-heartbeat-v2" and (
+                    not isinstance(metadata.get("segmentId"), str) or len(str(metadata["segmentId"])) < 8
+                ):
+                    raise ValueError("server-timed triage requires segmentId")
+                for key in ("activeSeconds", "externalWaitSeconds"):
+                    value = metadata.get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= float(value) <= 28800:
+                        raise ValueError(f"{key} must be between 0 and 28800")
+                for key in ("idleTimeoutSeconds", "tickCapSeconds"):
+                    value = metadata.get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 1 <= float(value) <= 600:
+                        raise ValueError(f"{key} must be between 1 and 600")
+        elif self.kind == "review_segment_closed":
+            if metadata.get("measurementVersion") == "server-heartbeat-v2":
+                required_v2 = {
+                    "reviewAttemptId", "queueEligibilityKey", "segmentId", "measurementVersion",
+                    "idleTimeoutSeconds", "tickCapSeconds",
+                }
+                if not self.event_id or not required_v2.issubset(metadata):
+                    raise ValueError("server-timed review segment requires the complete envelope")
+                if not all(isinstance(metadata.get(key), str) and len(str(metadata[key])) >= 8 for key in ("reviewAttemptId", "queueEligibilityKey", "segmentId")):
+                    raise ValueError("server-timed review segment identifiers are invalid")
+                return self
+            required = {
+                "reviewAttemptId", "queueEligibilityKey", "activeSeconds", "externalWaitSeconds",
+                "measurementVersion", "idleTimeoutSeconds", "tickCapSeconds",
+            }
+            if not self.event_id or not required.issubset(metadata):
+                raise ValueError("review_segment_closed requires a linked review attempt and timing fields")
+            if not all(isinstance(metadata.get(key), str) and len(str(metadata[key])) >= 8 for key in ("reviewAttemptId", "queueEligibilityKey")):
+                raise ValueError("review segment identifiers are invalid")
+            if metadata.get("measurementVersion") not in {"foreground-active-v1", "server-heartbeat-v2"}:
+                raise ValueError("review segment requires a supported measurement version")
+            if metadata.get("measurementVersion") == "server-heartbeat-v2" and (
+                not isinstance(metadata.get("segmentId"), str) or len(str(metadata["segmentId"])) < 8
+            ):
+                raise ValueError("server-timed review segment requires segmentId")
+            for key in ("activeSeconds", "externalWaitSeconds"):
+                value = metadata.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= float(value) <= 28800:
+                    raise ValueError(f"{key} must be between 0 and 28800")
+        elif self.kind == "review_heartbeat":
+            required = {
+                "reviewAttemptId", "queueEligibilityKey", "segmentId", "sequence",
+                "state", "measurementVersion", "idleTimeoutSeconds", "tickCapSeconds",
+            }
+            if not self.event_id or not required.issubset(metadata):
+                raise ValueError("review heartbeat requires the complete server-timed envelope")
+            if not all(isinstance(metadata.get(key), str) and len(str(metadata[key])) >= 8 for key in ("reviewAttemptId", "queueEligibilityKey", "segmentId")):
+                raise ValueError("review heartbeat identifiers are invalid")
+            if metadata.get("measurementVersion") != "server-heartbeat-v2":
+                raise ValueError("review heartbeat requires server-heartbeat-v2")
+            sequence = metadata.get("sequence")
+            if isinstance(sequence, bool) or not isinstance(sequence, (int, float)) or int(sequence) != sequence or not 0 <= int(sequence) <= 100000:
+                raise ValueError("review heartbeat sequence is invalid")
+            if metadata.get("state") not in {"active", "idle", "external_wait"}:
+                raise ValueError("review heartbeat state is invalid")
+        elif self.kind == "queue_eligible":
+            if not self.event_id or not isinstance(metadata.get("eligibilityKey"), str) or len(str(metadata["eligibilityKey"])) < 8:
+                raise ValueError("queue_eligible requires eventId and eligibilityKey")
+            if not isinstance(metadata.get("policyVersion"), str):
+                raise ValueError("queue_eligible requires policyVersion")
+        elif self.kind == "alert_quality_reviewed":
+            if not self.event_id or not isinstance(metadata.get("alertDeliveryKey"), str) or len(str(metadata["alertDeliveryKey"])) < 8:
+                raise ValueError("alert_quality_reviewed requires eventId and alertDeliveryKey")
+            if metadata.get("verdict") not in {"valid", "insufficient_evidence", "incorrect_cluster", "out_of_scope"}:
+                raise ValueError("alert_quality_reviewed requires a supported verdict")
+            if not isinstance(metadata.get("reason"), str) or not 3 <= len(str(metadata["reason"]).strip()) <= 1000:
+                raise ValueError("alert_quality_reviewed requires a review reason")
+        elif self.kind in {"metric_exclusion_recorded", "metric_exclusion_reinstated"}:
+            if not self.event_id:
+                raise ValueError("metric exclusion requires eventId")
+            if metadata.get("targetType") not in {"alert", "queue"}:
+                raise ValueError("metric exclusion requires targetType alert or queue")
+            if not isinstance(metadata.get("targetKey"), str) or len(str(metadata["targetKey"])) < 8:
+                raise ValueError("metric exclusion requires targetKey")
+            allowed_reasons = (
+                {"system_fault_duplicate"}
+                if self.kind == "metric_exclusion_recorded" else {"operator_correction"}
+            )
+            if metadata.get("reason") not in allowed_reasons:
+                raise ValueError("metric exclusion requires an auditable operational reason")
+            if self.kind == "metric_exclusion_recorded":
+                if not isinstance(metadata.get("canonicalKey"), str) or len(str(metadata["canonicalKey"])) < 8:
+                    raise ValueError("duplicate exclusions require the earlier canonicalKey")
+                if not isinstance(metadata.get("incidentId"), str) or len(str(metadata["incidentId"])) < 8:
+                    raise ValueError("duplicate exclusions require an immutable incidentId")
+            if not isinstance(metadata.get("note"), str) or not 3 <= len(str(metadata["note"]).strip()) <= 1000:
+                raise ValueError("metric exclusion requires an audit note")
+        return self
 
 
 class MutationReceipt(BaseModel):

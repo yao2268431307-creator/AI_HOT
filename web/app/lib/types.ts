@@ -149,7 +149,7 @@ export interface ConnectorStatus {
   quotaUsed?: number | null;
   quotaLimit?: number | null;
   costRmbMonth?: number | null;
-  rightsStatus?: "active" | "experimental" | "blocked";
+  rightsStatus?: "active" | "pending" | "experimental" | "blocked";
 }
 
 export interface RadarPayload {

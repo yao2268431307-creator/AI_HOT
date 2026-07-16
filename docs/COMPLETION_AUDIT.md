@@ -1,7 +1,7 @@
 # AI 热点雷达 V1 · rc2 完成审计
 
 审计基线：`AI热点雷达_V1_需求规格与执行计划_v1.0-rc2.md`  
-审计日期：2026-07-16  
+审计日期：2026-07-17
 判定原则：自动化用例只能证明代码行为；录制数据、内存压测和页面数量不能替代真实来源、人工标注、生产数据库、授权或连续运行证据。
 
 ## 状态定义
@@ -20,7 +20,7 @@
 | 播放、评论、搜索、Star 不单独确认采用 | 已证实 | `features-2026-07-rc2.1` 使用固定适用分母、平台家族总上限与最小样本；secondary intent 可受限贡献 Behavior，但 adoption 只看 primary；“高 Star + 平安装”回归用例 | 真实数据抽检 false adoption |
 | 跨平台确认使用平台家族与所有权实体 | 已证实（代码） | `ScoreInput` 分离 signal/platform family；至少 2 平台家族、2 所有权实体和 medium 证据；一平台四信号类别反例用例 | 真实平台别名表与 200 条传播抽检 |
 | 数据不足不输出强结论，缺失不当作 0 | 已证实 | Coverage、EvidenceMask、N/A 和连接器故障冻结用例；网页显示 N/A | 真实连接器停机演练 |
-| 15 分钟采集、聚类、评分闭环 | 已证实（代码） | Worker 默认 900 秒；持久 revision、租约、checkpoint 和重试用例 | 72H 真实来源 soak |
+| 15 分钟采集、聚类、评分闭环 | 已证实（代码与计量）/外部时间闸门 | Worker 默认 900 秒；逐 revision 的 collected/enqueued/completed/failed 历史；Owner SLA 接口与合并 revision 回归用例 | 用真实来源运行 72H；要求 95% 在 15 分钟内完成评分且无未恢复失败 |
 | 至少 4 个稳定信号家族，含讨论和行为 | 外部闸门 | 已有 RSS/HN/GitHub/HF/arXiv/OpenAlex/YouTube 适配器和覆盖页；五个免密公共元数据源完成一次真实 smoke | 用授权来源稳定运行 7 天并提交覆盖报告 |
 | 120–200 活跃源、500 候选、2,000 真实容量 | 外部闸门 | 候选晋级/5% 上限与容量契约已实现 | 提供清单、凭证和目标数据库后运行真实容量验收 |
 | 10,000 信源合成容量 | 已证实（非生产） | `tools/synthetic_load.py`：10,000 源、500 万计数事实、2,000 事件约 0.94s | 不得据此宣称 PostgreSQL P95 或生产容量 |
@@ -36,7 +36,7 @@
 | 连接器发现/增量/刷新/回补/成本/权利卡 | 已证实（配置） | `connector_registry.json`、持久 checkpoint、运行成本 fail-closed | 数据负责人逐字段签字，72H 验收状态由 pending 改为 passed |
 | Precision@K、宏 F1、分类型、Pairwise、B-cubed、区间 | 已证实（工具） | `tools/evaluate.py`、时间实体隔离、Cohen's kappa 和 bootstrap 用例 | 输入 60/240 双标注集并冻结报告 |
 | 高影响聚类 Pairwise Precision ≥ 0.90 | 外部闸门 | 计算实现存在 | 真实冻结测试集达到门槛，否则关闭自动合并 |
-| 产品 KPI：强告警接受率、错误告警、首次分诊和有效研判时长 | 部分完成 | 工作区交互埋点具备幂等键；`/api/v1/metrics/review` 仅输出明确标记的“详情打开→提交研判”探索性代理，字段名和 limitations 禁止冒充 rc2 KPI | 另行实现已送达强告警分母、队列可研判时间、值班时段/排除项与前台有效时长；达到最低样本量后再判定 |
+| 产品 KPI：强告警接受率、错误告警、首次分诊和有效研判时长 | 已证实（采集/计算）/外部样本闸门 | 冻结 `product-metrics-2026-07-rc2.7`；反馈只能引用最新 QueueEligibility epoch；已送达告警 + 持久反馈、双 Actor 错误复核、不可变 MetricIncident 归因和值班时钟均有用例。有效研判只累计认证、服务端连续接收的 `active` 心跳，忽略客户端时长汇总，跨重开累计且要求 95% 覆盖；并保留不受 state 缩短的服务端墙钟护栏，可信边界明确不防持证内部人伪报状态 | 真实收集 30 条强告警、5 个告警工作日、50 个可研判事件和 50 次完成研判；人工评估另受签名预登记、完整快照日历和独立基线约束 |
 | Owner/Analyst/Viewer 与工作区隔离 | 已证实（API key/RLS 单测）/待环境验证（联邦） | 服务器派生 workspace、RLS SQL、权限与隔离用例 | Sites/替代部署的真实身份、成员撤销和 SSE 凭证验证 |
 | 外部文本、SSRF、Prompt Injection、Webhook 安全 | 已证实（代码） | URL/DNS/重定向限制、Unicode NFKC/Bidi 清理、React 转义、LLM 不参与数值评分 | 渗透测试、域名重绑定和真实出口代理验证 |
 | AA、键盘、移动端、图表数据表 | 部分完成/待环境验证 | Radix Dialog、reduced-motion、断点和静态契约已通过；Sites 平台桌面截图已核验 | 企业策略禁止自动化访问 localhost/chatgpt.site；仍需 Chrome/Firefox、键盘、屏幕阅读器、对比度实测 |
@@ -44,7 +44,7 @@
 | PITR、RPO ≤1h、RTO ≤4h、Redis 丢失恢复 | 外部闸门 | 无本机生产备份环境 | 配置 WAL/PITR，执行恢复并记录实际 RPO/RTO |
 | Sites 或替代部署 | 部分完成/待联邦 | owner-only 录制数据候选 v1 已部署成功，源码 SHA、归档哈希、访问人数和平台截图可追溯 | 部署独立 API/存储，完成 Sites 身份、SSE/轮询、成员撤销和回滚验证 |
 | X、YouTube、中文受限源授权 | 外部闸门 | 未授权源默认关闭；YouTube 仅在 key 存在时装载 | 合同/配额/字段权利审批，不得绕过平台控制 |
-| 72H soak、7 天影子运行 | 外部闸门 | 瞬时自动化不能提供时间证据 | 按日复核误报、漏报、状态时机和证据支持度 |
+| 72H soak、7 天影子运行 | 工具已证实/时间仍为外部闸门 | `acceptance_monitor.py` 追加哈希链与 Ed25519 签名 JSONL，绑定工具/schema/keyring digest，逐采样验证独立签名的完整排序账本、append-only 阈值跨越事实、Top5 精确选择、固定时间窗、单调事实账本、数据权利、非零来源和运行时证明；PG 排序/crossing 事实与数据库时钟水位来自同一只读 repeatable-read 快照。运行时证明限定 public RLS 表并精确核对触发器的表/函数 schema、事件、模式与启用状态。内存仓库、空 keyring、pending rights 和单样本 canary 均拒绝晋级 | 登记 scheduler、reviewer、baseline、ledger 四类隔离密钥和数据权利后，在生产 PostgreSQL/RLS/认证环境实际运行完整 72H/168H，并保留原始 JSONL、完整排序账本、预登记、快照、基线与签字报告 |
 
 ## 当前可复跑证明
 
@@ -63,6 +63,6 @@ npm.cmd test
 
 ## 当前发布结论
 
-第二轮独立代码复审结果为：剩余 P0/P1/P2 均为“无”，当时独立复跑 `102 passed`。真实连接器 smoke 随后暴露并修复两项 OpenAlex 数据质量缺陷。第三轮复审又指出 smoke 参数无界、空响应误报 PASS 和证据措辞不精确两项 P2；现已增加 `1..10` 边界、零观测失败语义、8 个回归实例并修正文档。最终闭环复审在 `2dbbca1` 上确认剩余 P0/P1/P2 均为“无”，独立复跑 Python `111 passed`、Ruff、Web Lint、Vinext build、2 项渲染测试和生产依赖审计全部通过，因此**本地代码候选 GO**，可以冻结为真实环境集成基线。
+第二轮独立代码复审结果为：剩余 P0/P1/P2 均为“无”，当时独立复跑 `102 passed`。真实连接器 smoke 随后暴露并修复两项 OpenAlex 数据质量缺陷。第三轮复审又指出 smoke 参数无界、空响应误报 PASS 和证据措辞不精确两项 P2；现已增加 `1..10` 边界、零观测失败语义、8 个回归实例并修正文档。最终闭环复审在 `2dbbca1` 上确认当时剩余 P0/P1/P2 均为“无”，独立复跑 Python `111 passed`、Ruff、Web Lint、Vinext build、2 项渲染测试和生产依赖审计全部通过。其后新增并加固 rc2 产品 KPI、逐 revision SLA、完整签名排序/阈值跨越账本、运行时证明与长期验收监控链；本轮最终独立审计确认 P0/P1/P2 均为“无”，复跑 Python `141 passed`、Ruff、compileall、pip check、Web Lint、Vinext build、2 项渲染测试、生产依赖审计、Compose 配置解析和补丁检查全部通过，因此结论为**本地代码候选 GO**。
 
 **rc2 正式 Beta 仍为 NO-GO**：当前不能宣称达到 Definition of Done，也不能进入正式私有测试。剩余阻断项不是页面或单元测试数量，而是真实数据权利、信源规模、双人标注、72H soak、7 天影子运行、生产 PostgreSQL/R2/RLS、身份联邦、可访问性和恢复证据。

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 from collections.abc import AsyncIterator
@@ -9,13 +11,14 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from . import __version__
 from .assessment import event_assessment
 from .auth import Principal, Role, current_principal, require_role
-from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, EventType, FeedbackRequest, MutationReceipt, ProductInteractionRequest, RadarPayload, WatchlistRequest
+from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, EventType, FeedbackRequest, MetricIncidentRequest, MutationReceipt, ProductInteractionRequest, RadarPayload, WatchlistRequest
 from .fixtures import seed_repository
-from .product_metrics import review_funnel
+from .product_metrics import beta_product_metrics, load_product_metric_policy, review_funnel
 from .storage import InMemoryRepository, PostgresRepository
 from .connectors.base import ConnectorError, ensure_safe_public_url_resolved
 
@@ -32,7 +35,27 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
 
     @app.get("/health")
     async def health() -> dict[str, object]:
-        return {"status": "ok", "version": __version__, "events": len(repo.list_events()), "time": datetime.now(timezone.utc).isoformat()}
+        attestation = repo.runtime_attestation()
+        auth_required = os.getenv("AUTH_REQUIRED", "false").lower() == "true"
+        production_ready = (
+            attestation.get("storageBackend") == "postgresql"
+            and attestation.get("rlsVerified") is True
+            and attestation.get("migrationVersion") == "001_init_rc2.3"
+            and attestation.get("auditTriggersVerified") is True
+            and attestation.get("migrationMarkerReadOnly") is True
+            and attestation.get("databaseUser") == "radar_app"
+            and attestation.get("databaseRoleSuperuser") is False
+            and attestation.get("databaseRoleBypassRls") is False
+            and isinstance(attestation.get("instanceId"), str) and len(str(attestation["instanceId"])) >= 8
+            and isinstance(attestation.get("databaseClockSkewSeconds"), (int, float))
+            and float(attestation["databaseClockSkewSeconds"]) <= 5
+            and auth_required
+        )
+        return {
+            "status": "ok", "version": __version__, "events": len(repo.list_events()),
+            "time": datetime.now(timezone.utc).isoformat(), **attestation,
+            "authRequired": auth_required, "productionReady": production_ready,
+        }
 
     @app.get("/api/v1/radar", response_model=RadarPayload, response_model_by_alias=True)
     async def radar(window: str = Query(default="6h", pattern=r"^(1h|6h|24h|7d)$"), _: Principal = Depends(current_principal)) -> RadarPayload:
@@ -62,15 +85,50 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
     @app.get("/api/v1/review-queue")
     async def review_queue(_: Principal = Depends(current_principal)):
         items = repo.list_events()
+        entries = repo.list_review_queue_entries(datetime.min.replace(tzinfo=timezone.utc))
+        latest_entry = {str(row["eventId"]): row for row in entries}
         return {"generatedAt": datetime.now(timezone.utc).isoformat(), "items": [
-            {"event": event.model_dump(mode="json", by_alias=True), "assessment": event_assessment(event).model_dump(mode="json", by_alias=True)}
+            {
+                "event": event.model_dump(mode="json", by_alias=True),
+                "assessment": event_assessment(event).model_dump(mode="json", by_alias=True),
+                "queueEligibility": (
+                    {
+                        "eligibilityKey": latest_entry[event.id]["eligibilityKey"],
+                        "eligibleAt": latest_entry[event.id]["eligibleAt"],
+                        "policyVersion": latest_entry[event.id]["policyVersion"],
+                    }
+                    if event.id in latest_entry else None
+                ),
+            }
             for event in items
         ]}
 
     @app.get("/api/v1/events/{event_id}")
-    async def event_detail(event_id: str, _: Principal = Depends(current_principal)):
+    async def event_detail(event_id: str, principal: Principal = Depends(current_principal)):
         event = require_event(event_id)
-        return {"event": event.model_dump(mode="json", by_alias=True), "assessment": event_assessment(event).model_dump(mode="json", by_alias=True)}
+        queue_entry = max(
+            (row for row in repo.list_review_queue_entries(datetime.min.replace(tzinfo=timezone.utc)) if row["eventId"] == event_id),
+            key=lambda row: row["eligibleAt"], default=None,
+        )
+        alert_delivery = max(
+            (
+                row for row in repo.list_alert_deliveries(principal.workspace_id, datetime.min.replace(tzinfo=timezone.utc))
+                if row["eventId"] == event_id and row.get("status", "delivered") == "delivered"
+            ),
+            key=lambda row: row["deliveredAt"], default=None,
+        )
+        return {
+            "event": event.model_dump(mode="json", by_alias=True),
+            "assessment": event_assessment(event).model_dump(mode="json", by_alias=True),
+            "decisionContext": {
+                "queueEligibilityKey": queue_entry["eligibilityKey"] if queue_entry else None,
+                "alertDeliveryKey": (
+                    alert_delivery.get("idempotencyKey") or alert_delivery.get("deliveryId")
+                    if alert_delivery else None
+                ),
+                "capturedAt": datetime.now(timezone.utc).isoformat(),
+            },
+        }
 
     @app.get("/api/v1/events/{event_id}/assessment")
     async def assessment(event_id: str, _: Principal = Depends(current_principal)):
@@ -168,7 +226,10 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         require_role(principal, Role.ANALYST)
         require_event(event_id)
         normalized = request.model_copy(update={"event_id": event_id})
-        return repo.add_feedback(normalized, principal.workspace_id, principal.subject)
+        try:
+            return repo.add_feedback(normalized, principal.workspace_id, principal.subject)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/v1/events/{event_id}/behavior-applicability", response_model=MutationReceipt, response_model_by_alias=True)
     async def behavior_applicability(event_id: str, request: BehaviorApplicabilityRequest, principal: Principal = Depends(current_principal)):
@@ -243,12 +304,106 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         values = list(repo.connectors.values()) if isinstance(repo, InMemoryRepository) else repo.list_connectors()
         return {"items": [value.model_dump(mode="json", by_alias=True) for value in values]}
 
+    @app.get("/api/v1/operations/connector-runs")
+    async def connector_runs(hours: int = Query(default=72, ge=1, le=2160), principal: Principal = Depends(current_principal)):
+        require_role(principal, Role.OWNER)
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows = repo.list_connector_runs(since)
+        grouped: dict[str, dict[str, object]] = {}
+        for row in rows:
+            connector_id = str(row["connectorId"])
+            current = grouped.setdefault(connector_id, {
+                "connectorId": connector_id, "runs": 0, "healthyRuns": 0, "inserted": 0,
+                "duplicates": 0, "failedRuns": 0, "maxLatencyMs": 0,
+            })
+            current["runs"] = int(current["runs"]) + 1
+            current["inserted"] = int(current["inserted"]) + int(row["inserted"])
+            current["duplicates"] = int(current["duplicates"]) + int(row["duplicates"])
+            current["maxLatencyMs"] = max(int(current["maxLatencyMs"]), int(row["latencyMs"]))
+            if row["status"] == "healthy":
+                current["healthyRuns"] = int(current["healthyRuns"]) + 1
+            else:
+                current["failedRuns"] = int(current["failedRuns"]) + 1
+        for current in grouped.values():
+            observed = int(current["inserted"]) + int(current["duplicates"])
+            current["duplicateRate"] = int(current["duplicates"]) / observed if observed else None
+            current["healthyRunRate"] = int(current["healthyRuns"]) / int(current["runs"]) if current["runs"] else None
+        return {
+            "generatedAt": datetime.now(timezone.utc).isoformat(), "windowHours": hours,
+            "items": rows, "summary": list(grouped.values()),
+        }
+
+    @app.get("/api/v1/operations/pipeline-sla")
+    async def pipeline_sla(hours: int = Query(default=72, ge=1, le=2160), principal: Principal = Depends(current_principal)):
+        require_role(principal, Role.OWNER)
+        current = datetime.now(timezone.utc)
+        since = current - timedelta(hours=hours)
+        rows = repo.list_observation_processing_history(since)
+        threshold_seconds = 15 * 60
+        completed_latencies: list[float] = []
+        within = matured_pending = pending_window = invalid_future = invalid_order = unrecovered_failures = 0
+        for row in rows:
+            collected_at = row["collectedAt"]
+            completed_at = row.get("completedAt")
+            if collected_at > current:
+                invalid_future += 1
+                continue
+            if completed_at is not None:
+                if completed_at < collected_at:
+                    invalid_order += 1
+                    continue
+                latency = (completed_at - collected_at).total_seconds()
+                completed_latencies.append(latency)
+                if latency <= threshold_seconds:
+                    within += 1
+            elif (current - collected_at).total_seconds() > threshold_seconds:
+                matured_pending += 1
+                if row.get("lastError"):
+                    unrecovered_failures += 1
+            else:
+                pending_window += 1
+        sample = len(completed_latencies) + matured_pending
+        rate = within / sample if sample else None
+        ordered = sorted(completed_latencies)
+        p95 = ordered[max(0, (len(ordered) * 95 + 99) // 100 - 1)] if ordered else None
+        return {
+            "generatedAt": current.isoformat(), "windowHours": hours,
+            "metricScope": "collection_to_scoring_completion",
+            "sample": sample, "within15Minutes": within, "rate": rate, "targetRate": .95,
+            "evidenceStatus": "eligible" if sample else "insufficient",
+            "passesTarget": rate >= .95 if rate is not None else None,
+            "completedP95Seconds": p95, "maturedPending": matured_pending,
+            "pendingWindowOpen": pending_window, "invalidFutureTimestamps": invalid_future,
+            "invalidTimestampOrder": invalid_order, "unrecoveredFailures": unrecovered_failures,
+        }
+
+    @app.get("/api/v1/operations/data-quality")
+    async def data_quality(hours: int = Query(default=72, ge=1, le=2160), principal: Principal = Depends(current_principal)):
+        require_role(principal, Role.OWNER)
+        current = datetime.now(timezone.utc)
+        total, duplicates = repo.persisted_content_duplicate_stats(current - timedelta(hours=hours))
+        rate = duplicates / total if total else None
+        return {
+            "generatedAt": current.isoformat(), "windowHours": hours,
+            "metricScope": "persisted_within_connector_content_fingerprint_duplicates",
+            "sample": total, "persistedDuplicates": duplicates, "rate": rate, "targetMaxRate": .05,
+            "evidenceStatus": "eligible" if total else "insufficient",
+            "passesTarget": rate < .05 if rate is not None else None,
+            "limitations": [
+                "Cross-connector copies are not treated as storage duplicates because they may be independent propagation evidence.",
+                "Input dedup hits from polling are reported separately and do not count as persisted duplicate leakage.",
+            ],
+        }
+
     @app.post("/api/v1/feedback", response_model=MutationReceipt, response_model_by_alias=True, status_code=202)
     async def feedback(request: FeedbackRequest, principal: Principal = Depends(current_principal)) -> MutationReceipt:
         require_role(principal, Role.ANALYST)
         if repo.get_event(request.event_id) is None:
             raise HTTPException(404, "event not found")
-        return repo.add_feedback(request, principal.workspace_id, principal.subject)
+        try:
+            return repo.add_feedback(request, principal.workspace_id, principal.subject)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/v1/alert-rules", response_model=MutationReceipt, response_model_by_alias=True, status_code=201)
     @app.post("/api/v1/alerts/rules", response_model=MutationReceipt, response_model_by_alias=True, status_code=201, include_in_schema=False)
@@ -285,15 +440,120 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
 
     @app.post("/api/v1/interactions", response_model=MutationReceipt, response_model_by_alias=True, status_code=202)
     async def product_interaction(request: ProductInteractionRequest, principal: Principal = Depends(current_principal)) -> MutationReceipt:
+        if request.kind == "queue_eligible":
+            raise HTTPException(403, "queue eligibility is a system-generated scoring fact")
+        if request.kind == "alert_quality_reviewed":
+            require_role(principal, Role.ANALYST)
+        if request.kind in {"metric_exclusion_recorded", "metric_exclusion_reinstated"}:
+            require_role(principal, Role.OWNER)
         if request.event_id and repo.get_event(request.event_id) is None:
             raise HTTPException(404, "event not found")
-        return repo.record_product_interaction(request, principal.workspace_id, principal.subject)
+        try:
+            return repo.record_product_interaction(request, principal.workspace_id, principal.subject)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/v1/metric-incidents", response_model=MutationReceipt, response_model_by_alias=True, status_code=201)
+    async def create_metric_incident(
+        request: MetricIncidentRequest,
+        principal: Principal = Depends(current_principal),
+    ) -> MutationReceipt:
+        require_role(principal, Role.OWNER)
+        if repo.get_event(request.event_id) is None:
+            raise HTTPException(404, "event not found")
+        try:
+            return repo.create_metric_incident(request, principal.workspace_id, principal.subject)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/v1/metrics/review")
     async def review_metrics(hours: int = Query(default=168, ge=1, le=2160), principal: Principal = Depends(current_principal)):
         require_role(principal, Role.ANALYST)
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
         return {"generatedAt": datetime.now(timezone.utc).isoformat(), "windowHours": hours, **review_funnel(repo.list_product_interactions(principal.workspace_id, since))}
+
+    @app.get("/api/v1/metrics/beta")
+    async def beta_metrics(hours: int = Query(default=2160, ge=24, le=2160), principal: Principal = Depends(current_principal)):
+        require_role(principal, Role.ANALYST)
+        as_of = datetime.now(timezone.utc)
+        policy = load_product_metric_policy()
+        since = policy.frozen_at.astimezone(timezone.utc)
+        return {
+            "generatedAt": as_of.isoformat(),
+            "windowHours": (as_of - since).total_seconds() / 3600,
+            "requestedMinimumWindowHours": hours,
+            **beta_product_metrics(
+                deliveries=repo.list_alert_deliveries(principal.workspace_id, since),
+                feedback=repo.list_feedback(principal.workspace_id, since),
+                queue_entries=repo.list_review_queue_entries(since),
+                interactions=repo.list_product_interactions(principal.workspace_id, since),
+                incidents=repo.list_metric_incidents(principal.workspace_id, since),
+                as_of=as_of,
+                policy=policy,
+            ),
+        }
+
+    @app.get("/api/v1/metrics/ranking-ledger")
+    async def ranking_ledger(principal: Principal = Depends(current_principal)) -> dict[str, object]:
+        require_role(principal, Role.ANALYST)
+        generated_at, ranking_facts, lead_crossings = repo.ranking_ledger_snapshot()
+        policy = load_product_metric_policy()
+        reviewable = set(policy.reviewable_lifecycle_states)
+        rows: list[dict[str, object]] = []
+        for fact in ranking_facts:
+            event = fact["event"]
+            assert hasattr(event, "id")
+            score_run_id = fact.get("scoreRunId")
+            score = round(.45 * event.attention + .35 * event.behavior + .20 * event.coverage, 6)
+            has_score_fact = isinstance(score_run_id, str) and len(score_run_id) >= 8
+            eligible = (
+                has_score_fact and not event.superseded_by and event.state.value in reviewable
+                and event.coverage >= 40 and event.evidence_strength.value in {"medium", "high"}
+            )
+            rows.append({
+                "eventId": event.id, "score": score, "scoreRunId": score_run_id,
+                "scoreRunAt": fact.get("scoreRunAt").isoformat() if isinstance(fact.get("scoreRunAt"), datetime) else None,
+                "firstDetectedAt": event.first_seen.isoformat(),
+                "lifecycleState": event.state.value, "coverage": event.coverage,
+                "eligibleTop5": eligible,
+            })
+        rows.sort(key=lambda row: (-float(row["score"]), str(row["eventId"])))
+        for rank, row in enumerate(rows, 1):
+            row["rank"] = rank
+        artifact: dict[str, object] = {
+            "schemaVersion": "signed-score-ledger-v1",
+            "productMetricPolicyVersion": policy.version,
+            "thresholdVersion": policy.manual_evaluation.required_threshold_version,
+            "selectionRuleVersion": "daily-top5-score-v2",
+            "generatedAt": generated_at.isoformat(),
+            "rows": rows,
+            "leadCrossings": [
+                {
+                    "eventId": row["eventId"],
+                    "crossedAt": row["crossedAt"].isoformat() if isinstance(row.get("crossedAt"), datetime) else row.get("crossedAt"),
+                    "scoreRunId": row["scoreRunId"], "thresholdVersion": row["thresholdVersion"],
+                    "policyVersion": row["policyVersion"],
+                }
+                for row in lead_crossings
+                if row.get("thresholdVersion") == policy.manual_evaluation.required_threshold_version
+                and row.get("policyVersion") == policy.version
+            ],
+            "ledgerKeyId": os.getenv("SCORE_LEDGER_ED25519_KEY_ID", ""),
+        }
+        private_value = os.getenv("SCORE_LEDGER_ED25519_PRIVATE_KEY", "")
+        try:
+            private_bytes = base64.b64decode(private_value, validate=True)
+            if len(private_bytes) != 32 or len(str(artifact["ledgerKeyId"])) < 8:
+                raise ValueError("invalid score ledger signing identity")
+            material = json.dumps(artifact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            artifact["ledgerSignature"] = base64.b64encode(
+                Ed25519PrivateKey.from_private_bytes(private_bytes).sign(material)
+            ).decode()
+            artifact["ledgerDigest"] = "sha256:" + hashlib.sha256(material).hexdigest()
+        except (ValueError, TypeError):
+            artifact["ledgerSignature"] = None
+            artifact["ledgerDigest"] = None
+        return artifact
 
     @app.delete("/api/v1/privacy/sources/{source_id}")
     async def erase_source(source_id: str, principal: Principal = Depends(current_principal)):

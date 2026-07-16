@@ -1,6 +1,6 @@
 # AI 热点雷达 V1 用例设计
 
-版本：`test-cases-2026-07-16`  
+版本：`test-cases-2026-07-17`
 对应评分：`score-0.6.0` / `thresholds-2026-07-rc2`
 
 ## 自动化验收矩阵
@@ -37,6 +37,7 @@
 | D-08 | 删除派生内容 | 被删来源创建了事件首个标题/向量 | 从保留成员重建标题并失效 embedding；无保留成员时删除事件 |
 | D-09 | RightsPolicy 到期 | 原始载荷超过保留期，但最小事实仍需重放 | 清空原始引用并进入可重试物理删除队列；保留哈希、时间戳和短摘要；共享未到期引用不删 |
 | D-10 | R2 部分失败 | 同批对象中一个删除失败或毒对象持续失败 | 只确认真实成功对象；失败对象记录错误、释放租约并指数退避，不阻塞其他对象 |
+| D-11 | 端到端处理历史 | 两个 Observation revision 在处理前合并，随后完成最新 revision | 两条历史均保留 collected/enqueued/completed；15 分钟 SLA 不漏掉被合并的早期 revision |
 | C-01 | 聚类 | 共享 URL、实体且时间接近 | 归入同一事件并记录理由 |
 | C-02 | 连接器 | RSS 返回有效 item | 输出统一 Observation 与 rawEvidenceRef |
 | C-03 | 故障 | 连接器限流/失败 | 状态 degraded，冻结上一指标，不写零热度 |
@@ -66,6 +67,14 @@
 | R-11 | 探索性研判指标 | 打开详情后接受/拒绝/观察，客户端重试同一埋点 | 工作区幂等保存；字段明确为详情打开起算的代理，并声明不是强告警接受率或值班 SLA |
 | R-12 | 拆分成员契约 | 打开拆分对话框 | 从成员接口读取完整 Observation ID；证据卡截断 ID 不得进入拆分命令 |
 | R-13 | 聚类失败消费 | PG Worker 遇到陈旧版本或非法命令 | 命令标记 failed、outbox 记录执行错误并被消费，不永久循环 |
+| R-14 | 强告警接受率 | 两条已送达强告警，一条在一个工作日内确认、一条拒绝 | 分母为 2、接受率为 0.5；拒绝与未处理不从分母删除 |
+| R-15 | 错误强告警 | 两个不同 Actor 将同一告警复核为证据不足/错误聚类 | 计为一条错误强告警；单人重复提交或双人意见冲突只报 pending |
+| R-16 | 首次分诊 SLA | QueueEligibility 后 10/20 分钟分别提交首次判断 | 15 分钟 SLA 为 1/2；值班外、系统故障和重复事件分栏报告 |
+| R-17 | 有效研判心跳 | 反馈 receipt 与认证的 attempt/segment/sequence 心跳一一关联 | 忽略客户端时长汇总，只统计服务端连续接收的 `active` 区间；未关联、断序或低覆盖心跳拒绝进入有效分母，墙钟护栏不受 state 缩短 |
+| R-18 | KPI 最低样本 | 合成指标达到目标但样本少于冻结门槛 | `evidenceStatus=insufficient`、`passesTarget=null`，不得宣布 Beta 达标 |
+| R-19 | Queue epoch 防串账 | 事件退出后重新进入可研判状态，并提交引用旧 eligibility key 的反馈 | 返回 409；只有最新 epoch 的反馈可进入首次分诊与完成研判分母 |
+| R-20 | 有效时长连续性 | 连续 `active` 心跳 600 秒，关闭并重开后再产生 60 秒完整心跳片段 | 后端跨 segment 累计为 660 秒；若完成研判中有效 telemetry 覆盖率低于 95%，整体证据状态为 insufficient |
+| R-21 | 系统重复归因 | Owner 声称两条重复告警由 worker retry 导致 | 必须引用同事件、15 分钟内的两条真实已投递告警并创建不可变 MetricIncident；排除记录绑定 incident digest，非 Owner 或自由文本归因拒绝 |
 | O-01 | 扩源 | 候选观察不足 7 天 | 不得晋级 |
 | O-02 | 扩源 | 120 个活跃源当日扩源 | 晋级不超过 6 个（5%） |
 | O-03 | 预算 | 月度支出超过 2,000 元 | 停止付费连接器并降低覆盖置信度 |
@@ -75,6 +84,9 @@
 | O-07 | 预算运行时 | 已超月度预算的计量连接器进入采集轮次 | 不发起采集，状态 paused，覆盖惩罚不随每轮重复叠减 |
 | O-08 | 动态成本 | 本月台账余额不足以覆盖下一轮最坏成本 | 在调用外部 API 前暂停，不能等超支后再发现 |
 | O-09 | 告警并发 | 多个 Worker 同时争用同工作区/领域日预算 | 事务预留原子执行，领域最多 3 条、工作区最多 10 条，幂等键不重复 |
+| O-10 | 长期验收监控 | 单样本 canary、72H 连续样本和 7D 产品/人工证据分别报告 | canary 永不满足时长门槛；正式样本必须按 900 秒 cadence 由登记 scheduler 签名，并绑定 policy、monitor、schema、keyring digest；72H 校验 rights/连接器/管道，7D 额外校验产品与人工证据 |
+| O-11 | 正式运行时证明 | 在 InMemory、超级用户、未强制 RLS、无审计 trigger、可写 migration marker 或未认证环境生成样本 | 任一条件均使 runtime attestation 失败；只有稳定 instance ID、受限 `radar_app`、数据库时钟和冻结迁移标记全部满足才可计入正式窗口 |
+| O-12 | 运行时证明防替身 | 在其他 schema 创建同名表，或把同名 trigger 挂到错误表/函数、禁用或删除 UPDATE/DELETE 事件 | 必须限定 public 表，并逐项匹配 trigger 名、表/函数 schema、函数名、行级 BEFORE UPDATE/DELETE 与 enabled 状态，否则 attestation 失败 |
 | E-01 | 评估 | 排名结果 | Precision@K 与宏 F1 分开计算 |
 | E-02 | 评估 | 提前发现后被确认 | 单独计算中位提前量 |
 | E-03 | 聚类评估 | 两事件被错误合并 | Pairwise Precision 能发现 false merge |
@@ -82,6 +94,10 @@
 | E-05 | 评估切分 | 同一实体跨训练/测试时间窗出现 | 测试实体从训练集整体剔除，时点标签与未来结果字段分离 |
 | E-06 | 聚类评估 | 混合 false merge / false split | 同时输出 Pairwise 与 B-cubed Precision/Recall |
 | E-07 | 评估不确定性 | 有限标注样本生成报告 | 输出可复现 bootstrap 95% 区间；双标注报告 Cohen's kappa |
+| E-08 | 人工证据预登记 | 影子窗口开始前冻结规则，但不预知未来事件 ID | schema v2 冻结完整本地日期日历、Top-5 排名算法/digest、阈值、bootstrap seed/迭代/抽样单元；每天 09:00±5 分钟快照由 scheduler 签名并提交到监控链 |
+| E-09 | 完整排序账本 | 调度器用第 6 名替换 Top5、修改 score，或只签名所选候选 | 同一采样时点必须存在独立 ledger key 签名的完整排序账本；Top5 逐项等于前五个合格条目，摘要/签名任一不符即失败 |
+| E-10 | 提前量 crossing 连续性 | 事件过阈值后被 supersede，或中途从后续账本删除 crossing | 首次阈值跨越按 event/threshold/policy 版本化追加并保留；正式窗口只纳入窗内 crossing，但后续签名账本不得缩减或改写已有事实 |
+| E-09 | Precision 与提前量防自证 | Top-5 快照和 baseline 首次发现时间由同一角色或未登记密钥签名 | 拒绝；Precision 要求两个 reviewer 独立签名且点估计、95% CI 下界均 ≥ 0.70，提前量必须使用独立 baseline collector 的全量 eligible manifest 和首次发现日志 |
 | W-01 | Web | 服务端渲染首页 | 返回 200、正确标题、研判队列与覆盖说明 |
 | W-02 | Web | 静态产品契约 | 四个核心视图、移动断点和 reduced motion 均存在 |
 | W-03 | Web 静态可访问性 | 检查移动端详情实现 | 使用 Radix Dialog 模态、可访问标题、移动断点及 reduced-motion 规则；真实焦点行为仍进入浏览器验收 |
@@ -99,3 +115,4 @@
 | L-06 | 第三方授权 | X、YouTube、Bilibili 合规凭证可用 | 必须由数据权利人/组织提供 |
 | L-07 | 身份联邦 | Sites 身份能安全映射到 FastAPI Role | 需要真实部署域、密钥和组织配置 |
 | L-08 | 浏览器可访问性 | 移动端 Tab/Escape、焦点恢复、背景 inert、屏幕阅读器 | 需要真实浏览器/辅助技术 E2E；源码静态契约不能替代交互验收 |
+| L-09 | 产品 KPI 与人工证据最低样本 | 30 条强告警、5 个有告警工作日、50 个可研判事件、50 次完成研判且 telemetry 覆盖率 ≥95%；证据窗每个本地日期均有一个签名 Precision@5 快照，至少 7 个快照；至少 30 个签名独立基线事件；Precision 点估计和 95% CI 下界均 ≥0.70，中位提前量 ≥30 分钟 | 必须来自策略冻结后的真实影子运行；预登记日历、scheduler/reviewer/baseline 隔离密钥、监控 commitment 和原始首次发现日志全部齐备；合成数据和录制演示不得进入分母 |

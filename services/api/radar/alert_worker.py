@@ -91,7 +91,9 @@ class AlertDispatcher:
                 evaluated += 1
                 candidate = self._candidate(event, workspace_id, previous, now)
                 # Strong alerts must be independently auditable from the message.
-                if len(event.evidence) < 3:
+                # Low-evidence events stay in the review queue even when a
+                # workspace rule was configured too permissively.
+                if event.evidence_strength.value == "low" or len(event.evidence) < 3:
                     skipped += 1
                     continue
                 decision: AlertDecision = policy.evaluate(candidate)

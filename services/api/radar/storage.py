@@ -2,14 +2,49 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
-from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, ConnectorStatus, EvidenceState, EvidenceStrength, FeedbackRequest, LifecycleState, MetricSnapshot, MutationReceipt, Observation, ProductInteractionRequest, RadarEvent, StoredScore, WatchlistItem, WatchlistRequest
+from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, ConnectorStatus, EvidenceState, EvidenceStrength, FeedbackRequest, LifecycleState, MetricIncidentRequest, MetricSnapshot, MutationReceipt, Observation, ProductInteractionRequest, RadarEvent, StoredScore, WatchlistItem, WatchlistRequest
 from .facts import split_observation
+from .product_metrics import TRIAGE_ACTIONS, load_product_metric_policy
+
+
+AUDIT_TRIGGER_SPECS = {
+    "feedback_append_only": ("public", "feedback", "public", "reject_audit_fact_mutation"),
+    "product_interactions_append_only": ("public", "product_interactions", "public", "reject_audit_fact_mutation"),
+    "review_queue_entries_append_only": ("public", "review_queue_entries", "public", "reject_audit_fact_mutation"),
+    "lead_threshold_crossings_append_only": (
+        "public", "lead_threshold_crossings", "public", "reject_audit_fact_mutation",
+    ),
+    "content_ingest_history_append_only": ("public", "content_ingest_history", "public", "reject_audit_fact_mutation"),
+    "connector_runs_append_only": ("public", "connector_runs", "public", "reject_audit_fact_mutation"),
+    "metric_incidents_append_only": ("public", "metric_incidents", "public", "reject_audit_fact_mutation"),
+    "alert_deliveries_immutable": ("public", "alert_deliveries", "public", "protect_alert_delivery_fact"),
+    "observation_processing_history_monotonic": (
+        "public", "observation_processing_history", "public", "protect_processing_history_fact",
+    ),
+}
+
+
+def audit_trigger_specs_verified(rows: list[tuple[object, ...]]) -> bool:
+    """Require exact trigger identity, attachment, function, mode and events."""
+    expected = {
+        (name, schema, table, function_schema, function, "O", True, True, True, True)
+        for name, (schema, table, function_schema, function) in AUDIT_TRIGGER_SPECS.items()
+    }
+    normalized = {
+        (
+            str(name), str(schema), str(table), str(function_schema), str(function), str(enabled),
+            bool(row_level), bool(before), bool(on_delete), bool(on_update),
+        )
+        for name, schema, table, function_schema, function, enabled, row_level, before, on_delete, on_update in rows
+    }
+    return normalized == expected
 
 
 def utcnow() -> datetime:
@@ -21,6 +56,44 @@ def score_cycle(value: datetime) -> str:
     return bucket.isoformat()
 
 
+def _queue_eligibility(event: RadarEvent, eligible_at: datetime | None = None) -> dict[str, object] | None:
+    policy = load_product_metric_policy()
+    if event.state.value not in policy.reviewable_lifecycle_states:
+        return None
+    entered_at = eligible_at or utcnow()
+    entry_id = str(uuid.uuid4())
+    material = f"{event.id}|{event.cluster_version}|{entered_at.isoformat()}|{policy.version}|{entry_id}"
+    return {
+        "id": entry_id,
+        "eventId": event.id,
+        "eligibilityKey": f"qe-{hashlib.sha256(material.encode()).hexdigest()}",
+        "eligibleAt": entered_at,
+        "lifecycleState": event.state.value,
+        "clusterVersion": event.cluster_version,
+        "scoreVersion": event.score_version,
+        "policyVersion": policy.version,
+        "entryKind": "transition",
+    }
+
+
+def _entered_review_queue(previous: RadarEvent | None, current: RadarEvent) -> bool:
+    return _entered_review_queue_state(previous.state.value if previous else None, current.state.value)
+
+
+def _entered_review_queue_state(previous_state: str | None, current_state: str) -> bool:
+    reviewable = set(load_product_metric_policy().reviewable_lifecycle_states)
+    return current_state in reviewable and previous_state not in reviewable
+
+
+def _meets_lead_threshold(event: RadarEvent) -> bool:
+    policy = load_product_metric_policy().manual_evaluation
+    return (
+        event.state.value in policy.lead_lifecycle_states
+        and event.attention >= policy.lead_minimum_attention
+        and event.coverage >= policy.lead_minimum_coverage
+    )
+
+
 class InMemoryRepository:
     """Deterministic repository for tests, local preview and disconnected operation."""
 
@@ -29,7 +102,7 @@ class InMemoryRepository:
         self.observations: dict[str, Observation] = {}
         self.events: dict[str, RadarEvent] = {}
         self.connectors: dict[str, ConnectorStatus] = {}
-        self.feedback: dict[str, tuple[str, str, FeedbackRequest]] = {}
+        self.feedback: dict[str, dict[str, object]] = {}
         self.alerts: dict[str, tuple[str, str, AlertRuleRequest]] = {}
         self.alert_deliveries: list[dict[str, object]] = []
         self.watchlists: dict[str, tuple[str, str, WatchlistRequest, datetime]] = {}
@@ -40,10 +113,21 @@ class InMemoryRepository:
         self.event_observations: dict[str, dict[str, float]] = {}
         self.metric_facts: dict[str, MetricSnapshot] = {}
         self.observation_processing: dict[str, dict[str, object]] = {}
+        self.observation_processing_history: list[dict[str, object]] = []
+        self.content_ingest_history: list[dict[str, object]] = []
         self.connector_runs: list[dict[str, object]] = []
         self.connector_checkpoints: dict[str, dict[str, object]] = {}
         self.product_interactions: list[dict[str, object]] = []
+        self.metric_incidents: list[dict[str, object]] = []
+        self.review_queue_entries: list[dict[str, object]] = []
+        self.lead_threshold_crossings: dict[tuple[str, str, str], dict[str, object]] = {}
         self.raw_evidence_deletions: dict[str, dict[str, object]] = {}
+
+    def runtime_attestation(self) -> dict[str, object]:
+        return {
+            "storageBackend": "in_memory", "rlsVerified": False,
+            "migrationVersion": None, "instanceId": "local-demo", "databaseClockSkewSeconds": None,
+        }
 
     def save_observation_with_outbox(self, observation: Observation) -> bool:
         """Observation and outbox record share the same lock/commit boundary."""
@@ -52,6 +136,12 @@ class InMemoryRepository:
             content_inserted = observation.id not in self.observations
             if content_inserted:
                 self.observations[observation.id] = observation
+                content = split_observation(observation)[0]
+                self.content_ingest_history.append({
+                    "observationId": observation.id, "connectorId": content.connector,
+                    "contentFingerprint": observation.content_fingerprint or content.content_hash,
+                    "persistedAt": utcnow(),
+                })
                 self.outbox.append({"id": str(uuid.uuid4()), "kind": "observation.created", "aggregate_id": observation.id, "created_at": utcnow()})
             new_snapshots = [snapshot for snapshot in snapshots if snapshot.id not in self.metric_facts]
             for snapshot in new_snapshots:
@@ -62,6 +152,16 @@ class InMemoryRepository:
             if changed:
                 state = self.observation_processing.setdefault(observation.id, {"revision": 0, "processedRevision": 0, "attempts": 0, "leaseUntil": None, "lastError": None})
                 state["revision"] = int(state["revision"]) + 1
+                self.observation_processing_history.append({
+                    "observationId": observation.id,
+                    "revision": int(state["revision"]),
+                    "collectedAt": observation.collected_at,
+                    "enqueuedAt": utcnow(),
+                    "completedAt": None,
+                    "attempts": 0,
+                    "lastFailedAt": None,
+                    "lastError": None,
+                })
             return changed
 
     def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
@@ -74,6 +174,9 @@ class InMemoryRepository:
                 return None
             state["leaseUntil"] = utcnow() + timedelta(seconds=lease_seconds)
             state["attempts"] = int(state["attempts"]) + 1
+            for row in self.observation_processing_history:
+                if row["observationId"] == observation_id and row["revision"] == int(state["revision"]):
+                    row["attempts"] = int(row["attempts"]) + 1
             return int(state["revision"])
 
     def complete_observation_processing(self, observation_id: str, revision: int) -> None:
@@ -82,6 +185,10 @@ class InMemoryRepository:
             state["processedRevision"] = max(int(state["processedRevision"]), revision)
             state["leaseUntil"] = None
             state["lastError"] = None
+            completed_at = utcnow()
+            for row in self.observation_processing_history:
+                if row["observationId"] == observation_id and int(row["revision"]) <= revision and row["completedAt"] is None:
+                    row["completedAt"] = completed_at
 
     def fail_observation_processing(self, observation_id: str, revision: int, error: str) -> None:
         with self._lock:
@@ -89,6 +196,15 @@ class InMemoryRepository:
             if int(state["processedRevision"]) < revision:
                 state["leaseUntil"] = None
                 state["lastError"] = error[:1000]
+                failed_at = utcnow()
+                for row in self.observation_processing_history:
+                    if row["observationId"] == observation_id and row["revision"] == revision:
+                        row["lastFailedAt"] = failed_at
+                        row["lastError"] = error[:1000]
+
+    def list_observation_processing_history(self, since: datetime) -> list[dict[str, object]]:
+        with self._lock:
+            return [row.copy() for row in self.observation_processing_history if row["enqueuedAt"] >= since]
 
     def list_pending_observation_ids(self, limit: int = 100) -> list[str]:
         now = utcnow()
@@ -116,7 +232,12 @@ class InMemoryRepository:
 
     def upsert_event(self, event: RadarEvent) -> None:
         with self._lock:
+            previous = self.events.get(event.id)
             self.events[event.id] = event
+            if _entered_review_queue(previous, event):
+                entry = _queue_eligibility(event)
+                if entry and not any(row["eligibilityKey"] == entry["eligibilityKey"] for row in self.review_queue_entries):
+                    self.review_queue_entries.append(entry)
 
     def save_score(self, score: StoredScore) -> None:
         with self._lock:
@@ -131,9 +252,36 @@ class InMemoryRepository:
     def has_score_input_digest(self, event_id: str, input_digest: str) -> bool:
         return any(score.event_id == event_id and score.input_digest == input_digest for score in self.score_runs)
 
+    def list_ranking_score_facts(self) -> list[dict[str, object]]:
+        with self._lock:
+            rows: list[dict[str, object]] = []
+            for event in self.events.values():
+                scores = [score for score in self.score_runs if score.event_id == event.id]
+                latest = max(scores, key=lambda score: score.input_to) if scores else None
+                rows.append({
+                    "event": event,
+                    "scoreRunId": latest.input_digest if latest else None,
+                    "scoreRunAt": latest.input_to if latest else None,
+                })
+            return rows
+
+    def list_lead_threshold_crossings(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [{"eventId": key[0], **row} for key, row in self.lead_threshold_crossings.items()]
+
+    def ranking_ledger_snapshot(
+        self,
+    ) -> tuple[datetime, list[dict[str, object]], list[dict[str, object]]]:
+        """Read ranking facts, crossing facts and the watermark under one lock."""
+        with self._lock:
+            ranking_facts = self.list_ranking_score_facts()
+            crossings = self.list_lead_threshold_crossings()
+            return utcnow(), ranking_facts, crossings
+
     def commit_scored_event(self, event: RadarEvent, score: StoredScore) -> None:
         """Atomically update current state, append its reproducibility record and enqueue outbox."""
         with self._lock:
+            previous = self.events.get(event.id)
             self.events[event.id] = event
             cycle = score_cycle(score.input_to)
             index = next((index for index, item in enumerate(self.score_runs) if item.event_id == score.event_id and score_cycle(item.input_to) == cycle), None)
@@ -142,6 +290,17 @@ class InMemoryRepository:
                 self.outbox.append({"id": str(uuid.uuid4()), "kind": "score.created", "aggregate_id": event.id, "created_at": utcnow(), "cycle_id": cycle})
             else:
                 self.score_runs[index] = score
+            crossing_key = (event.id, score.threshold_version, load_product_metric_policy().version)
+            if _meets_lead_threshold(event) and crossing_key not in self.lead_threshold_crossings:
+                self.lead_threshold_crossings[crossing_key] = {
+                    "crossedAt": utcnow(), "scoreRunId": score.input_digest,
+                    "thresholdVersion": score.threshold_version,
+                    "policyVersion": load_product_metric_policy().version,
+                }
+            if _entered_review_queue(previous, event):
+                entry = _queue_eligibility(event)
+                if entry and not any(row["eligibilityKey"] == entry["eligibilityKey"] for row in self.review_queue_entries):
+                    self.review_queue_entries.append(entry)
 
     def assign_observation(self, event_id: str, observation_id: str, cluster_score: float, assignment_version: str) -> bool:
         with self._lock:
@@ -192,6 +351,15 @@ class InMemoryRepository:
         latencies = sorted(int(item["latencyMs"]) for item in rows)
         p95_ms = latencies[max(0, (len(latencies) * 95 + 99) // 100 - 1)] if latencies else 0
         return inserted, (p95_ms + 59_999) // 60_000
+
+    def list_connector_runs(self, since: datetime) -> list[dict[str, object]]:
+        with self._lock:
+            return [row.copy() for row in self.connector_runs if row["startedAt"] >= since]
+
+    def persisted_content_duplicate_stats(self, since: datetime) -> tuple[int, int]:
+        rows = [item for item in self.content_ingest_history if item["persistedAt"] >= since]
+        keys = [(item["connectorId"], item["contentFingerprint"]) for item in rows]
+        return len(rows), len(keys) - len(set(keys))
 
     def monthly_connector_spend(self, at: datetime | None = None) -> float:
         current = at or utcnow()
@@ -282,9 +450,40 @@ class InMemoryRepository:
 
     def add_feedback(self, request: FeedbackRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
         receipt = MutationReceipt(id=str(uuid.uuid4()), operation=f"feedback.{request.action}", createdAt=utcnow())
-        self.feedback[receipt.id] = (workspace_id, actor_id, request)
-        self.outbox.append({"id": str(uuid.uuid4()), "kind": "feedback.created", "aggregate_id": receipt.id, "created_at": utcnow()})
+        with self._lock:
+            eligible_rows = [
+                row for row in self.review_queue_entries
+                if row["eventId"] == request.event_id and row["eligibleAt"] <= receipt.created_at
+            ]
+            latest_eligible = max(eligible_rows, key=lambda row: (row["eligibleAt"], row["eligibilityKey"]), default=None)
+            if request.action in TRIAGE_ACTIONS and (
+                latest_eligible is None or latest_eligible["eligibilityKey"] != request.queue_eligibility_key
+            ):
+                raise ValueError("queue eligibility is stale, unrelated, or not yet effective")
+            alert = next((
+                row for row in self.alert_deliveries
+                if row["workspaceId"] == workspace_id and row["eventId"] == request.event_id
+                and row.get("status", "delivered") == "delivered"
+                and row.get("idempotencyKey") == request.alert_delivery_key
+                and row["deliveredAt"] <= receipt.created_at
+            ), None)
+            if request.alert_delivery_key and alert is None:
+                raise ValueError("alert delivery does not belong to this workspace/event or is not delivered")
+            self.feedback[receipt.id] = {
+                "id": receipt.id, "workspaceId": workspace_id, "actorId": actor_id,
+                **request.model_dump(mode="json", by_alias=True), "createdAt": receipt.created_at,
+                "queueEligibilityKey": request.queue_eligibility_key,
+                "alertDeliveryKey": request.alert_delivery_key,
+            }
+            self.outbox.append({"id": str(uuid.uuid4()), "kind": "feedback.created", "aggregate_id": receipt.id, "created_at": utcnow()})
         return receipt
+
+    def list_feedback(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        return [value.copy() for value in self.feedback.values() if value["workspaceId"] == workspace_id and value["createdAt"] >= since]
+
+    def list_review_queue_entries(self, since: datetime) -> list[dict[str, object]]:
+        with self._lock:
+            return [row.copy() for row in self.review_queue_entries if row["eligibleAt"] >= since]
 
     def set_behavior_applicability(self, event_id: str, request: BehaviorApplicabilityRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
         receipt = MutationReceipt(id=str(uuid.uuid4()), status="queued", operation="event.behavior_applicability", createdAt=utcnow())
@@ -598,7 +797,13 @@ class InMemoryRepository:
             del self.watchlists[existing_id]
             return MutationReceipt(id=existing_id, status="completed", operation="watchlist.delete", createdAt=utcnow())
 
-    def record_product_interaction(self, request: ProductInteractionRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+    def record_product_interaction(
+        self,
+        request: ProductInteractionRequest,
+        workspace_id: str,
+        actor_id: str,
+        occurred_at: datetime | None = None,
+    ) -> MutationReceipt:
         with self._lock:
             existing = next(
                 (row for row in self.product_interactions if row["workspaceId"] == workspace_id and row["idempotencyKey"] == request.idempotency_key),
@@ -608,12 +813,76 @@ class InMemoryRepository:
                 return MutationReceipt(
                     id=str(existing["id"]), status="completed", operation=f"interaction.{existing['kind']}", createdAt=existing["occurredAt"],
                 )
-            receipt = MutationReceipt(id=str(uuid.uuid4()), status="completed", operation=f"interaction.{request.kind}", createdAt=utcnow())
+            if request.kind == "metric_exclusion_recorded":
+                incident_id = str(request.metadata.get("incidentId") or "")
+                incident = next(
+                    (
+                        row for row in self.metric_incidents
+                        if row["workspaceId"] == workspace_id and row["id"] == incident_id
+                    ),
+                    None,
+                )
+                if (
+                    incident is None
+                    or incident["eventId"] != request.event_id
+                    or incident["targetKey"] != request.metadata.get("targetKey")
+                    or incident["canonicalKey"] != request.metadata.get("canonicalKey")
+                ):
+                    raise ValueError("metric exclusion must reference a matching immutable incident fact")
+                request = request.model_copy(update={
+                    "metadata": {**request.metadata, "incidentFactDigest": incident["factDigest"]},
+                })
+            receipt = MutationReceipt(
+                id=str(uuid.uuid4()), status="completed", operation=f"interaction.{request.kind}", createdAt=occurred_at or utcnow(),
+            )
             self.product_interactions.append({
                 "id": receipt.id, "workspaceId": workspace_id, "actorId": actor_id,
                 **request.model_dump(mode="json", by_alias=True), "occurredAt": receipt.created_at,
             })
         return receipt
+
+    def create_metric_incident(
+        self,
+        request: MetricIncidentRequest,
+        workspace_id: str,
+        actor_id: str,
+    ) -> MutationReceipt:
+        with self._lock:
+            rows = {
+                str(row.get("idempotencyKey")): row
+                for row in self.alert_deliveries
+                if row.get("workspaceId") == workspace_id and row.get("status", "delivered") == "delivered"
+            }
+            target = rows.get(request.target_key)
+            canonical = rows.get(request.canonical_key)
+            if (
+                target is None or canonical is None
+                or target.get("eventId") != request.event_id
+                or canonical.get("eventId") != request.event_id
+                or target.get("deliveredAt") <= canonical.get("deliveredAt")
+                or target.get("deliveredAt") > canonical.get("deliveredAt") + timedelta(minutes=15)
+            ):
+                raise ValueError("incident requires two matching delivered alerts in canonical order within 15 minutes")
+            created_at = utcnow()
+            incident_id = str(uuid.uuid4())
+            fact = {
+                "id": incident_id, "workspaceId": workspace_id, "actorId": actor_id,
+                **request.model_dump(mode="json", by_alias=True), "createdAt": created_at,
+            }
+            fact["factDigest"] = "sha256:" + hashlib.sha256(
+                json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
+            ).hexdigest()
+            self.metric_incidents.append(fact)
+            return MutationReceipt(
+                id=incident_id, status="completed", operation="metric_incident.create", createdAt=created_at,
+            )
+
+    def list_metric_incidents(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        with self._lock:
+            return [
+                row.copy() for row in self.metric_incidents
+                if row["workspaceId"] == workspace_id and row["createdAt"] >= since
+            ]
 
     def list_product_interactions(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
         with self._lock:
@@ -714,6 +983,64 @@ class PostgresRepository:
         with psycopg.connect(self.dsn) as connection:
             yield connection
 
+    def runtime_attestation(self) -> dict[str, object]:
+        required_rls_tables = {
+            "feedback", "alert_rules", "alert_deliveries", "watchlists",
+            "product_interactions", "cluster_edit_requests", "metric_incidents",
+        }
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT clock_timestamp(),current_user,roles.rolsuper,roles.rolbypassrls
+                    FROM pg_roles roles WHERE roles.rolname=current_user"""
+                )
+                database_time, database_user, role_superuser, role_bypass_rls = cursor.fetchone()
+                cursor.execute("SELECT value FROM schema_attestations WHERE key='migration_version'")
+                migration_row = cursor.fetchone()
+                cursor.execute(
+                    """SELECT relation.relname,relation.relrowsecurity,relation.relforcerowsecurity
+                    FROM pg_class relation
+                    JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                    WHERE namespace.nspname='public' AND relation.relname=ANY(%s)""",
+                    (list(required_rls_tables),),
+                )
+                rls_rows = {str(row[0]): bool(row[1] and row[2]) for row in cursor.fetchall()}
+                cursor.execute(
+                    """SELECT trigger.tgname,namespace.nspname,relation.relname,
+                    procedure_namespace.nspname,procedure.proname,
+                    trigger.tgenabled,
+                    (trigger.tgtype & 1)<>0,(trigger.tgtype & 2)<>0,
+                    (trigger.tgtype & 8)<>0,(trigger.tgtype & 16)<>0
+                    FROM pg_trigger trigger
+                    JOIN pg_class relation ON relation.oid=trigger.tgrelid
+                    JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                    JOIN pg_proc procedure ON procedure.oid=trigger.tgfoid
+                    JOIN pg_namespace procedure_namespace ON procedure_namespace.oid=procedure.pronamespace
+                    WHERE NOT trigger.tgisinternal AND trigger.tgname=ANY(%s)""",
+                    (list(AUDIT_TRIGGER_SPECS),),
+                )
+                audit_trigger_rows = cursor.fetchall()
+                cursor.execute(
+                    """SELECT
+                    has_table_privilege(current_user,'schema_attestations','SELECT'),
+                    has_table_privilege(current_user,'schema_attestations','INSERT'),
+                    has_table_privilege(current_user,'schema_attestations','UPDATE'),
+                    has_table_privilege(current_user,'schema_attestations','DELETE')"""
+                )
+                marker_privileges = cursor.fetchone()
+        return {
+            "storageBackend": "postgresql",
+            "rlsVerified": set(rls_rows) == required_rls_tables and all(rls_rows.values()),
+            "migrationVersion": str(migration_row[0]) if migration_row else None,
+            "auditTriggersVerified": audit_trigger_specs_verified(audit_trigger_rows),
+            "migrationMarkerReadOnly": bool(marker_privileges[0] and not any(marker_privileges[1:])),
+            "instanceId": os.getenv("RADAR_INSTANCE_ID", ""),
+            "databaseUser": str(database_user),
+            "databaseRoleSuperuser": bool(role_superuser),
+            "databaseRoleBypassRls": bool(role_bypass_rls),
+            "databaseClockSkewSeconds": abs((utcnow() - database_time).total_seconds()),
+        }
+
     def save_observation_with_outbox(self, observation: Observation) -> bool:
         payload = observation.model_dump(mode="json", by_alias=True)
         digest = observation.content_fingerprint or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -734,6 +1061,12 @@ class PostgresRepository:
                 )
                 content_inserted = cursor.fetchone() is not None
                 if content_inserted:
+                    cursor.execute(
+                        """INSERT INTO content_ingest_history
+                        (observation_id,connector_id,content_fingerprint,persisted_at)
+                        VALUES (%s,%s,%s,clock_timestamp())""",
+                        (observation.id, content.connector, digest),
+                    )
                     cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('observation.created',%s,%s::jsonb)", (observation.id, json.dumps({"observationId": observation.id})))
                 snapshot_ids: list[str] = []
                 for snapshot in snapshots:
@@ -755,8 +1088,16 @@ class PostgresRepository:
                         INSERT INTO observation_processing (observation_id,revision,processed_revision)
                         VALUES (%s,1,0) ON CONFLICT (observation_id) DO UPDATE
                         SET revision=observation_processing.revision+1,updated_at=now()
+                        RETURNING revision
                         """,
                         (observation.id,),
+                    )
+                    revision = int(cursor.fetchone()[0])
+                    cursor.execute(
+                        """INSERT INTO observation_processing_history
+                        (observation_id,revision,collected_at,enqueued_at)
+                        VALUES (%s,%s,%s,now()) ON CONFLICT (observation_id,revision) DO NOTHING""",
+                        (observation.id, revision, observation.collected_at),
                     )
             connection.commit()
         return content_inserted or bool(snapshot_ids)
@@ -773,6 +1114,12 @@ class PostgresRepository:
                     (lease_seconds, observation_id),
                 )
                 row = cursor.fetchone()
+                if row:
+                    cursor.execute(
+                        """UPDATE observation_processing_history SET attempts=attempts+1
+                        WHERE observation_id=%s AND revision=%s""",
+                        (observation_id, int(row[0])),
+                    )
             connection.commit()
         return int(row[0]) if row else None
 
@@ -786,6 +1133,11 @@ class PostgresRepository:
                     """,
                     (revision, observation_id),
                 )
+                cursor.execute(
+                    """UPDATE observation_processing_history SET completed_at=COALESCE(completed_at,now())
+                    WHERE observation_id=%s AND revision<=%s""",
+                    (observation_id, revision),
+                )
             connection.commit()
 
     def fail_observation_processing(self, observation_id: str, revision: int, error: str) -> None:
@@ -798,7 +1150,29 @@ class PostgresRepository:
                     """,
                     (error[:1000], observation_id, revision),
                 )
+                cursor.execute(
+                    """UPDATE observation_processing_history SET last_failed_at=now(),last_error=%s
+                    WHERE observation_id=%s AND revision=%s AND completed_at IS NULL""",
+                    (error[:1000], observation_id, revision),
+                )
             connection.commit()
+
+    def list_observation_processing_history(self, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT observation_id,revision,collected_at,enqueued_at,completed_at,attempts,last_failed_at,last_error
+                    FROM observation_processing_history WHERE enqueued_at>=%s ORDER BY enqueued_at""",
+                    (since,),
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "observationId": row[0], "revision": row[1], "collectedAt": row[2], "enqueuedAt": row[3],
+                "completedAt": row[4], "attempts": row[5], "lastFailedAt": row[6], "lastError": row[7],
+            }
+            for row in rows
+        ]
 
     def list_pending_observation_ids(self, limit: int = 100) -> list[str]:
         with self.connection() as connection:
@@ -854,6 +1228,10 @@ class PostgresRepository:
         payload = json.dumps(event.model_dump(mode="json", by_alias=True), ensure_ascii=False)
         with self.connection() as connection:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (event.id,))
+                cursor.execute("SELECT lifecycle_state FROM events WHERE id=%s FOR UPDATE", (event.id,))
+                previous_row = cursor.fetchone()
+                previous_state = str(previous_row[0]) if previous_row else None
                 cursor.execute(
                     """
                     INSERT INTO events (id, canonical_title_zh, canonical_title_en, event_type, lifecycle_state,
@@ -868,6 +1246,8 @@ class PostgresRepository:
                     (event.id, event.title, event.title_en, event.event_type, event.state,
                      [str(label) for label in event.labels], event.first_seen, event.updated_at, payload),
                 )
+                if _entered_review_queue_state(previous_state, event.state.value):
+                    self._insert_review_queue_entry(cursor, event)
             connection.commit()
 
     def save_score(self, score: StoredScore) -> None:
@@ -895,11 +1275,92 @@ class PostgresRepository:
                 cursor.execute("SELECT 1 FROM score_runs WHERE event_id=%s AND input_digest=%s LIMIT 1", (event_id, input_digest))
                 return cursor.fetchone() is not None
 
+    def list_ranking_score_facts(self) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT e.current_score,s.input_digest,s.input_to
+                    FROM events e
+                    LEFT JOIN LATERAL (
+                      SELECT input_digest,input_to FROM score_runs
+                      WHERE event_id=e.id ORDER BY input_to DESC,created_at DESC LIMIT 1
+                    ) s ON true
+                    WHERE cardinality(e.superseded_by)=0"""
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "event": RadarEvent.model_validate(row[0]),
+                "scoreRunId": row[1],
+                "scoreRunAt": row[2],
+            }
+            for row in rows
+        ]
+
+    def list_lead_threshold_crossings(self) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT event_id,crossed_at,score_run_ref,threshold_version,policy_version
+                    FROM lead_threshold_crossings ORDER BY crossed_at,event_id"""
+                )
+                rows = cursor.fetchall()
+        return [
+            {"eventId": row[0], "crossedAt": row[1], "scoreRunId": row[2], "thresholdVersion": row[3], "policyVersion": row[4]}
+            for row in rows
+        ]
+
+    def ranking_ledger_snapshot(
+        self,
+    ) -> tuple[datetime, list[dict[str, object]], list[dict[str, object]]]:
+        """Return one DB-clock-watermarked repeatable-read ledger snapshot."""
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                cursor.execute(
+                    """SELECT e.current_score,s.input_digest,s.input_to
+                    FROM events e
+                    LEFT JOIN LATERAL (
+                      SELECT input_digest,input_to FROM score_runs
+                      WHERE event_id=e.id ORDER BY input_to DESC,created_at DESC LIMIT 1
+                    ) s ON true
+                    WHERE cardinality(e.superseded_by)=0"""
+                )
+                score_rows = cursor.fetchall()
+                cursor.execute(
+                    """SELECT event_id,crossed_at,score_run_ref,threshold_version,policy_version
+                    FROM lead_threshold_crossings ORDER BY crossed_at,event_id"""
+                )
+                crossing_rows = cursor.fetchall()
+                cursor.execute("SELECT clock_timestamp()")
+                generated_at = cursor.fetchone()[0]
+            connection.commit()
+        ranking_facts = [
+            {
+                "event": RadarEvent.model_validate(row[0]),
+                "scoreRunId": row[1],
+                "scoreRunAt": row[2],
+            }
+            for row in score_rows
+        ]
+        crossings = [
+            {
+                "eventId": row[0], "crossedAt": row[1], "scoreRunId": row[2],
+                "thresholdVersion": row[3], "policyVersion": row[4],
+            }
+            for row in crossing_rows
+        ]
+        return generated_at, ranking_facts, crossings
+
     def commit_scored_event(self, event: RadarEvent, score: StoredScore) -> None:
         payload = json.dumps(event.model_dump(mode="json", by_alias=True), ensure_ascii=False)
         cycle = score_cycle(score.input_to)
         with self.connection() as connection:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (event.id,))
+                cursor.execute("SELECT lifecycle_state FROM events WHERE id=%s FOR UPDATE", (event.id,))
+                previous_row = cursor.fetchone()
+                previous_state = str(previous_row[0]) if previous_row else None
                 cursor.execute(
                     """
                     INSERT INTO events (id,canonical_title_zh,canonical_title_en,event_type,lifecycle_state,
@@ -930,6 +1391,16 @@ class PostgresRepository:
                     "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb) ON CONFLICT DO NOTHING",
                     (event.id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle})),
                 )
+                if _meets_lead_threshold(event):
+                    cursor.execute(
+                        """INSERT INTO lead_threshold_crossings
+                        (event_id,crossed_at,score_run_ref,threshold_version,policy_version)
+                        VALUES (%s,clock_timestamp(),%s,%s,%s)
+                        ON CONFLICT (event_id,threshold_version,policy_version) DO NOTHING""",
+                        (event.id, score.input_digest, score.threshold_version, load_product_metric_policy().version),
+                    )
+                if _entered_review_queue_state(previous_state, event.state.value):
+                    self._insert_review_queue_entry(cursor, event)
             connection.commit()
 
     def assign_observation(self, event_id: str, observation_id: str, cluster_score: float, assignment_version: str) -> bool:
@@ -1041,6 +1512,36 @@ class PostgresRepository:
                 )
                 row = cursor.fetchone()
         return int(row[0]), (int(float(row[1])) + 59_999) // 60_000
+
+    def list_connector_runs(self, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT connector_id,started_at,finished_at,status,inserted_count,duplicate_count,
+                    latency_ms,coverage,error,estimated_cost_rmb
+                    FROM connector_runs WHERE started_at>=%s ORDER BY started_at""",
+                    (since,),
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "connectorId": row[0], "startedAt": row[1], "finishedAt": row[2], "status": row[3],
+                "inserted": row[4], "duplicates": row[5], "latencyMs": row[6], "coverage": row[7],
+                "error": row[8], "estimatedCostRmb": float(row[9]),
+            }
+            for row in rows
+        ]
+
+    def persisted_content_duplicate_stats(self, since: datetime) -> tuple[int, int]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT count(*),count(*)-count(DISTINCT (connector_id,content_fingerprint))
+                    FROM content_ingest_history WHERE persisted_at>=%s""",
+                    (since,),
+                )
+                row = cursor.fetchone()
+        return int(row[0]), int(row[1])
 
     def monthly_connector_spend(self, at: datetime | None = None) -> float:
         current = at or utcnow()
@@ -1172,18 +1673,103 @@ class PostgresRepository:
     def _set_workspace(cursor: object, workspace_id: str) -> None:
         cursor.execute("SELECT set_config('app.workspace_id',%s,true)", (workspace_id,))
 
+    @staticmethod
+    def _insert_review_queue_entry(cursor: object, event: RadarEvent) -> None:
+        # Queue eligibility is an operational fact. Use the database clock from
+        # this transaction, never the event's source/data timestamp.
+        cursor.execute("SELECT clock_timestamp()")
+        entered_at = cursor.fetchone()[0]
+        entry = _queue_eligibility(event, entered_at)
+        if entry is None:
+            return
+        cursor.execute(
+            """INSERT INTO review_queue_entries
+            (id,event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (eligibility_key) DO NOTHING""",
+            (
+                entry["id"], entry["eventId"], entry["eligibilityKey"], entry["eligibleAt"],
+                entry["lifecycleState"], entry["clusterVersion"], entry["scoreVersion"], entry["policyVersion"], entry["entryKind"],
+            ),
+        )
+
     def add_feedback(self, request: FeedbackRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
-        receipt = MutationReceipt(id=str(uuid.uuid4()), operation=f"feedback.{request.action}", createdAt=utcnow())
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 self._set_workspace(cursor, workspace_id)
+                cursor.execute("SELECT clock_timestamp()")
+                created_at = cursor.fetchone()[0]
+                receipt = MutationReceipt(
+                    id=str(uuid.uuid4()), operation=f"feedback.{request.action}", createdAt=created_at,
+                )
                 cursor.execute(
-                    "INSERT INTO feedback (id,workspace_id,event_id,actor_id,action,reason,target_event_id) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                    (receipt.id, workspace_id, request.event_id, actor_id, request.action, request.reason, request.target_event_id),
+                    """SELECT eligibility_key FROM review_queue_entries
+                    WHERE event_id=%s AND eligible_at<=%s
+                    ORDER BY eligible_at DESC,eligibility_key DESC LIMIT 1 FOR SHARE""",
+                    (request.event_id, receipt.created_at),
+                )
+                queue_row = cursor.fetchone()
+                if request.action in TRIAGE_ACTIONS and (
+                    queue_row is None or queue_row[0] != request.queue_eligibility_key
+                ):
+                    raise ValueError("queue eligibility is stale, unrelated, or not yet effective")
+                cursor.execute(
+                    """SELECT idempotency_key FROM alert_deliveries
+                    WHERE workspace_id=%s AND event_id=%s AND idempotency_key=%s
+                    AND status='delivered' AND delivered_at<=%s LIMIT 1""",
+                    (workspace_id, request.event_id, request.alert_delivery_key, receipt.created_at),
+                )
+                alert_row = cursor.fetchone()
+                if request.alert_delivery_key and alert_row is None:
+                    raise ValueError("alert delivery does not belong to this workspace/event or is not delivered")
+                cursor.execute(
+                    """INSERT INTO feedback
+                    (id,workspace_id,event_id,actor_id,action,reason,target_event_id,queue_eligibility_key,alert_delivery_key,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        receipt.id, workspace_id, request.event_id, actor_id, request.action, request.reason,
+                        request.target_event_id, request.queue_eligibility_key, request.alert_delivery_key,
+                        receipt.created_at,
+                    ),
                 )
                 cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('feedback.created',%s,%s::jsonb)", (receipt.id, json.dumps({"feedbackId": receipt.id})))
             connection.commit()
         return receipt
+
+    def list_feedback(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """SELECT id,event_id,actor_id,action,reason,target_event_id,created_at,queue_eligibility_key,alert_delivery_key
+                    FROM feedback WHERE workspace_id=%s AND created_at>=%s ORDER BY created_at""",
+                    (workspace_id, since),
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "id": str(row[0]), "workspaceId": workspace_id, "eventId": row[1], "actorId": row[2],
+                "action": row[3], "reason": row[4], "targetEventId": row[5], "createdAt": row[6],
+                "queueEligibilityKey": row[7], "alertDeliveryKey": row[8],
+            }
+            for row in rows
+        ]
+
+    def list_review_queue_entries(self, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT id,event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind
+                    FROM review_queue_entries WHERE eligible_at>=%s ORDER BY eligible_at""",
+                    (since,),
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "id": str(row[0]), "eventId": row[1], "eligibilityKey": row[2], "eligibleAt": row[3],
+                "lifecycleState": row[4], "clusterVersion": row[5], "scoreVersion": row[6], "policyVersion": row[7], "entryKind": row[8],
+            }
+            for row in rows
+        ]
 
     def set_behavior_applicability(self, event_id: str, request: BehaviorApplicabilityRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
         receipt = MutationReceipt(id=str(uuid.uuid4()), status="queued", operation="event.behavior_applicability", createdAt=utcnow())
@@ -1544,7 +2130,7 @@ class PostgresRepository:
                 self._set_workspace(cursor, workspace_id)
                 cursor.execute(
                     """
-                    SELECT rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel
+                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status
                     FROM alert_deliveries WHERE workspace_id=%s AND delivered_at >= %s
                       AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
                     ORDER BY delivered_at
@@ -1553,9 +2139,10 @@ class PostgresRepository:
                 )
                 rows = cursor.fetchall()
         return [{
-            "ruleId": str(row[0]), "workspaceId": workspace_id, "eventId": row[1], "domain": row[2],
-            "lifecycleState": row[3], "evidenceStrength": row[4], "evidenceCount": row[5],
-            "deliveredAt": row[6], "channel": row[7],
+            "deliveryId": str(row[0]), "ruleId": str(row[1]), "workspaceId": workspace_id,
+            "eventId": row[2], "domain": row[3], "lifecycleState": row[4], "evidenceStrength": row[5],
+            "evidenceCount": row[6], "deliveredAt": row[7], "channel": row[8],
+            "idempotencyKey": row[9], "status": row[10],
         } for row in rows]
 
     def last_alert_delivery(self, workspace_id: str, event_id: str) -> dict[str, object] | None:
@@ -1564,7 +2151,7 @@ class PostgresRepository:
                 self._set_workspace(cursor, workspace_id)
                 cursor.execute(
                     """
-                    SELECT rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel
+                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status
                     FROM alert_deliveries WHERE workspace_id=%s AND event_id=%s
                       AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
                     ORDER BY delivered_at DESC LIMIT 1
@@ -1575,9 +2162,10 @@ class PostgresRepository:
         if row is None:
             return None
         return {
-            "ruleId": str(row[0]), "workspaceId": workspace_id, "eventId": row[1], "domain": row[2],
-            "lifecycleState": row[3], "evidenceStrength": row[4], "evidenceCount": row[5],
-            "deliveredAt": row[6], "channel": row[7],
+            "deliveryId": str(row[0]), "ruleId": str(row[1]), "workspaceId": workspace_id,
+            "eventId": row[2], "domain": row[3], "lifecycleState": row[4], "evidenceStrength": row[5],
+            "evidenceCount": row[6], "deliveredAt": row[7], "channel": row[8],
+            "idempotencyKey": row[9], "status": row[10],
         }
 
     def record_alert_delivery(self, item: dict[str, object]) -> None:
@@ -1588,11 +2176,12 @@ class PostgresRepository:
                 cursor.execute(
                     """
                     INSERT INTO alert_deliveries
-                      (rule_id,workspace_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,channel,delivered_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                      (rule_id,workspace_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,channel,delivered_at,idempotency_key,status)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'delivered')
                     """,
                     (item["ruleId"], workspace_id, item["eventId"], item["domain"], item["lifecycleState"],
-                     item["evidenceStrength"], item["evidenceCount"], item["channel"], item["deliveredAt"]),
+                     item["evidenceStrength"], item["evidenceCount"], item["channel"], item["deliveredAt"],
+                     item.get("idempotencyKey", str(uuid.uuid4()))),
                 )
             connection.commit()
 
@@ -1708,12 +2297,105 @@ class PostgresRepository:
             return None
         return MutationReceipt(id=str(row[0]), status="completed", operation="watchlist.delete", createdAt=utcnow())
 
-    def record_product_interaction(self, request: ProductInteractionRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
-        proposed_id = str(uuid.uuid4())
-        proposed_at = utcnow()
+    def create_metric_incident(
+        self,
+        request: MetricIncidentRequest,
+        workspace_id: str,
+        actor_id: str,
+    ) -> MutationReceipt:
+        incident_id = str(uuid.uuid4())
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 self._set_workspace(cursor, workspace_id)
+                cursor.execute("SELECT clock_timestamp()")
+                created_at = cursor.fetchone()[0]
+                fact = {
+                    "id": incident_id, "workspaceId": workspace_id, "actorId": actor_id,
+                    **request.model_dump(mode="json", by_alias=True), "createdAt": created_at,
+                }
+                fact_digest = "sha256:" + hashlib.sha256(
+                    json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
+                ).hexdigest()
+                cursor.execute(
+                    """SELECT idempotency_key,event_id,delivered_at,status FROM alert_deliveries
+                    WHERE workspace_id=%s AND idempotency_key IN (%s,%s) FOR SHARE""",
+                    (workspace_id, request.target_key, request.canonical_key),
+                )
+                deliveries = {str(row[0]): row for row in cursor.fetchall()}
+                target = deliveries.get(request.target_key)
+                canonical = deliveries.get(request.canonical_key)
+                if (
+                    target is None or canonical is None
+                    or target[1] != request.event_id or canonical[1] != request.event_id
+                    or target[3] != "delivered" or canonical[3] != "delivered"
+                    or target[2] <= canonical[2]
+                    or target[2] > canonical[2] + timedelta(minutes=15)
+                    or created_at > target[2] + timedelta(minutes=15)
+                ):
+                    raise ValueError("incident requires two matching delivered alerts in canonical order within 15 minutes")
+                cursor.execute(
+                    """INSERT INTO metric_incidents
+                    (id,workspace_id,actor_id,event_id,target_key,canonical_key,cause,note,fact_digest,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (
+                        incident_id, workspace_id, actor_id, request.event_id, request.target_key,
+                        request.canonical_key, request.cause, request.note, fact_digest, created_at,
+                    ),
+                )
+            connection.commit()
+        return MutationReceipt(
+            id=incident_id, status="completed", operation="metric_incident.create", createdAt=created_at,
+        )
+
+    def list_metric_incidents(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """SELECT id,actor_id,event_id,target_key,canonical_key,cause,note,fact_digest,created_at
+                    FROM metric_incidents WHERE workspace_id=%s AND created_at>=%s ORDER BY created_at""",
+                    (workspace_id, since),
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "id": str(row[0]), "workspaceId": workspace_id, "actorId": row[1], "eventId": row[2],
+                "targetKey": row[3], "canonicalKey": row[4], "cause": row[5], "note": row[6],
+                "factDigest": row[7], "createdAt": row[8],
+            }
+            for row in rows
+        ]
+
+    def record_product_interaction(
+        self,
+        request: ProductInteractionRequest,
+        workspace_id: str,
+        actor_id: str,
+        occurred_at: datetime | None = None,
+    ) -> MutationReceipt:
+        proposed_id = str(uuid.uuid4())
+        metadata = request.metadata.copy()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("SELECT clock_timestamp()")
+                proposed_at = cursor.fetchone()[0]
+                if request.kind == "metric_exclusion_recorded":
+                    cursor.execute(
+                        """SELECT event_id,target_key,canonical_key,fact_digest,created_at FROM metric_incidents
+                        WHERE workspace_id=%s AND id=%s""",
+                        (workspace_id, str(metadata.get("incidentId") or "")),
+                    )
+                    incident = cursor.fetchone()
+                    if (
+                        incident is None
+                        or incident[0] != request.event_id
+                        or incident[1] != metadata.get("targetKey")
+                        or incident[2] != metadata.get("canonicalKey")
+                        or incident[4] > proposed_at
+                    ):
+                        raise ValueError("metric exclusion must reference a matching immutable incident fact")
+                    metadata["incidentFactDigest"] = str(incident[3])
                 cursor.execute(
                     """INSERT INTO product_interactions
                     (id,workspace_id,actor_id,event_id,session_id,idempotency_key,kind,metadata,occurred_at)
@@ -1721,7 +2403,7 @@ class PostgresRepository:
                     ON CONFLICT (workspace_id,idempotency_key) DO NOTHING
                     RETURNING id,occurred_at,kind""",
                     (proposed_id, workspace_id, actor_id, request.event_id, request.session_id, request.idempotency_key,
-                     request.kind, json.dumps(request.metadata, ensure_ascii=False), proposed_at),
+                     request.kind, json.dumps(metadata, ensure_ascii=False), proposed_at),
                 )
                 row = cursor.fetchone()
                 if row is None:
@@ -1738,12 +2420,18 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 self._set_workspace(cursor, workspace_id)
                 cursor.execute(
-                    """SELECT session_id,event_id,kind,metadata,occurred_at FROM product_interactions
+                    """SELECT id,actor_id,session_id,event_id,idempotency_key,kind,metadata,occurred_at FROM product_interactions
                     WHERE workspace_id=%s AND occurred_at>=%s ORDER BY occurred_at""",
                     (workspace_id, since),
                 )
                 rows = cursor.fetchall()
-        return [{"sessionId": row[0], "eventId": row[1], "kind": row[2], "metadata": row[3], "occurredAt": row[4]} for row in rows]
+        return [
+            {
+                "id": str(row[0]), "actorId": row[1], "sessionId": row[2], "eventId": row[3],
+                "idempotencyKey": row[4], "kind": row[5], "metadata": row[6], "occurredAt": row[7],
+            }
+            for row in rows
+        ]
 
     def purge_source(self, source_id: str) -> int:
         with self.connection() as connection:

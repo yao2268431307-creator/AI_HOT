@@ -220,7 +220,14 @@ def test_postgres_feedback_and_applicability_paths_bind_their_own_request_fields
 
         def execute(self, sql: str, params: object = None) -> None:
             self.statements.append((sql, params))
-            self._row = ({"coverage": 50, "behaviorEvidenceState": "missing"},) if "SELECT current_score" in sql else None
+            if "SELECT current_score" in sql:
+                self._row = ({"coverage": 50, "behaviorEvidenceState": "missing"},)
+            elif "SELECT clock_timestamp()" in sql:
+                self._row = (datetime.now(timezone.utc),)
+            elif "SELECT eligibility_key" in sql:
+                self._row = ("queue-key-test",)
+            else:
+                self._row = None
 
         def fetchone(self):
             return self._row
@@ -247,7 +254,10 @@ def test_postgres_feedback_and_applicability_paths_bind_their_own_request_fields
             yield self.connection_spy
 
     repository = Repository()
-    feedback = FeedbackRequest(eventId="evt-1", action="confirm", reason="three independent sources")
+    feedback = FeedbackRequest(
+        eventId="evt-1", action="confirm", reason="three independent sources",
+        queueEligibilityKey="queue-key-test",
+    )
     repository.add_feedback(feedback, "workspace-a", "analyst-a")
     applicability = BehaviorApplicabilityRequest(state="not_applicable", reason="behavior has no defined denominator")
     repository.set_behavior_applicability("evt-1", applicability, "workspace-a", "owner-a")

@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://signal-ai.local/schemas/manual-product-evaluation-v1.3.json",
+  "title": "AI Radar rc2 manual product evaluation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "productMetricPolicyVersion",
+    "productMetricPolicyDigest",
+    "precisionCandidateEventSetDigest",
+    "precisionCandidateEventIds",
+    "eligibleLeadEventIds",
+    "eligibleLeadEventSetDigest",
+    "snapshotScheduleId",
+    "preregisteredAt",
+    "evaluatedAt",
+    "reviewerIds",
+    "reviewerSignatures",
+    "baselineArtifact",
+    "baselineArtifactDigest",
+    "preregistrationArtifact",
+    "preregistrationDigest",
+    "leadCandidateManifest",
+    "leadCandidateManifestDigest",
+    "precisionAt5",
+    "discoveryLead"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "manual-product-evaluation-v1.3"},
+    "productMetricPolicyVersion": {"type": "string", "minLength": 8},
+    "productMetricPolicyDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "precisionCandidateEventSetDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "precisionCandidateEventIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 3}},
+    "eligibleLeadEventIds": {"type": "array", "minItems": 30, "uniqueItems": true, "items": {"type": "string", "minLength": 3}},
+    "eligibleLeadEventSetDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "snapshotScheduleId": {"type": "string", "minLength": 8},
+    "preregisteredAt": {"type": "string", "format": "date-time"},
+    "evaluatedAt": {"type": "string", "format": "date-time"},
+    "reviewerIds": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 3}
+    },
+    "reviewerSignatures": {
+      "type": "object", "minProperties": 2,
+      "additionalProperties": {"type": "string", "minLength": 80}
+    },
+    "baselineArtifactDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "baselineArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "generatedAt", "eventLogs", "collectorKeyId", "collectorSignature"],
+      "properties": {
+        "schemaVersion": {"const": "manual-independent-baseline-v1"},
+        "generatedAt": {"type": "string", "format": "date-time"},
+        "eventLogs": {
+          "type": "array", "minItems": 30,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["logRef", "eventId", "firstDetectedAt"],
+            "properties": {
+              "logRef": {"type": "string", "minLength": 8},
+              "eventId": {"type": "string", "minLength": 3},
+              "firstDetectedAt": {"type": "string", "format": "date-time"}
+            }
+          }
+        },
+        "collectorKeyId": {"type": "string", "minLength": 8},
+        "collectorSignature": {"type": "string", "minLength": 80}
+      }
+    },
+    "preregistrationArtifact": {"$ref": "manual_product_preregistration.schema.json"},
+    "preregistrationDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "leadCandidateManifestDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "leadCandidateManifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "preregistrationDigest", "generatedAt", "candidates", "schedulerKeyId", "schedulerSignature"],
+      "properties": {
+        "schemaVersion": {"const": "manual-lead-candidate-manifest-v1"},
+        "preregistrationDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "generatedAt": {"type": "string", "format": "date-time"},
+        "candidates": {
+          "type": "array", "minItems": 30,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["eventId", "radarDetectedAt", "scoreRunId", "thresholdVersion", "eligibilityReason"],
+            "properties": {
+              "eventId": {"type": "string", "minLength": 3},
+              "radarDetectedAt": {"type": "string", "format": "date-time"},
+              "scoreRunId": {"type": "string", "minLength": 8},
+              "thresholdVersion": {"type": "string", "minLength": 8},
+              "eligibilityReason": {"type": "string", "minLength": 8}
+            }
+          }
+        },
+        "schedulerKeyId": {"type": "string", "minLength": 8},
+        "schedulerSignature": {"type": "string", "minLength": 80}
+      }
+    },
+    "precisionAt5": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["doubleReviewed", "snapshots", "candidates", "value", "ciLow", "ciHigh", "intervalMethod", "confidenceLevel", "bootstrapIterations", "bootstrapSeed", "rawSnapshots"],
+      "properties": {
+        "doubleReviewed": {"const": true},
+        "snapshots": {"type": "integer", "minimum": 7},
+        "candidates": {"type": "integer", "minimum": 35},
+        "value": {"type": "number", "minimum": 0, "maximum": 1},
+        "ciLow": {"type": "number", "minimum": 0.7, "maximum": 1},
+        "ciHigh": {"type": "number", "minimum": 0.7, "maximum": 1},
+        "intervalMethod": {"const": "bootstrap"},
+        "confidenceLevel": {"const": 0.95},
+        "bootstrapIterations": {"type": "integer", "minimum": 1000},
+        "bootstrapSeed": {"type": "integer"},
+        "rawSnapshots": {
+          "type": "array",
+          "minItems": 7,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["snapshotId", "scheduledAt", "preregistrationDigest", "rankingRuleVersion", "rankingResponseDigest", "schedulerKeyId", "schedulerSignature", "candidates"],
+            "properties": {
+              "snapshotId": {"type": "string", "minLength": 8},
+              "scheduledAt": {"type": "string", "format": "date-time"},
+              "preregistrationDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "rankingRuleVersion": {"type": "string", "minLength": 8},
+              "rankingResponseDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "schedulerKeyId": {"type": "string", "minLength": 8},
+              "schedulerSignature": {"type": "string", "minLength": 80},
+              "candidates": {
+                "type": "array", "minItems": 5, "maxItems": 5,
+                "items": {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["rank", "eventId", "score", "scoreRunId", "labels"],
+                  "properties": {
+                    "rank": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "eventId": {"type": "string", "minLength": 3},
+                    "score": {"type": "number"},
+                    "scoreRunId": {"type": "string", "minLength": 8},
+                    "labels": {
+                      "type": "array", "minItems": 2,
+                      "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["reviewerId", "relevant"],
+                        "properties": {
+                          "reviewerId": {"type": "string", "minLength": 3},
+                          "relevant": {"type": "boolean"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "discoveryLead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["independentBaseline", "sample", "medianMinutes", "rawEvents"],
+      "properties": {
+        "independentBaseline": {"const": true},
+        "sample": {"type": "integer", "minimum": 30},
+        "medianMinutes": {"type": "number"},
+        "rawEvents": {
+          "type": "array", "minItems": 30,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["eventId", "radarDetectedAt", "baselineDetectedAt", "scoreRunId", "thresholdVersion", "baselineLogRef"],
+            "properties": {
+              "eventId": {"type": "string", "minLength": 3},
+              "radarDetectedAt": {"type": "string", "format": "date-time"},
+              "baselineDetectedAt": {"type": "string", "format": "date-time"},
+              "scoreRunId": {"type": "string", "minLength": 8},
+              "thresholdVersion": {"type": "string", "minLength": 8},
+              "baselineLogRef": {"type": "string", "minLength": 8}
+            }
+          }
+        }
+      }
+    }
+  }
+}

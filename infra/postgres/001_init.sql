@@ -1,6 +1,12 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+CREATE TABLE IF NOT EXISTS schema_attestations (
+  key text PRIMARY KEY,
+  value text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS source_entities (
   id text PRIMARY KEY,
   entity_type text NOT NULL CHECK (entity_type IN ('person','organization','repository','publication','channel')),
@@ -82,6 +88,22 @@ CREATE INDEX IF NOT EXISTS observations_entity_idx ON observations (entity_id, p
 CREATE INDEX IF NOT EXISTS observations_fingerprint_idx ON observations (content_fingerprint);
 CREATE INDEX IF NOT EXISTS observations_metrics_idx ON observations USING gin (metrics);
 
+-- Minimal immutable ingest ledger: no body/title/URL, only the facts required
+-- to prove persisted duplicate leakage cannot be improved by later source purge.
+CREATE TABLE IF NOT EXISTS content_ingest_history (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  observation_id text NOT NULL,
+  connector_id text NOT NULL,
+  content_fingerprint text NOT NULL,
+  persisted_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE content_ingest_history ADD COLUMN IF NOT EXISTS id uuid DEFAULT gen_random_uuid();
+ALTER TABLE content_ingest_history ALTER COLUMN id SET NOT NULL;
+ALTER TABLE content_ingest_history DROP CONSTRAINT IF EXISTS content_ingest_history_pkey;
+ALTER TABLE content_ingest_history ADD CONSTRAINT content_ingest_history_pkey PRIMARY KEY (id);
+CREATE INDEX IF NOT EXISTS content_ingest_history_time_idx ON content_ingest_history (persisted_at DESC);
+CREATE INDEX IF NOT EXISTS content_ingest_history_fingerprint_idx ON content_ingest_history (connector_id,content_fingerprint);
+
 CREATE TABLE IF NOT EXISTS observation_processing (
   observation_id text PRIMARY KEY REFERENCES observations(id) ON DELETE CASCADE,
   revision integer NOT NULL DEFAULT 1,
@@ -94,6 +116,23 @@ CREATE TABLE IF NOT EXISTS observation_processing (
 );
 CREATE INDEX IF NOT EXISTS observation_processing_pending_idx ON observation_processing (updated_at)
   WHERE processed_revision < revision;
+
+CREATE TABLE IF NOT EXISTS observation_processing_history (
+  observation_id text NOT NULL,
+  revision integer NOT NULL,
+  collected_at timestamptz NOT NULL,
+  enqueued_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  attempts integer NOT NULL DEFAULT 0,
+  last_failed_at timestamptz,
+  last_error text,
+  PRIMARY KEY (observation_id,revision)
+);
+ALTER TABLE observation_processing_history DROP CONSTRAINT IF EXISTS observation_processing_history_observation_id_fkey;
+CREATE INDEX IF NOT EXISTS observation_processing_history_time_idx
+  ON observation_processing_history (enqueued_at DESC);
+CREATE INDEX IF NOT EXISTS observation_processing_history_pending_idx
+  ON observation_processing_history (enqueued_at) WHERE completed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS events (
   id text PRIMARY KEY,
@@ -183,13 +222,18 @@ CREATE INDEX IF NOT EXISTS metric_snapshots_subject_idx ON metric_snapshots (sub
 CREATE TABLE IF NOT EXISTS feedback (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id text NOT NULL,
-  event_id text NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  event_id text NOT NULL,
   actor_id text NOT NULL,
   action text NOT NULL,
   reason text NOT NULL,
   target_event_id text,
+  queue_eligibility_key text,
+  alert_delivery_key text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE feedback DROP CONSTRAINT IF EXISTS feedback_event_id_fkey;
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS queue_eligibility_key text;
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS alert_delivery_key text;
 
 CREATE TABLE IF NOT EXISTS outbox (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -253,9 +297,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 
 CREATE TABLE IF NOT EXISTS alert_deliveries (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  rule_id uuid NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+  rule_id uuid NOT NULL,
   workspace_id text NOT NULL,
-  event_id text NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  event_id text NOT NULL,
   domain text NOT NULL,
   lifecycle_state text NOT NULL,
   evidence_strength text NOT NULL CHECK (evidence_strength IN ('low','medium','high')),
@@ -265,9 +309,25 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
   status text NOT NULL DEFAULT 'delivered' CHECK (status IN ('reserved','delivered')),
   delivered_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_rule_id_fkey;
+ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_event_id_fkey;
 ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS idempotency_key text NOT NULL DEFAULT gen_random_uuid()::text;
 ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'delivered';
 CREATE UNIQUE INDEX IF NOT EXISTS alert_deliveries_idempotency_uidx ON alert_deliveries (idempotency_key);
+
+CREATE TABLE IF NOT EXISTS metric_incidents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id text NOT NULL,
+  actor_id text NOT NULL,
+  event_id text NOT NULL,
+  target_key text NOT NULL,
+  canonical_key text NOT NULL,
+  cause text NOT NULL CHECK (cause IN ('worker_retry_after_timeout','delivery_ack_race','provider_duplicate_callback')),
+  note text NOT NULL,
+  fact_digest text NOT NULL CHECK (fact_digest ~ '^sha256:[0-9a-f]{64}$'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id,target_key,canonical_key)
+);
 
 CREATE TABLE IF NOT EXISTS watchlists (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -282,17 +342,57 @@ CREATE TABLE IF NOT EXISTS product_interactions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id text NOT NULL,
   actor_id text NOT NULL,
-  event_id text REFERENCES events(id) ON DELETE SET NULL,
+  event_id text,
   session_id text NOT NULL,
   idempotency_key text NOT NULL,
-  kind text NOT NULL CHECK (kind IN ('detail_opened','evidence_opened','triage_submitted','watch_toggled','alert_acknowledged')),
+  kind text NOT NULL CHECK (kind IN ('detail_opened','evidence_opened','triage_submitted','review_segment_closed','review_heartbeat','watch_toggled','alert_acknowledged','queue_eligible','alert_quality_reviewed','metric_exclusion_recorded','metric_exclusion_reinstated')),
   metadata jsonb NOT NULL DEFAULT '{}',
   occurred_at timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE product_interactions DROP CONSTRAINT IF EXISTS product_interactions_event_id_fkey;
 ALTER TABLE product_interactions ADD COLUMN IF NOT EXISTS idempotency_key text;
 UPDATE product_interactions SET idempotency_key=id::text WHERE idempotency_key IS NULL;
 ALTER TABLE product_interactions ALTER COLUMN idempotency_key SET NOT NULL;
+ALTER TABLE product_interactions DROP CONSTRAINT IF EXISTS product_interactions_kind_check;
+ALTER TABLE product_interactions ADD CONSTRAINT product_interactions_kind_check CHECK (
+  kind IN ('detail_opened','evidence_opened','triage_submitted','review_segment_closed','review_heartbeat','watch_toggled','alert_acknowledged','queue_eligible','alert_quality_reviewed','metric_exclusion_recorded','metric_exclusion_reinstated')
+);
+
+CREATE TABLE IF NOT EXISTS review_queue_entries (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_id text NOT NULL,
+  eligibility_key text NOT NULL UNIQUE,
+  eligible_at timestamptz NOT NULL,
+  lifecycle_state text NOT NULL,
+  cluster_version integer NOT NULL,
+  score_version text NOT NULL,
+  policy_version text NOT NULL,
+  entry_kind text NOT NULL DEFAULT 'transition' CHECK (entry_kind IN ('transition','deployment_backfill')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS lead_threshold_crossings (
+  event_id text NOT NULL,
+  crossed_at timestamptz NOT NULL,
+  score_run_ref text NOT NULL,
+  threshold_version text NOT NULL,
+  policy_version text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (event_id,threshold_version,policy_version)
+);
+ALTER TABLE lead_threshold_crossings DROP CONSTRAINT IF EXISTS lead_threshold_crossings_pkey;
+ALTER TABLE lead_threshold_crossings ADD PRIMARY KEY (event_id,threshold_version,policy_version);
+ALTER TABLE review_queue_entries DROP CONSTRAINT IF EXISTS review_queue_entries_event_id_fkey;
+ALTER TABLE review_queue_entries ADD COLUMN IF NOT EXISTS entry_kind text NOT NULL DEFAULT 'transition';
+INSERT INTO review_queue_entries
+  (event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
+SELECT e.id,'qe-backfill-'||gen_random_uuid()::text,clock_timestamp(),e.lifecycle_state,e.cluster_version,
+       COALESCE(NULLIF(e.current_score->>'scoreVersion',''),'unknown'),
+       'product-metrics-2026-07-rc2.7','deployment_backfill'
+FROM events e
+WHERE e.lifecycle_state IN ('detected','emerging','accelerating','established','cooling')
+  AND NOT EXISTS (SELECT 1 FROM review_queue_entries q WHERE q.event_id=e.id);
 
 CREATE TABLE IF NOT EXISTS cluster_edit_requests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -334,6 +434,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS watchlists_workspace_event_uidx ON watchlists 
 CREATE INDEX IF NOT EXISTS product_interactions_workspace_idx ON product_interactions (workspace_id,occurred_at DESC);
 CREATE INDEX IF NOT EXISTS product_interactions_event_idx ON product_interactions (workspace_id,event_id,occurred_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS product_interactions_idempotency_uidx ON product_interactions (workspace_id,idempotency_key);
+CREATE INDEX IF NOT EXISTS review_queue_entries_time_idx ON review_queue_entries (eligible_at DESC);
+CREATE INDEX IF NOT EXISTS review_queue_entries_event_idx ON review_queue_entries (event_id,eligible_at DESC);
 CREATE INDEX IF NOT EXISTS cluster_edit_requests_event_idx ON cluster_edit_requests (event_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS cluster_edit_requests_workspace_idx ON cluster_edit_requests (workspace_id, created_at DESC);
 
@@ -343,6 +445,8 @@ ALTER TABLE alert_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alert_rules FORCE ROW LEVEL SECURITY;
 ALTER TABLE alert_deliveries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alert_deliveries FORCE ROW LEVEL SECURITY;
+ALTER TABLE metric_incidents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE metric_incidents FORCE ROW LEVEL SECURITY;
 ALTER TABLE watchlists ENABLE ROW LEVEL SECURITY;
 ALTER TABLE watchlists FORCE ROW LEVEL SECURITY;
 ALTER TABLE product_interactions ENABLE ROW LEVEL SECURITY;
@@ -350,24 +454,91 @@ ALTER TABLE product_interactions FORCE ROW LEVEL SECURITY;
 ALTER TABLE cluster_edit_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cluster_edit_requests FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS feedback_workspace_isolation ON feedback;
 CREATE POLICY feedback_workspace_isolation ON feedback
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS alert_rules_workspace_isolation ON alert_rules;
 CREATE POLICY alert_rules_workspace_isolation ON alert_rules
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS alert_deliveries_workspace_isolation ON alert_deliveries;
 CREATE POLICY alert_deliveries_workspace_isolation ON alert_deliveries
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS metric_incidents_workspace_isolation ON metric_incidents;
+CREATE POLICY metric_incidents_workspace_isolation ON metric_incidents
+  USING (workspace_id = current_setting('app.workspace_id', true))
+  WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS watchlists_workspace_isolation ON watchlists;
 CREATE POLICY watchlists_workspace_isolation ON watchlists
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS product_interactions_workspace_isolation ON product_interactions;
 CREATE POLICY product_interactions_workspace_isolation ON product_interactions
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS cluster_edit_requests_workspace_isolation ON cluster_edit_requests;
 CREATE POLICY cluster_edit_requests_workspace_isolation ON cluster_edit_requests
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+
+CREATE OR REPLACE FUNCTION reject_audit_fact_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION '% is append-only; write a compensating audit fact instead', TG_TABLE_NAME;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION protect_alert_delivery_fact() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP='DELETE' AND OLD.status='reserved' THEN
+    RETURN OLD;
+  END IF;
+  IF TG_OP='UPDATE' AND OLD.status='reserved' AND NEW.status='delivered'
+     AND (to_jsonb(NEW)-'status')=(to_jsonb(OLD)-'status') THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'delivered alert facts are immutable';
+END
+$$;
+
+CREATE OR REPLACE FUNCTION protect_processing_history_fact() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP='DELETE' THEN
+    RAISE EXCEPTION 'observation processing history cannot be deleted';
+  END IF;
+  IF NEW.observation_id<>OLD.observation_id OR NEW.revision<>OLD.revision
+     OR NEW.collected_at<>OLD.collected_at OR NEW.enqueued_at<>OLD.enqueued_at
+     OR NEW.attempts<OLD.attempts
+     OR (OLD.completed_at IS NOT NULL AND NEW.completed_at IS DISTINCT FROM OLD.completed_at)
+     OR (NEW.completed_at IS NOT NULL AND NEW.completed_at<NEW.enqueued_at)
+     OR (OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
+         AND NEW.completed_at<clock_timestamp()-interval '1 minute') THEN
+    RAISE EXCEPTION 'invalid mutation of observation processing history';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+DO $$
+DECLARE audit_table text;
+BEGIN
+  FOREACH audit_table IN ARRAY ARRAY['feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents']
+  LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS %I_append_only ON %I',audit_table,audit_table);
+    EXECUTE format('CREATE TRIGGER %I_append_only BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_audit_fact_mutation()',audit_table,audit_table);
+  END LOOP;
+END
+$$;
+DROP TRIGGER IF EXISTS alert_deliveries_immutable ON alert_deliveries;
+CREATE TRIGGER alert_deliveries_immutable BEFORE UPDATE OR DELETE ON alert_deliveries
+  FOR EACH ROW EXECUTE FUNCTION protect_alert_delivery_fact();
+DROP TRIGGER IF EXISTS observation_processing_history_monotonic ON observation_processing_history;
+CREATE TRIGGER observation_processing_history_monotonic BEFORE UPDATE OR DELETE ON observation_processing_history
+  FOR EACH ROW EXECUTE FUNCTION protect_processing_history_fact();
 
 -- The bootstrap POSTGRES_USER owns migrations and is intentionally not used by
 -- the application. Superusers bypass RLS even when policies are otherwise
@@ -385,3 +556,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO radar_app
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO radar_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO radar_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO radar_app;
+
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON schema_attestations FROM radar_app;
+GRANT SELECT ON schema_attestations TO radar_app;
+
+-- Written last: an interrupted migration must never attest the target schema.
+INSERT INTO schema_attestations (key,value,updated_at)
+VALUES ('migration_version','001_init_rc2.3',clock_timestamp())
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at;

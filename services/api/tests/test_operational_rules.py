@@ -10,13 +10,15 @@ import pytest
 from radar.alerts import AlertCandidate, AlertPolicyEngine
 from radar.alert_worker import AlertDispatcher
 from radar.budget import budget_guard
-from radar.contracts import AlertRuleRequest, EventType
+from radar.contracts import AlertRuleRequest, EventType, EvidenceStrength, Observation
+from radar.connectors.base import BaseConnector
 from radar.evaluation import EvaluationExample, LabeledPrediction, bcubed_cluster_precision_recall, bootstrap_confidence_interval, cohen_kappa, macro_f1, median_lead_minutes, pairwise_cluster_precision, pairwise_cluster_recall, precision_at_k, temporal_entity_holdout
 from radar.metrics import Baseline, SignalSnapshot, aggregate_metrics, to_score_input
 from radar.source_discovery import SourceCandidate, candidate_score, promote_candidates
 from radar.fixtures import seed_repository
 from radar.feature_registry import behavior_metric_roles, load_feature_registry
 from radar.storage import InMemoryRepository
+from radar.worker import CollectorWorker
 
 
 NOW = datetime.now(timezone.utc)
@@ -259,6 +261,24 @@ async def test_committed_score_event_matches_rule_and_creates_durable_in_app_ale
 
 
 @pytest.mark.asyncio
+async def test_low_evidence_event_never_becomes_a_strong_alert_even_with_a_permissive_rule() -> None:
+    repository = seed_repository(InMemoryRepository())
+    event = repository.get_event("evt-open-model")
+    assert event is not None
+    repository.upsert_event(event.model_copy(update={"evidence_strength": EvidenceStrength.LOW, "evidence_score": 10}))
+    repository.add_alert(
+        AlertRuleRequest(name="permissive rule", minimumAttention=0, minimumEvidenceStrength=0),
+        "workspace-a", "analyst-a",
+    )
+    summary = await AlertDispatcher(repository, signing_secret="test-secret").dispatch_event(
+        event.id, ["workspace-a"], NOW,
+    )
+    assert summary.evaluated == 1
+    assert summary.delivered == 0
+    assert repository.alert_deliveries == []
+
+
+@pytest.mark.asyncio
 async def test_unchanged_alert_does_not_reappear_after_midnight_and_cooldown() -> None:
     repository = seed_repository(InMemoryRepository())
     repository.add_alert(AlertRuleRequest(name="strong", minimumAttention=70, minimumEvidenceStrength=65), "workspace-a", "analyst-a")
@@ -330,10 +350,31 @@ def test_double_label_agreement_and_bootstrap_interval_are_reproducible() -> Non
 def test_connector_registry_has_required_rights_cost_backfill_and_acceptance_fields() -> None:
     registry_path = Path(__file__).parents[3] / "config" / "connector_registry.json"
     payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    required = {"id", "priority", "signalFamilies", "discovery", "incrementalKey", "refresh", "backfill", "quotaModel", "worstCaseCostRmbPerRun", "rightsPolicyId", "storedFields", "deletion", "productionState", "acceptanceState"}
+    required = {"id", "priority", "signalFamilies", "discovery", "incrementalKey", "refresh", "backfill", "quotaModel", "worstCaseCostRmbPerRun", "rightsPolicyId", "rightsStatus", "storedFields", "deletion", "productionState", "acceptanceState"}
     assert len(payload["connectors"]) >= 8
     assert all(required.issubset(connector) for connector in payload["connectors"])
     assert all(connector["productionState"] == "disabled" for connector in payload["connectors"] if connector["id"] == "x")
+    assert all(connector["rightsStatus"] != "active" for connector in payload["connectors"])
+
+
+@pytest.mark.asyncio
+async def test_worker_cannot_promote_unapproved_connector_rights() -> None:
+    class EmptyXConnector(BaseConnector):
+        id = "x"
+        platform = "X"
+        signal_family = "discussion"
+
+        async def collect(self) -> list[Observation]:
+            return []
+
+    repository = InMemoryRepository()
+    connector = EmptyXConnector()
+    try:
+        result = await CollectorWorker(repository, [connector]).run_connector(connector)
+    finally:
+        await connector.close()
+    assert result.failed is False
+    assert repository.get_connector("x").rights_status == "blocked"
 
 
 def test_frozen_feature_registry_is_complete_and_controls_metric_roles() -> None:

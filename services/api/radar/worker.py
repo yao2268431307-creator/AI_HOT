@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from .connectors import BaseConnector
 from .contracts import ConnectorStatus
+from .governance import connector_rights_status
 from .budget import BudgetDecision, budget_guard
 from .processor import EventProcessor
 from .identities import SourceIdentityResolver
@@ -73,6 +74,7 @@ class CollectorWorker:
         inserted = 0
         duplicates = 0
         estimated_cost = 0.0
+        rights_status = connector_rights_status(connector.id)
         budget_reason = self._budget_skip_reason(connector)
         if budget_reason:
             existing = self.repository.get_connector(connector.id)
@@ -90,6 +92,7 @@ class CollectorWorker:
                 # skipped runs must not compound coverage down to zero.
                 coverage=min(existing.coverage if existing else 90, max(0, 90 - penalty)),
                 lastSuccess=existing.last_success if existing else utcnow() - timedelta(days=1), note=budget_reason,
+                rightsStatus=rights_status,
             ))
             return ConnectorRun(connector.id, 0, 0, False, None, True)
         try:
@@ -123,6 +126,7 @@ class CollectorWorker:
                 id=connector.id, name=connector.platform, family=connector.signal_family,
                 status="healthy", latencyMinutes=latency, observations24h=observations_24h, coverage=90,
                 lastSuccess=finished, note="最近一轮采集成功；延迟字段为 24H 采集轮次耗时 P95",
+                rightsStatus=rights_status,
             ))
             return ConnectorRun(connector.id, inserted, duplicates, False)
         except Exception as exc:
@@ -139,6 +143,7 @@ class CollectorWorker:
                 coverage=coverage,
                 lastSuccess=existing.last_success if existing else utcnow() - timedelta(days=1),
                 note=f"连接器失败，冻结上一指标：{str(exc)[:120]}",
+                rightsStatus=rights_status,
             ))
             return ConnectorRun(connector.id, inserted, duplicates, True, str(exc))
 

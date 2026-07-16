@@ -97,13 +97,13 @@ def seed_repository(repository: InMemoryRepository) -> InMemoryRepository:
     for event in demo_events():
         repository.upsert_event(event)
     connectors = [
-        ("rss", "RSS / 官方站点", "官方与媒体", "healthy", 3, 1284, 94, "142 个订阅源，正文指纹去重已启用", None, None, 0, "active"),
-        ("hn", "Hacker News", "技术讨论", "healthy", 2, 842, 98, "官方 API；评论作者按独立讨论者计算", None, None, 0, "active"),
-        ("github", "GitHub", "开发者行为", "healthy", 6, 3621, 91, "仓库事件、搜索与指标快照", 1840, 5000, 0, "active"),
-        ("hf", "Hugging Face", "模型采用", "healthy", 7, 1047, 89, "Hub API；下载、点赞和衍生关系", None, None, 0, "active"),
-        ("research", "arXiv / OpenAlex", "研究信号", "healthy", 11, 516, 86, "跨语言实体与作者网络归并", None, None, 0, "active"),
-        ("youtube", "YouTube", "内容行为", "degraded", 19, 431, 58, "配额降频中；结论自动降低置信度", 7200, 10000, 0, "experimental"),
-        ("x", "X Recent Search", "社交讨论", "paused", 0, 0, 0, "实验连接器，未配置商业数据授权", None, None, None, "blocked"),
+        ("rss", "RSS / 官方站点", "official", "healthy", 3, 1284, 94, "142 个订阅源，正文指纹去重已启用", None, None, 0, "pending"),
+        ("hn", "Hacker News", "discussion", "healthy", 2, 842, 98, "官方 API；评论作者按独立讨论者计算", None, None, 0, "pending"),
+        ("github", "GitHub", "behavior", "healthy", 6, 3621, 91, "仓库事件、搜索与指标快照", 1840, 5000, 0, "pending"),
+        ("hf", "Hugging Face", "behavior", "healthy", 7, 1047, 89, "Hub API；下载、点赞和衍生关系", None, None, 0, "pending"),
+        ("research", "arXiv / OpenAlex", "research", "healthy", 11, 516, 86, "跨语言实体与作者网络归并", None, None, 0, "pending"),
+        ("youtube", "YouTube", "behavior", "degraded", 19, 431, 58, "配额降频中；结论自动降低置信度", 7200, 10000, 0, "blocked"),
+        ("x", "X Recent Search", "discussion", "paused", 0, 0, 0, "实验连接器，未配置商业数据授权", None, None, None, "blocked"),
     ]
     for connector_id, name, family, status, latency, count, coverage, note, quota_used, quota_limit, cost, rights_status in connectors:
         repository.upsert_connector(ConnectorStatus(id=connector_id, name=name, family=family, status=status, latencyMinutes=latency, observations24h=count, coverage=coverage, lastSuccess=ago(.1 if status == "healthy" else 1), note=note, quotaUsed=quota_used, quotaLimit=quota_limit, costRmbMonth=cost, rightsStatus=rights_status))

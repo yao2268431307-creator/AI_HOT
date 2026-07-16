@@ -13,6 +13,37 @@ const RadarChart = lazy(() => import("./RadarChart").then((module) => ({ default
 
 type View = "queue" | "radar" | "coverage" | "method";
 type Filters = { state: "all" | LifecycleState; eventType: "all" | RadarEvent["eventType"]; evidence: "all" | RadarEvent["evidenceStrength"] };
+type InteractionPayload = {
+  kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled";
+  idempotencyKey: string;
+  sessionId: string;
+  eventId: string;
+  metadata: Record<string, string | number | boolean>;
+};
+const interactionOutboxKey = "signal-ai-interaction-outbox-v1";
+
+function readInteractionOutbox(): InteractionPayload[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(interactionOutboxKey) ?? "[]");
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeInteractionOutbox(rows: InteractionPayload[]) {
+  window.localStorage.setItem(interactionOutboxKey, JSON.stringify(rows));
+}
+
+async function flushInteractionOutbox(base: string) {
+  for (const payload of readInteractionOutbox()) {
+    const response = await fetch(`${base}/api/v1/interactions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error(`interaction persistence failed (${response.status})`);
+    writeInteractionOutbox(readInteractionOutbox().filter((row) => row.idempotencyKey !== payload.idempotencyKey));
+  }
+}
 const windowName: Record<string, string> = { "1H": "一小时", "6H": "六小时", "24H": "二十四小时", "7D": "七天" };
 
 const stateName: Record<LifecycleState, string> = {
@@ -101,7 +132,9 @@ function ClusterEditDialog({ event, peers }: { event: RadarEvent; peers: RadarEv
   </Dialog.Root>;
 }
 
-function DetailPanel({ event, peers, assessment, lineage, windowSize, watched, onWatchChange, onLineageRefresh, onInteraction, onClose }: { event: RadarEvent; peers: RadarEvent[]; assessment: EventAssessment | null; lineage: EventLineage | null; windowSize: string; watched: boolean; onWatchChange: (eventId: string, watched: boolean) => void; onLineageRefresh: () => void; onInteraction: (kind: "evidence_opened" | "triage_submitted" | "watch_toggled", eventId: string, metadata?: Record<string, string | number | boolean>) => void; onClose: () => void }) {
+type DecisionContext = { queueEligibilityKey: string | null; alertDeliveryKey: string | null; capturedAt: string };
+
+function DetailPanel({ event, peers, assessment, decisionContext, lineage, windowSize, watched, onWatchChange, onLineageRefresh, onInteraction, onClose }: { event: RadarEvent; peers: RadarEvent[]; assessment: EventAssessment | null; decisionContext: DecisionContext | null; lineage: EventLineage | null; windowSize: string; watched: boolean; onWatchChange: (eventId: string, watched: boolean) => void; onLineageRefresh: () => void; onInteraction: (kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled", eventId: string, metadata?: Record<string, string | number | boolean>) => Promise<void>; onClose: () => void }) {
   const latest = event.timeline[event.timeline.length - 1] ?? { attention: event.attention, behavior: event.behavior };
   const hasDiscussion = assessment ? assessment.evidenceMask.discussion === "observed" : discussionObserved(event);
   const hasBehavior = assessment ? assessment.evidenceMask.behavior === "observed" : behaviorObserved(event);
@@ -114,20 +147,154 @@ function DetailPanel({ event, peers, assessment, lineage, windowSize, watched, o
   ].filter((item): item is string => Boolean(item));
   const [actionStatus, setActionStatus] = useState("");
   const [watchNote, setWatchNote] = useState("从研判详情关注");
+  const [waitingExternal, setWaitingExternal] = useState(false);
+  const timing = useRef({ lastTick: 0, lastActivity: 0, activeSeconds: 0, externalWaitSeconds: 0, waitingExternal: false, segmentId: "", sequence: 0 });
+  const openInteractionReady = useRef<Promise<boolean>>(Promise.resolve(true));
+  const reviewAttemptId = useRef("");
+  const submittedAttemptId = useRef("");
+  const collectReviewTiming = useCallback(() => {
+    const now = window.performance.now();
+    const previous = timing.current.lastTick || now;
+    // Cap a single tick so suspended tabs and sleeping devices cannot inflate
+    // foreground work when the browser resumes. Explicit external wait is wall
+    // time, so it keeps accruing while the analyst is in another app/tab.
+    const rawElapsedSeconds = Math.max(0, (now - previous) / 1000);
+    const foregroundElapsedSeconds = Math.min(5, rawElapsedSeconds);
+    if (timing.current.waitingExternal) timing.current.externalWaitSeconds += rawElapsedSeconds;
+    else if (document.visibilityState === "visible" && document.hasFocus() && now - timing.current.lastActivity <= 60_000) {
+      timing.current.activeSeconds += foregroundElapsedSeconds;
+    }
+    timing.current.lastTick = now;
+    return {
+      activeSeconds: Math.round(timing.current.activeSeconds * 10) / 10,
+      externalWaitSeconds: Math.round(timing.current.externalWaitSeconds * 10) / 10,
+    };
+  }, []);
+
+  const sendReviewHeartbeat = useCallback(async () => {
+    const queueEligibilityKey = decisionContext?.queueEligibilityKey;
+    const attemptId = reviewAttemptId.current;
+    const current = timing.current;
+    if (!queueEligibilityKey || !attemptId || !current.segmentId) return;
+    collectReviewTiming();
+    const now = window.performance.now();
+    const state = current.waitingExternal
+      ? "external_wait"
+      : document.visibilityState === "visible" && document.hasFocus() && now - current.lastActivity <= 60_000
+        ? "active" : "idle";
+    const sequence = current.sequence++;
+    await onInteraction("review_heartbeat", event.id, {
+      reviewAttemptId: attemptId, queueEligibilityKey, segmentId: current.segmentId,
+      sequence, state, measurementVersion: "server-heartbeat-v2", idleTimeoutSeconds: 60, tickCapSeconds: 5,
+    });
+  }, [collectReviewTiming, decisionContext?.queueEligibilityKey, event.id, onInteraction]);
+
+  useEffect(() => {
+    const queueEligibilityKey = decisionContext?.queueEligibilityKey;
+    if (!queueEligibilityKey) {
+      openInteractionReady.current = Promise.resolve(false);
+      return;
+    }
+    const now = window.performance.now();
+    const segmentId = window.crypto.randomUUID();
+    timing.current = { lastTick: now, lastActivity: now, activeSeconds: 0, externalWaitSeconds: 0, waitingExternal: false, segmentId, sequence: 0 };
+    const attemptId = window.crypto.randomUUID();
+    reviewAttemptId.current = attemptId;
+    submittedAttemptId.current = "";
+    openInteractionReady.current = onInteraction("detail_opened", event.id, {
+      window: windowSize, reviewAttemptId: attemptId, queueEligibilityKey, segmentId,
+      measurementVersion: "server-heartbeat-v2",
+    })
+      .then(async () => { await sendReviewHeartbeat(); return true; })
+      .catch(() => false);
+    const markActivity = () => {
+      collectReviewTiming();
+      timing.current.lastActivity = window.performance.now();
+    };
+    const accountTransition = () => collectReviewTiming();
+    const interval = window.setInterval(() => { void sendReviewHeartbeat().catch(() => undefined); }, 5000);
+    window.addEventListener("pointerdown", markActivity, { passive: true });
+    window.addEventListener("keydown", markActivity);
+    window.addEventListener("focus", accountTransition);
+    window.addEventListener("blur", accountTransition);
+    document.addEventListener("visibilitychange", accountTransition);
+    return () => {
+      collectReviewTiming();
+      if (submittedAttemptId.current !== attemptId) {
+        void sendReviewHeartbeat().catch(() => undefined).finally(() => onInteraction("review_segment_closed", event.id, {
+          reviewAttemptId: attemptId, queueEligibilityKey, segmentId,
+          measurementVersion: "server-heartbeat-v2", idleTimeoutSeconds: 60, tickCapSeconds: 5,
+        }).catch(() => undefined));
+      }
+      window.clearInterval(interval);
+      window.removeEventListener("pointerdown", markActivity);
+      window.removeEventListener("keydown", markActivity);
+      window.removeEventListener("focus", accountTransition);
+      window.removeEventListener("blur", accountTransition);
+      document.removeEventListener("visibilitychange", accountTransition);
+    };
+  }, [collectReviewTiming, decisionContext?.queueEligibilityKey, event.id, onInteraction, sendReviewHeartbeat, windowSize]);
+
+  const toggleExternalWait = () => {
+    collectReviewTiming();
+    timing.current.waitingExternal = !timing.current.waitingExternal;
+    timing.current.lastActivity = window.performance.now();
+    setWaitingExternal(timing.current.waitingExternal);
+  };
+
   const submitAction = async (action: "watch" | "confirm" | "reject" | "observe") => {
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
     const endpoint = action === "watch" ? "/api/v1/watchlists" : "/api/v1/feedback";
     const body = action === "watch"
       ? { eventId: event.id, note: watchNote }
-      : { eventId: event.id, action, reason: action === "confirm" ? "分析师接受当前研判" : action === "reject" ? "分析师拒绝当前研判" : "证据尚未闭合，继续观察" };
+      : {
+          eventId: event.id, action,
+          queueEligibilityKey: decisionContext?.queueEligibilityKey,
+          alertDeliveryKey: decisionContext?.alertDeliveryKey,
+          reason: action === "confirm" ? "分析师接受当前研判" : action === "reject" ? "分析师拒绝当前研判" : "证据尚未闭合，继续观察",
+        };
     try {
+      if (action !== "watch" && !decisionContext?.queueEligibilityKey) {
+        setActionStatus("提交失败，详情缺少队列版本；请刷新后重试");
+        return;
+      }
       const removingWatch = action === "watch" && watched;
+      // Freeze analyst foreground time at the decision boundary. Network latency
+      // while the feedback receipt is being persisted is not review work.
+      if (action !== "watch") collectReviewTiming();
+      if (action !== "watch" && !(await openInteractionReady.current)) {
+        setActionStatus("无法保存详情打开时间；已进入本地重试队列，请联网后重试研判");
+        return;
+      }
+      if (action !== "watch") await sendReviewHeartbeat();
       const response = await fetch(removingWatch ? `${base}${endpoint}/${encodeURIComponent(event.id)}` : `${base}${endpoint}`, removingWatch
         ? { method: "DELETE" }
         : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!response.ok) throw new Error("request failed");
+      const receipt = await response.json() as { id: string };
       if (action === "watch") onWatchChange(event.id, !watched);
-      onInteraction(action === "watch" ? "watch_toggled" : "triage_submitted", event.id, action === "watch" ? { watched: !watched } : { action });
+      if (action !== "watch") submittedAttemptId.current = reviewAttemptId.current;
+      try {
+        await onInteraction(
+          action === "watch" ? "watch_toggled" : "triage_submitted",
+          event.id,
+          action === "watch"
+            ? { watched: !watched }
+            : {
+                action,
+              feedbackId: receipt.id,
+              reviewAttemptId: reviewAttemptId.current,
+              queueEligibilityKey: decisionContext?.queueEligibilityKey ?? "",
+                segmentId: timing.current.segmentId,
+                measurementVersion: "server-heartbeat-v2",
+                idleTimeoutSeconds: 60,
+                tickCapSeconds: 5,
+              },
+        );
+      } catch {
+        setActionStatus("研判已保存；计时记录已进入本地重试队列");
+        return;
+      }
       setActionStatus(action === "watch" ? (watched ? "已取消关注" : "已关注") : action === "confirm" ? "已接受" : action === "reject" ? "已拒绝" : "已标记观察");
     } catch {
       setActionStatus("提交失败，未保存");
@@ -158,9 +325,10 @@ function DetailPanel({ event, peers, assessment, lineage, windowSize, watched, o
       <div className="label-row">{event.labels.map((label) => <span className="structure-label" key={label}>{labelName[label]}</span>)}</div>
       <div className="detail-actions">
         <button className={watched ? "action-watched" : ""} onClick={() => submitAction("watch")}>{watched ? "取消关注" : "关注事件"}</button>
-        <button className="action-confirm" onClick={() => submitAction("confirm")}>接受</button>
-        <button onClick={() => submitAction("observe")}>需观察</button>
-        <button onClick={() => submitAction("reject")}>拒绝</button>
+        <button className="action-confirm" disabled={!decisionContext?.queueEligibilityKey} onClick={() => submitAction("confirm")}>接受</button>
+        <button disabled={!decisionContext?.queueEligibilityKey} onClick={() => submitAction("observe")}>需观察</button>
+        <button disabled={!decisionContext?.queueEligibilityKey} onClick={() => submitAction("reject")}>拒绝</button>
+        <button type="button" aria-pressed={waitingExternal} onClick={toggleExternalWait}>{waitingExternal ? "结束外部等待" : "等待外部数据"}</button>
         <ClusterEditDialog event={event} peers={peers} />
         {actionStatus && <span className={actionStatus.startsWith("提交失败") ? "action-error" : ""} role="status">{actionStatus}</span>}
       </div>
@@ -218,7 +386,7 @@ function DetailPanel({ event, peers, assessment, lineage, windowSize, watched, o
       <section className="evidence-section">
         <div className="section-title"><span>证据链</span><span>显示 {event.evidence.length} / {Math.max(event.evidenceCount ?? 0, event.evidence.length)} 项可核验</span></div>
         <div className="evidence-list">{event.evidence.map((item, index) => (
-          <a className="evidence-item" href={item.url} target="_blank" rel="noreferrer" key={item.id} onClick={() => onInteraction("evidence_opened", event.id, { evidenceId: item.id, platform: item.platform })}>
+          <a className="evidence-item" href={item.url} target="_blank" rel="noreferrer" key={item.id} onClick={() => { void onInteraction("evidence_opened", event.id, { evidenceId: item.id, platform: item.platform }); }}>
             <span className={`evidence-index evidence-${item.kind}`}>{String(index + 1).padStart(2, "0")}</span>
             <div><b>{item.title}</b><p>{item.excerpt}</p><small>{item.platform} · {item.source} · {timeAgo(item.publishedAt)}</small></div>
             <ChevronRight size={15} />
@@ -333,6 +501,7 @@ export function RadarShell() {
   const [selectedId, setSelectedId] = useState(demoPayload.events[0].id);
   const [detailOpen, setDetailOpen] = useState(true);
   const [detailAssessment, setDetailAssessment] = useState<EventAssessment | null>(null);
+  const [detailDecisionContext, setDetailDecisionContext] = useState<DecisionContext | null>(null);
   const [detailLineage, setDetailLineage] = useState<EventLineage | null>(null);
   const [coverageBudget, setCoverageBudget] = useState<CoverageBudget | null>(null);
   const [query, setQuery] = useState("");
@@ -344,16 +513,34 @@ export function RadarShell() {
   const [showWatched, setShowWatched] = useState(false);
   const searchInput = useRef<HTMLInputElement>(null);
   const interactionSession = useRef("");
-  const recordInteraction = useCallback((kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "watch_toggled", eventId: string, metadata: Record<string, string | number | boolean> = {}) => {
-    if (!interactionSession.current) return;
+  const recordInteraction = useCallback(async (kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled", eventId: string, metadata: Record<string, string | number | boolean> = {}) => {
+    if (!interactionSession.current) {
+      const existing = window.sessionStorage.getItem("signal-ai-review-session");
+      interactionSession.current = existing || window.crypto.randomUUID();
+      if (!existing) window.sessionStorage.setItem("signal-ai-review-session", interactionSession.current);
+    }
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
-    void fetch(`${base}/api/v1/interactions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, idempotencyKey: window.crypto.randomUUID(), sessionId: interactionSession.current, eventId, metadata }) }).catch(() => undefined);
+    const payload: InteractionPayload = {
+      kind, idempotencyKey: window.crypto.randomUUID(), sessionId: interactionSession.current, eventId, metadata,
+    };
+    const pending = readInteractionOutbox();
+    pending.push(payload);
+    writeInteractionOutbox(pending);
+    await flushInteractionOutbox(base);
   }, []);
 
   useEffect(() => {
     const existing = window.sessionStorage.getItem("signal-ai-review-session");
     interactionSession.current = existing || window.crypto.randomUUID();
     if (!existing) window.sessionStorage.setItem("signal-ai-review-session", interactionSession.current);
+  }, []);
+
+  useEffect(() => {
+    const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
+    const retry = () => { void flushInteractionOutbox(base).catch(() => undefined); };
+    retry();
+    window.addEventListener("online", retry);
+    return () => window.removeEventListener("online", retry);
   }, []);
 
   useEffect(() => {
@@ -416,11 +603,13 @@ export function RadarShell() {
     }
     const controller = new AbortController();
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
-    recordInteraction("detail_opened", selectedId, { window: windowSize });
     void fetch(`${base}/api/v1/events/${encodeURIComponent(selectedId)}`, { signal: controller.signal })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("detail unavailable")))
-      .then((data: { assessment: EventAssessment }) => setDetailAssessment(data.assessment))
-      .catch(() => { if (!controller.signal.aborted) setDetailAssessment(null); });
+      .then((data: { assessment: EventAssessment; decisionContext: DecisionContext }) => {
+        setDetailAssessment(data.assessment);
+        setDetailDecisionContext(data.decisionContext);
+      })
+      .catch(() => { if (!controller.signal.aborted) { setDetailAssessment(null); setDetailDecisionContext(null); } });
     void fetch(`${base}/api/v1/events/${encodeURIComponent(selectedId)}/lineage`, { signal: controller.signal })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("lineage unavailable")))
       .then((data: EventLineage) => setDetailLineage(data))
@@ -454,7 +643,7 @@ export function RadarShell() {
   const concentrated = payload.events.filter((e) => e.labels.includes("platform_concentrated")).length;
   const generatedAtMs = new Date(payload.generatedAt).getTime();
   const recentlyUpdated = payload.events.filter((event) => generatedAtMs - new Date(event.updatedAt).getTime() <= 3_600_000).length;
-  const selectEvent = useCallback((id: string) => { setSelectedId(id); setDetailAssessment(null); setDetailLineage(null); setDetailOpen(true); }, []);
+  const selectEvent = useCallback((id: string) => { setSelectedId(id); setDetailAssessment(null); setDetailDecisionContext(null); setDetailLineage(null); setDetailOpen(true); }, []);
   const refreshLineage = useCallback(() => {
     if (!selectedId || dataMode !== "live") return;
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
@@ -518,11 +707,11 @@ export function RadarShell() {
               <Dialog.Overlay className="dialog-overlay mobile-detail-overlay" />
               <Dialog.Content className="mobile-detail-dialog" aria-describedby={undefined}>
                 <Dialog.Title className="sr-only">{selected.title}事件研判详情</Dialog.Title>
-                <DetailPanel event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={() => setDetailOpen(false)} />
+                <DetailPanel key={`${selected.id}:${windowSize}`} event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} decisionContext={detailDecisionContext} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={() => setDetailOpen(false)} />
               </Dialog.Content>
             </Dialog.Portal>
           </Dialog.Root> :
-          <DetailPanel event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={() => setDetailOpen(false)} />)}
+          <DetailPanel key={`${selected.id}:${windowSize}`} event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} decisionContext={detailDecisionContext} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={() => setDetailOpen(false)} />)}
       </div>
     </Tooltip.Provider>
   );
