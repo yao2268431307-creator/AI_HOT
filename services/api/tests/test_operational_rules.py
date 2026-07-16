@@ -14,7 +14,7 @@ from radar.contracts import AlertRuleRequest, EventType, EvidenceStrength, Obser
 from radar.connectors.base import BaseConnector
 from radar.evaluation import EvaluationExample, LabeledPrediction, bcubed_cluster_precision_recall, bootstrap_confidence_interval, cohen_kappa, macro_f1, median_lead_minutes, pairwise_cluster_precision, pairwise_cluster_recall, precision_at_k, temporal_entity_holdout
 from radar.metrics import Baseline, SignalSnapshot, aggregate_metrics, to_score_input
-from radar.source_discovery import SourceCandidate, candidate_score, promote_candidates
+from radar.source_discovery import SourceCandidate, candidate_score, load_source_score_policy, promote_candidates, source_score_policy_digest
 from radar.fixtures import seed_repository
 from radar.feature_registry import behavior_metric_roles, load_feature_registry
 from radar.storage import InMemoryRepository
@@ -156,10 +156,31 @@ def candidate(item_id: str, score_bias: int = 0) -> SourceCandidate:
 def test_source_promotion_respects_history_quality_and_daily_growth_cap() -> None:
     candidates = [candidate(f"s{i}") for i in range(20)]
     promoted = promote_candidates(candidates, active_count=120, now=NOW)
-    assert len(promoted) == 6  # ceil(120 * 5%)
+    assert len(promoted) == 6  # floor(120 * 5%)
     assert all(item.score >= 58 for item in promoted)
+    assert [item.id for item in promoted] == [
+        item.id for item in promote_candidates(list(reversed(candidates)), active_count=120, now=NOW)
+    ]
     too_new = SourceCandidate("new", NOW - timedelta(days=2), 20, 20, 20, 100, 100, 100, 0)
     assert too_new not in promote_candidates([too_new], active_count=120, now=NOW)
+    assert len(promote_candidates(candidates, active_count=121, now=NOW)) == 6
+    assert promote_candidates(candidates, active_count=19, now=NOW) == []
+
+
+def test_source_policy_freezes_ranking_and_repeated_daily_promotions_fail_closed() -> None:
+    policy = load_source_score_policy()
+    assert policy.status == "frozen_for_candidate_governance"
+    assert policy.timezone_name == "Asia/Shanghai"
+    assert policy.ranking_enabled is False
+    assert policy.auto_promotion_enabled is False
+    assert policy.daily_growth_rounding == "floor"
+    assert policy.allow_automatic_bootstrap is False
+    assert source_score_policy_digest(policy).startswith("sha256:")
+    # Six of the current 126 active sources were already promoted today, which
+    # exhausts the 5% cap computed from the start-of-day population of 120.
+    assert promote_candidates(
+        [candidate("next")], active_count=126, promoted_today=6, now=NOW, policy=policy,
+    ) == []
 
 
 def test_source_marketing_overlap_penalizes_candidate() -> None:

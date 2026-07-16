@@ -96,6 +96,12 @@ def demo_events() -> list[RadarEvent]:
 def seed_repository(repository: InMemoryRepository) -> InMemoryRepository:
     for event in demo_events():
         repository.upsert_event(event)
+        for item in event.evidence:
+            repository.register_source_candidate(
+                source_id=item.source.lower().replace(" ", "-"), display_name=item.source,
+                platform=item.platform, language="other", observed_at=item.published_at,
+                reason="recorded_demo_evidence",
+            )
     connectors = [
         ("rss", "RSS / 官方站点", "official", "healthy", 3, 1284, 94, "142 个订阅源，正文指纹去重已启用", None, None, 0, "pending"),
         ("hn", "Hacker News", "discussion", "healthy", 2, 842, 98, "官方 API；评论作者按独立讨论者计算", None, None, 0, "pending"),

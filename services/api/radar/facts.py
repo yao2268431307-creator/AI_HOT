@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 
 from .contracts import ContentObservation, MetricSnapshot, Observation
-from .normalize import normalize_url, sanitize_external_text
+from .normalize import content_fingerprint, normalize_url, sanitize_external_text
 
 
 def split_observation(observation: Observation, parser_version: str = "parser-1", rights_policy_id: str | None = None) -> tuple[ContentObservation, list[MetricSnapshot]]:
-    fingerprint = observation.content_fingerprint or hashlib.sha256(f"{observation.title}\n{observation.text}\n{observation.url}".encode()).hexdigest()
+    fingerprint = observation.content_fingerprint or content_fingerprint(
+        observation.title, observation.text, observation.url,
+    )
     content = ContentObservation(
         id=observation.id, connector=observation.platform.lower().replace(" ", "-"), platform=observation.platform,
         externalId=observation.external_id,

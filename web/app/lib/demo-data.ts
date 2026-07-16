@@ -4,6 +4,7 @@ const t = (hoursAgo: number) => new Date(Date.now() - hoursAgo * 3_600_000).toIS
 
 export const demoPayload: RadarPayload = {
   generatedAt: new Date().toISOString(),
+  dataMode: "recorded_demo",
   window: "6h",
   events: [
     {

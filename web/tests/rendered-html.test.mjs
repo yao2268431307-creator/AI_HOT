@@ -19,6 +19,7 @@ test("server-renders the intelligence workspace", async () => {
   assert.match(html, /<title>SIGNAL\/\/AI · 热点研判台<\/title>/i);
   assert.match(html, /AI 热点研判队列/);
   assert.match(html, /研判队列/);
+  assert.match(html, /信源治理/);
   assert.match(html, /RECORDED DEMO/);
   assert.match(html, /覆盖置信度/);
   assert.match(html, /开发者与研究生态信号 Beta/);
@@ -33,8 +34,9 @@ test("ships the required product views and responsive safety", async () => {
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../app/lib/demo-data.ts", import.meta.url), "utf8"),
   ]);
-  for (const label of ["研判队列", "信号雷达", "数据覆盖", "方法与边界"]) assert.match(shell, new RegExp(label));
+  for (const label of ["研判队列", "信号雷达", "信源治理", "数据覆盖", "方法与边界"]) assert.match(shell, new RegExp(label));
   assert.match(shell, /NEXT_PUBLIC_API_URL/);
+  assert.match(shell, /data\.dataMode === "recorded_demo"/);
   assert.match(shell, /windowSize\.toLowerCase\(\)/);
   assert.match(shell, /windowName\[windowSize\]/);
   assert.match(table, /header: `\$\{windowSize\} 轨迹`/);
@@ -43,6 +45,10 @@ test("ships the required product views and responsive safety", async () => {
   assert.match(shell, /只看关注/);
   assert.match(shell, /ClusterEditDialog/);
   assert.match(shell, /中文讨论覆盖不足/);
+  assert.match(shell, /SourceScore 排行等待真实结果集校准|等待真实历史结果集校准/);
+  assert.match(shell, /candidateScore === null \? "N\/A"/);
+  assert.match(shell, /new URLSearchParams\(\{ limit: "500", offset:/);
+  assert.match(shell, /source-pagination/);
   assert.match(shell, /mobileDetail[\s\S]*Dialog\.Content/);
   assert.match(shell, /discussionEvidenceState === undefined/);
   assert.match(table, /behaviorEvidenceState === undefined/);

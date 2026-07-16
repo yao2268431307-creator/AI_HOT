@@ -48,12 +48,59 @@ CREATE TABLE IF NOT EXISTS sources (
   hit_rate numeric(5,2) NOT NULL DEFAULT 0,
   originality numeric(5,2) NOT NULL DEFAULT 0,
   domain_focus numeric(5,2) NOT NULL DEFAULT 0,
+  authority numeric(5,2) NOT NULL DEFAULT 0,
+  marketing_matrix_overlap numeric(5,2) NOT NULL DEFAULT 0,
   valid_observations integer NOT NULL DEFAULT 0,
+  early_hits integer NOT NULL DEFAULT 0,
+  confirmed_hits integer NOT NULL DEFAULT 0,
+  quality_calibrated boolean NOT NULL DEFAULT false,
   discovered_reason text,
+  discovery_reasons text[] NOT NULL DEFAULT '{}',
+  first_observed_at timestamptz NOT NULL DEFAULT now(),
+  last_observed_at timestamptz NOT NULL DEFAULT now(),
+  score_version text,
   activated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS authority numeric(5,2) NOT NULL DEFAULT 0;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS marketing_matrix_overlap numeric(5,2) NOT NULL DEFAULT 0;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS early_hits integer NOT NULL DEFAULT 0;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS confirmed_hits integer NOT NULL DEFAULT 0;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS quality_calibrated boolean NOT NULL DEFAULT false;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS discovery_reasons text[] NOT NULL DEFAULT '{}';
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS first_observed_at timestamptz;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS last_observed_at timestamptz;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS score_version text;
+UPDATE sources SET
+  first_observed_at=COALESCE(first_observed_at,created_at),
+  last_observed_at=COALESCE(last_observed_at,updated_at,created_at),
+  discovery_reasons=ARRAY(
+    SELECT DISTINCT reason FROM unnest(
+      discovery_reasons || CASE
+        WHEN discovered_reason IS NULL OR btrim(discovered_reason)='' THEN '{}'::text[]
+        ELSE ARRAY[discovered_reason]
+      END
+    ) reason
+  );
+ALTER TABLE sources ALTER COLUMN first_observed_at SET DEFAULT now();
+ALTER TABLE sources ALTER COLUMN first_observed_at SET NOT NULL;
+ALTER TABLE sources ALTER COLUMN last_observed_at SET DEFAULT now();
+ALTER TABLE sources ALTER COLUMN last_observed_at SET NOT NULL;
+
+CREATE TABLE IF NOT EXISTS source_promotion_facts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_id text NOT NULL,
+  from_status text NOT NULL,
+  to_status text NOT NULL,
+  score numeric(5,2) NOT NULL,
+  policy_version text NOT NULL,
+  policy_digest text NOT NULL DEFAULT 'legacy:unavailable',
+  promoted_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+ALTER TABLE source_promotion_facts ADD COLUMN IF NOT EXISTS policy_digest text NOT NULL DEFAULT 'legacy:unavailable';
+CREATE INDEX IF NOT EXISTS source_promotion_facts_time_idx
+  ON source_promotion_facts (promoted_at DESC,source_id);
 
 CREATE TABLE IF NOT EXISTS observations (
   id text PRIMARY KEY,
@@ -86,6 +133,7 @@ CREATE INDEX IF NOT EXISTS observations_collected_idx ON observations (collected
 CREATE INDEX IF NOT EXISTS observations_source_idx ON observations (source_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS observations_entity_idx ON observations (entity_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS observations_fingerprint_idx ON observations (content_fingerprint);
+CREATE INDEX IF NOT EXISTS observations_source_fingerprint_idx ON observations (source_id,content_fingerprint);
 CREATE INDEX IF NOT EXISTS observations_metrics_idx ON observations USING gin (metrics);
 
 -- Minimal immutable ingest ledger: no body/title/URL, only the facts required
@@ -389,7 +437,7 @@ INSERT INTO review_queue_entries
   (event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
 SELECT e.id,'qe-backfill-'||gen_random_uuid()::text,clock_timestamp(),e.lifecycle_state,e.cluster_version,
        COALESCE(NULLIF(e.current_score->>'scoreVersion',''),'unknown'),
-       'product-metrics-2026-07-rc2.7','deployment_backfill'
+       'product-metrics-2026-07-rc2.8','deployment_backfill'
 FROM events e
 WHERE e.lifecycle_state IN ('detected','emerging','accelerating','established','cooling')
   AND NOT EXISTS (SELECT 1 FROM review_queue_entries q WHERE q.event_id=e.id);
@@ -526,7 +574,7 @@ $$;
 DO $$
 DECLARE audit_table text;
 BEGIN
-  FOREACH audit_table IN ARRAY ARRAY['feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents']
+  FOREACH audit_table IN ARRAY ARRAY['feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents','source_promotion_facts']
   LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS %I_append_only ON %I',audit_table,audit_table);
     EXECUTE format('CREATE TRIGGER %I_append_only BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_audit_fact_mutation()',audit_table,audit_table);
@@ -562,5 +610,5 @@ GRANT SELECT ON schema_attestations TO radar_app;
 
 -- Written last: an interrupted migration must never attest the target schema.
 INSERT INTO schema_attestations (key,value,updated_at)
-VALUES ('migration_version','001_init_rc2.3',clock_timestamp())
+VALUES ('migration_version','001_init_rc2.4',clock_timestamp())
 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at;

@@ -1,7 +1,7 @@
 {
-  "version": "product-metrics-2026-07-rc2.7",
+  "version": "product-metrics-2026-07-rc2.8",
   "status": "frozen_for_beta_collection",
-  "frozenAt": "2026-07-17T03:25:00+08:00",
+  "frozenAt": "2026-07-17T03:50:00+08:00",
   "timezone": "Asia/Shanghai",
   "dutyWindows": [
     {
@@ -63,7 +63,7 @@
   },
   "acceptanceMonitoring": {
     "monitorVersion": "acceptance-monitor-v1.1",
-    "monitorDigest": "sha256:e315719ac7a4741c35bd4257860b8f45b2a13f4e2f83b4f6345ecb630ab75d83",
+    "monitorDigest": "sha256:52673952b6419e4c32789e9cd951d18e0418154e643f5be3ce2b008d30854292",
     "keyringVersion": "acceptance-keys-2026-07-rc2.3",
     "keyringDigest": "sha256:17fe0368defef907375ac86dfb9a721ece1eef7a8acb5cf27b920d7109d5826a",
     "keyringFrozenAt": "2026-07-17T03:23:00+08:00",

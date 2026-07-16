@@ -1,0 +1,30 @@
+{
+  "version": "source-score-2026-07-rc2.2",
+  "status": "frozen_for_candidate_governance",
+  "frozenAt": "2026-07-17T04:08:00+08:00",
+  "timezone": "Asia/Shanghai",
+  "rankingEnabled": false,
+  "autoPromotionEnabled": false,
+  "minimumValidObservations": 5,
+  "minimumHistoryDays": 7,
+  "minimumPromotionScore": 58,
+  "dailyGrowthRate": 0.05,
+  "dailyGrowthRounding": "floor",
+  "allowAutomaticBootstrap": false,
+  "activeCapacity": 200,
+  "candidateCapacity": 500,
+  "systemCapacity": 2000,
+  "weights": {
+    "earlyHitRate": 0.30,
+    "confirmedHitRate": 0.25,
+    "originality": 0.18,
+    "domainFocus": 0.12,
+    "authority": 0.15,
+    "marketingMatrixPenalty": 0.35
+  },
+  "notes": [
+    "Candidate discovery is automatic, but source ranking and automatic promotion stay disabled until the frozen historical outcome set and feedback-loop calibration are approved.",
+    "Zero is a real measured value only after calibration; missing source-quality features remain evidence-insufficient and must not be presented as a bad score.",
+    "Promotion is append-only audited and limited to floor(five percent of the start-of-day active population); the initial active cohort must be reviewed manually."
+  ]
+}

@@ -8,10 +8,12 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
+from zoneinfo import ZoneInfo
 
 from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, ConnectorStatus, EvidenceState, EvidenceStrength, FeedbackRequest, LifecycleState, MetricIncidentRequest, MetricSnapshot, MutationReceipt, Observation, ProductInteractionRequest, RadarEvent, StoredScore, WatchlistItem, WatchlistRequest
 from .facts import split_observation
 from .product_metrics import TRIAGE_ACTIONS, load_product_metric_policy
+from .source_discovery import SourceCandidate, load_source_score_policy, promote_candidates, source_score_policy_digest
 
 
 AUDIT_TRIGGER_SPECS = {
@@ -24,6 +26,9 @@ AUDIT_TRIGGER_SPECS = {
     "content_ingest_history_append_only": ("public", "content_ingest_history", "public", "reject_audit_fact_mutation"),
     "connector_runs_append_only": ("public", "connector_runs", "public", "reject_audit_fact_mutation"),
     "metric_incidents_append_only": ("public", "metric_incidents", "public", "reject_audit_fact_mutation"),
+    "source_promotion_facts_append_only": (
+        "public", "source_promotion_facts", "public", "reject_audit_fact_mutation",
+    ),
     "alert_deliveries_immutable": ("public", "alert_deliveries", "public", "protect_alert_delivery_fact"),
     "observation_processing_history_monotonic": (
         "public", "observation_processing_history", "public", "protect_processing_history_fact",
@@ -121,6 +126,9 @@ class InMemoryRepository:
         self.metric_incidents: list[dict[str, object]] = []
         self.review_queue_entries: list[dict[str, object]] = []
         self.lead_threshold_crossings: dict[tuple[str, str, str], dict[str, object]] = {}
+        self.source_profiles: dict[str, dict[str, object]] = {}
+        self.source_content_fingerprints: set[tuple[str, str]] = set()
+        self.source_promotion_facts: list[dict[str, object]] = []
         self.raw_evidence_deletions: dict[str, dict[str, object]] = {}
 
     def runtime_attestation(self) -> dict[str, object]:
@@ -132,11 +140,32 @@ class InMemoryRepository:
     def save_observation_with_outbox(self, observation: Observation) -> bool:
         """Observation and outbox record share the same lock/commit boundary."""
         with self._lock:
-            _, snapshots = split_observation(observation)
+            content, snapshots = split_observation(observation)
             content_inserted = observation.id not in self.observations
             if content_inserted:
+                source_content_key = (observation.source_id, content.content_hash)
+                source_content_duplicate = source_content_key in self.source_content_fingerprints
+                self.source_content_fingerprints.add(source_content_key)
                 self.observations[observation.id] = observation
-                content = split_observation(observation)[0]
+                if not source_content_duplicate:
+                    self.register_source_candidate(
+                        source_id=observation.source_id,
+                        display_name=observation.source_id,
+                        platform=observation.platform,
+                        language=observation.language,
+                        observed_at=observation.collected_at,
+                        reason=f"connector_observation:{content.connector}",
+                        account_id=observation.account_id,
+                        entity_id=observation.entity_id,
+                    )
+                elif observation.source_id in self.source_profiles:
+                    profile = self.source_profiles[observation.source_id]
+                    profile["lastObservedAt"] = max(profile["lastObservedAt"], observation.collected_at)
+                    profile["discoveryReasons"].add("duplicate_content_observation")
+                    if observation.account_id:
+                        profile["accountIds"].add(observation.account_id)
+                    if observation.entity_id:
+                        profile["entityIds"].add(observation.entity_id)
                 self.content_ingest_history.append({
                     "observationId": observation.id, "connectorId": content.connector,
                     "contentFingerprint": observation.content_fingerprint or content.content_hash,
@@ -163,6 +192,82 @@ class InMemoryRepository:
                     "lastError": None,
                 })
             return changed
+
+    def register_source_candidate(
+        self, *, source_id: str, display_name: str, platform: str, language: str,
+        observed_at: datetime, reason: str, account_id: str | None = None, entity_id: str | None = None,
+    ) -> None:
+        with self._lock:
+            profile = self.source_profiles.setdefault(source_id, {
+                "id": source_id, "displayName": display_name, "platform": platform,
+                "language": language, "status": "candidate", "validObservations": 0,
+                "earlyHits": 0, "confirmedHits": 0, "originality": 0.0,
+                "domainFocus": 0.0, "authority": 0.0, "marketingMatrixOverlap": 0.0,
+                "qualityCalibrated": False, "discoveryReasons": set(), "accountIds": set(),
+                "entityIds": set(), "createdAt": observed_at, "firstObservedAt": observed_at,
+                "lastObservedAt": observed_at, "activatedAt": None,
+            })
+            profile["validObservations"] = int(profile["validObservations"]) + 1
+            profile["lastObservedAt"] = max(profile["lastObservedAt"], observed_at)
+            profile["firstObservedAt"] = min(profile["firstObservedAt"], observed_at)
+            profile["discoveryReasons"].add(reason)
+            if account_id:
+                profile["accountIds"].add(account_id)
+            if entity_id:
+                profile["entityIds"].add(entity_id)
+
+    def list_source_profiles(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [
+                {
+                    **profile,
+                    "discoveryReasons": sorted(profile["discoveryReasons"]),
+                    "accountIds": sorted(profile["accountIds"]),
+                    "entityIds": sorted(profile["entityIds"]),
+                }
+                for profile in self.source_profiles.values()
+            ]
+
+    def promote_source_candidates(self, now: datetime | None = None) -> dict[str, object]:
+        promoted_at = now or utcnow()
+        policy = load_source_score_policy()
+        local_day = promoted_at.astimezone(ZoneInfo(policy.timezone_name)).date()
+        with self._lock:
+            active_count = sum(profile["status"] == "active" for profile in self.source_profiles.values())
+            promoted_today = sum(
+                fact["promotedAt"].astimezone(ZoneInfo(policy.timezone_name)).date() == local_day
+                and fact["toStatus"] == "active"
+                for fact in self.source_promotion_facts
+            )
+            candidates = [
+                SourceCandidate(
+                    id=str(profile["id"]), discovered_at=profile["createdAt"],
+                    valid_observations=int(profile["validObservations"]), early_hits=int(profile["earlyHits"]),
+                    confirmed_hits=int(profile["confirmedHits"]), originality=float(profile["originality"]),
+                    domain_focus=float(profile["domainFocus"]), authority=float(profile["authority"]),
+                    marketing_matrix_overlap=float(profile["marketingMatrixOverlap"]),
+                )
+                for profile in self.source_profiles.values()
+                if profile["status"] == "candidate" and profile["qualityCalibrated"] is True
+            ]
+            promoted = promote_candidates(
+                candidates, active_count, now=promoted_at, promoted_today=promoted_today, policy=policy,
+            ) if policy.auto_promotion_enabled else []
+            for candidate in promoted:
+                profile = self.source_profiles[candidate.id]
+                profile["status"] = "active"
+                profile["activatedAt"] = promoted_at
+                self.source_promotion_facts.append({
+                    "id": str(uuid.uuid4()), "sourceId": candidate.id,
+                    "fromStatus": "candidate", "toStatus": "active", "score": candidate.score,
+                    "policyVersion": policy.version, "policyDigest": source_score_policy_digest(policy),
+                    "promotedAt": promoted_at,
+                })
+            return {
+                "promotedSourceIds": [candidate.id for candidate in promoted],
+                "activeBefore": active_count, "promotedEarlierToday": promoted_today,
+                "policyVersion": policy.version, "autoPromotionEnabled": policy.auto_promotion_enabled,
+            }
 
     def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
         with self._lock:
@@ -916,6 +1021,10 @@ class InMemoryRepository:
             for item_id in observation_ids:
                 del self.observations[item_id]
                 self.observation_processing.pop(item_id, None)
+            self.source_profiles.pop(source_id, None)
+            self.source_content_fingerprints = {
+                key for key in self.source_content_fingerprints if key[0] != source_id
+            }
             self.metric_facts = {key: value for key, value in self.metric_facts.items() if value.subject_id not in deleting}
             for event_id, members in list(self.event_observations.items()):
                 for item_id in deleting:
@@ -1042,9 +1151,8 @@ class PostgresRepository:
         }
 
     def save_observation_with_outbox(self, observation: Observation) -> bool:
-        payload = observation.model_dump(mode="json", by_alias=True)
-        digest = observation.content_fingerprint or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         content, snapshots = split_observation(observation)
+        digest = content.content_hash
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1061,6 +1169,47 @@ class PostgresRepository:
                 )
                 content_inserted = cursor.fetchone() is not None
                 if content_inserted:
+                    discovery_reason = f"connector_observation:{content.connector}"
+                    # The observation rows themselves intentionally allow duplicate
+                    # fingerprints so data-quality leakage remains measurable. This
+                    # lock serializes only the source-validity claim: after waiting,
+                    # READ COMMITTED gives the NOT EXISTS statement a fresh snapshot.
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                        (f"source-valid-observation:{observation.source_id}:{digest}",),
+                    )
+                    cursor.execute(
+                        """INSERT INTO sources
+                        (id,platform,display_name,status,language,valid_observations,
+                         discovered_reason,discovery_reasons,first_observed_at,last_observed_at)
+                        SELECT %s,%s,%s,'candidate',%s,1,%s,ARRAY[%s]::text[],%s,%s
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM observations
+                          WHERE source_id=%s AND content_fingerprint=%s AND id<>%s
+                        )
+                        ON CONFLICT (id) DO UPDATE SET
+                          valid_observations=sources.valid_observations+1,
+                          last_observed_at=GREATEST(sources.last_observed_at,excluded.last_observed_at),
+                          first_observed_at=LEAST(sources.first_observed_at,excluded.first_observed_at),
+                          discovery_reasons=ARRAY(
+                            SELECT DISTINCT reason FROM unnest(sources.discovery_reasons||excluded.discovery_reasons) reason
+                          ),
+                          updated_at=clock_timestamp()""",
+                        (
+                            observation.source_id, observation.platform, observation.source_id,
+                            observation.language, discovery_reason, discovery_reason,
+                            observation.collected_at, observation.collected_at,
+                            observation.source_id, digest, observation.id,
+                        ),
+                    )
+                    if cursor.rowcount == 0:
+                        cursor.execute(
+                            """UPDATE sources SET last_observed_at=GREATEST(last_observed_at,%s),
+                            discovery_reasons=ARRAY(
+                              SELECT DISTINCT reason FROM unnest(discovery_reasons||ARRAY['duplicate_content_observation']) reason
+                            ),updated_at=clock_timestamp() WHERE id=%s""",
+                            (observation.collected_at, observation.source_id),
+                        )
                     cursor.execute(
                         """INSERT INTO content_ingest_history
                         (observation_id,connector_id,content_fingerprint,persisted_at)
@@ -1101,6 +1250,92 @@ class PostgresRepository:
                     )
             connection.commit()
         return content_inserted or bool(snapshot_ids)
+
+    def list_source_profiles(self) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT s.id,s.display_name,s.platform,s.language,s.status,s.valid_observations,
+                    s.early_hits,s.confirmed_hits,s.originality,s.domain_focus,s.authority,
+                    s.marketing_matrix_overlap,s.quality_calibrated,s.discovery_reasons,
+                    s.created_at,s.first_observed_at,s.last_observed_at,s.activated_at,
+                    COALESCE((SELECT array_agg(DISTINCT o.account_id) FROM observations o
+                              WHERE o.source_id=s.id AND o.account_id IS NOT NULL),'{}'::text[]),
+                    COALESCE((SELECT array_agg(DISTINCT o.entity_id) FROM observations o
+                              WHERE o.source_id=s.id AND o.entity_id IS NOT NULL),'{}'::text[])
+                    FROM sources s ORDER BY s.created_at,s.id"""
+                )
+                rows = cursor.fetchall()
+        return [
+            {
+                "id": row[0], "displayName": row[1], "platform": row[2], "language": row[3],
+                "status": row[4], "validObservations": row[5], "earlyHits": row[6],
+                "confirmedHits": row[7], "originality": float(row[8]), "domainFocus": float(row[9]),
+                "authority": float(row[10]), "marketingMatrixOverlap": float(row[11]),
+                "qualityCalibrated": row[12], "discoveryReasons": list(row[13] or []),
+                "createdAt": row[14], "firstObservedAt": row[15], "lastObservedAt": row[16],
+                "activatedAt": row[17], "accountIds": list(row[18] or []), "entityIds": list(row[19] or []),
+            }
+            for row in rows
+        ]
+
+    def promote_source_candidates(self, now: datetime | None = None) -> dict[str, object]:
+        policy = load_source_score_policy()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended('source-promotions',0))")
+                cursor.execute("SELECT COALESCE(%s::timestamptz,clock_timestamp())", (now,))
+                promoted_at = cursor.fetchone()[0]
+                cursor.execute("SELECT count(*) FROM sources WHERE status='active'")
+                active_count = int(cursor.fetchone()[0])
+                cursor.execute(
+                    """SELECT count(*) FROM source_promotion_facts
+                    WHERE to_status='active'
+                    AND promoted_at >= (date_trunc('day',%s::timestamptz AT TIME ZONE %s) AT TIME ZONE %s)""",
+                    (promoted_at, policy.timezone_name, policy.timezone_name),
+                )
+                promoted_today = int(cursor.fetchone()[0])
+                cursor.execute(
+                    """SELECT id,created_at,valid_observations,early_hits,confirmed_hits,
+                    originality,domain_focus,authority,marketing_matrix_overlap
+                    FROM sources WHERE status='candidate' AND quality_calibrated=true FOR UPDATE"""
+                )
+                candidates = [
+                    SourceCandidate(
+                        id=str(row[0]), discovered_at=row[1], valid_observations=int(row[2]),
+                        early_hits=int(row[3]), confirmed_hits=int(row[4]), originality=float(row[5]),
+                        domain_focus=float(row[6]), authority=float(row[7]),
+                        marketing_matrix_overlap=float(row[8]),
+                    )
+                    for row in cursor.fetchall()
+                ]
+                promoted = promote_candidates(
+                    candidates, active_count, now=promoted_at, promoted_today=promoted_today, policy=policy,
+                ) if policy.auto_promotion_enabled else []
+                for candidate in promoted:
+                    cursor.execute(
+                        """UPDATE sources SET status='active',lead_score=%s,score_version=%s,
+                        activated_at=%s,updated_at=clock_timestamp()
+                        WHERE id=%s AND status='candidate'""",
+                        (candidate.score, policy.version, promoted_at, candidate.id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("source promotion lost its locked candidate")
+                    cursor.execute(
+                        """INSERT INTO source_promotion_facts
+                        (source_id,from_status,to_status,score,policy_version,policy_digest,promoted_at)
+                        VALUES (%s,'candidate','active',%s,%s,%s,%s)""",
+                        (
+                            candidate.id, candidate.score, policy.version,
+                            source_score_policy_digest(policy), promoted_at,
+                        ),
+                    )
+            connection.commit()
+        return {
+            "promotedSourceIds": [candidate.id for candidate in promoted],
+            "activeBefore": active_count, "promotedEarlierToday": promoted_today,
+            "policyVersion": policy.version, "autoPromotionEnabled": policy.auto_promotion_enabled,
+        }
 
     def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
         with self.connection() as connection:

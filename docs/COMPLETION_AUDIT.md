@@ -22,7 +22,7 @@
 | 数据不足不输出强结论，缺失不当作 0 | 已证实 | Coverage、EvidenceMask、N/A 和连接器故障冻结用例；网页显示 N/A | 真实连接器停机演练 |
 | 15 分钟采集、聚类、评分闭环 | 已证实（代码与计量）/外部时间闸门 | Worker 默认 900 秒；逐 revision 的 collected/enqueued/completed/failed 历史；Owner SLA 接口与合并 revision 回归用例 | 用真实来源运行 72H；要求 95% 在 15 分钟内完成评分且无未恢复失败 |
 | 至少 4 个稳定信号家族，含讨论和行为 | 外部闸门 | 已有 RSS/HN/GitHub/HF/arXiv/OpenAlex/YouTube 适配器和覆盖页；五个免密公共元数据源完成一次真实 smoke | 用授权来源稳定运行 7 天并提交覆盖报告 |
-| 120–200 活跃源、500 候选、2,000 真实容量 | 外部闸门 | 候选晋级/5% 上限与容量契约已实现 | 提供清单、凭证和目标数据库后运行真实容量验收 |
+| 120–200 活跃源、500 候选、2,000 真实容量 | 部分完成/外部闸门 | 采集事务自动登记候选；同源同指纹使用 PG 事务锁，重复内容不抬高有效观测。冻结候选治理策略采用 Asia/Shanghai 严格 floor 5% 日上限、人工种子、确定性 tie-break 与 append-only 策略摘要事实；服务端分页/查询和信源中心可覆盖完整容量。质量特征缺失显示 N/A，排行和自动晋级 fail-closed | 提供真实清单、凭证和目标数据库；完成经验贝叶斯收缩、探索配额与反馈回路校准后才可开放排名/自动晋级，并在目标 PG 上跑真实并发和容量验收 |
 | 10,000 信源合成容量 | 已证实（非生产） | `tools/synthetic_load.py`：10,000 源、500 万计数事实、2,000 事件约 0.94s | 不得据此宣称 PostgreSQL P95 或生产容量 |
 | 中英文事件归并 | 部分完成 | BGE-M3 接口、共同 URL/实体/时间回退和跨语言 Mock 用例 | 部署 BGE-M3，完成 200 条真实中英抽检 |
 | Narrative 与 Event 分离 | 部分完成 | Event 支持可选 Narrative 关系；详情明确 Event 独立评分 | 建立真实 Narrative 归并和人工修订运营流程 |
@@ -36,7 +36,7 @@
 | 连接器发现/增量/刷新/回补/成本/权利卡 | 已证实（配置） | `connector_registry.json`、持久 checkpoint、运行成本 fail-closed | 数据负责人逐字段签字，72H 验收状态由 pending 改为 passed |
 | Precision@K、宏 F1、分类型、Pairwise、B-cubed、区间 | 已证实（工具） | `tools/evaluate.py`、时间实体隔离、Cohen's kappa 和 bootstrap 用例 | 输入 60/240 双标注集并冻结报告 |
 | 高影响聚类 Pairwise Precision ≥ 0.90 | 外部闸门 | 计算实现存在 | 真实冻结测试集达到门槛，否则关闭自动合并 |
-| 产品 KPI：强告警接受率、错误告警、首次分诊和有效研判时长 | 已证实（采集/计算）/外部样本闸门 | 冻结 `product-metrics-2026-07-rc2.7`；反馈只能引用最新 QueueEligibility epoch；已送达告警 + 持久反馈、双 Actor 错误复核、不可变 MetricIncident 归因和值班时钟均有用例。有效研判只累计认证、服务端连续接收的 `active` 心跳，忽略客户端时长汇总，跨重开累计且要求 95% 覆盖；并保留不受 state 缩短的服务端墙钟护栏，可信边界明确不防持证内部人伪报状态 | 真实收集 30 条强告警、5 个告警工作日、50 个可研判事件和 50 次完成研判；人工评估另受签名预登记、完整快照日历和独立基线约束 |
+| 产品 KPI：强告警接受率、错误告警、首次分诊和有效研判时长 | 已证实（采集/计算）/外部样本闸门 | 冻结 `product-metrics-2026-07-rc2.8`；反馈只能引用最新 QueueEligibility epoch；已送达告警 + 持久反馈、双 Actor 错误复核、不可变 MetricIncident 归因和值班时钟均有用例。有效研判只累计认证、服务端连续接收的 `active` 心跳，忽略客户端时长汇总，跨重开累计且要求 95% 覆盖；并保留不受 state 缩短的服务端墙钟护栏，可信边界明确不防持证内部人伪报状态 | 真实收集 30 条强告警、5 个告警工作日、50 个可研判事件和 50 次完成研判；人工评估另受签名预登记、完整快照日历和独立基线约束 |
 | Owner/Analyst/Viewer 与工作区隔离 | 已证实（API key/RLS 单测）/待环境验证（联邦） | 服务器派生 workspace、RLS SQL、权限与隔离用例 | Sites/替代部署的真实身份、成员撤销和 SSE 凭证验证 |
 | 外部文本、SSRF、Prompt Injection、Webhook 安全 | 已证实（代码） | URL/DNS/重定向限制、Unicode NFKC/Bidi 清理、React 转义、LLM 不参与数值评分 | 渗透测试、域名重绑定和真实出口代理验证 |
 | AA、键盘、移动端、图表数据表 | 部分完成/待环境验证 | Radix Dialog、reduced-motion、断点和静态契约已通过；Sites 平台桌面截图已核验 | 企业策略禁止自动化访问 localhost/chatgpt.site；仍需 Chrome/Firefox、键盘、屏幕阅读器、对比度实测 |
@@ -63,6 +63,6 @@ npm.cmd test
 
 ## 当前发布结论
 
-第二轮独立代码复审结果为：剩余 P0/P1/P2 均为“无”，当时独立复跑 `102 passed`。真实连接器 smoke 随后暴露并修复两项 OpenAlex 数据质量缺陷。第三轮复审又指出 smoke 参数无界、空响应误报 PASS 和证据措辞不精确两项 P2；现已增加 `1..10` 边界、零观测失败语义、8 个回归实例并修正文档。最终闭环复审在 `2dbbca1` 上确认当时剩余 P0/P1/P2 均为“无”，独立复跑 Python `111 passed`、Ruff、Web Lint、Vinext build、2 项渲染测试和生产依赖审计全部通过。其后新增并加固 rc2 产品 KPI、逐 revision SLA、完整签名排序/阈值跨越账本、运行时证明与长期验收监控链；本轮最终独立审计确认 P0/P1/P2 均为“无”，复跑 Python `141 passed`、Ruff、compileall、pip check、Web Lint、Vinext build、2 项渲染测试、生产依赖审计、Compose 配置解析和补丁检查全部通过，因此结论为**本地代码候选 GO**。
+第二轮独立代码复审结果为：剩余 P0/P1/P2 均为“无”，当时独立复跑 `102 passed`。真实连接器 smoke 随后暴露并修复两项 OpenAlex 数据质量缺陷。第三轮复审又指出 smoke 参数无界、空响应误报 PASS 和证据措辞不精确两项 P2；现已增加 `1..10` 边界、零观测失败语义、8 个回归实例并修正文档。最终闭环复审在 `2dbbca1` 上确认当时剩余 P0/P1/P2 均为“无”，独立复跑 Python `111 passed`、Ruff、Web Lint、Vinext build、2 项渲染测试和生产依赖审计全部通过。其后新增并加固 rc2 产品 KPI、逐 revision SLA、完整签名排序/阈值跨越账本、运行时证明与长期验收监控链。最新信源治理增量的独立审计先后发现并修复并发同指纹计数、严格 5% 日上限、完整目录分页/账号实体检索、旧迁移回填和同分晋级确定性等问题；最终复核确认当前剩余 P0/P1/P2 均为“无”，独立复跑 Python `146 passed`、Ruff、compileall、pip check、Web Lint、Vinext build、2 项渲染测试、生产依赖审计、Compose 配置解析、monitor digest 和补丁检查全部通过，因此结论为**本地代码候选 GO**。
 
 **rc2 正式 Beta 仍为 NO-GO**：当前不能宣称达到 Definition of Done，也不能进入正式私有测试。剩余阻断项不是页面或单元测试数量，而是真实数据权利、信源规模、双人标注、72H soak、7 天影子运行、生产 PostgreSQL/R2/RLS、身份联邦、可访问性和恢复证据。

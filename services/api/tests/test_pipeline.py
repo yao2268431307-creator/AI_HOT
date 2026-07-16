@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+from pathlib import Path
 
 import httpx
 import pytest
 
 from radar import alerts as alert_module
+from radar import storage as storage_module
 from radar.assessment import event_assessment
 from radar.alerts import sign_payload, verify_payload
 from radar.clustering import ClusterCandidate, choose_cluster, entities
@@ -30,6 +32,7 @@ from radar.processor import EventProcessor
 from radar.retention import RawEvidenceRetentionWorker, load_retention_days
 from radar.evidence_store import S3EvidenceStore
 from radar.storage import InMemoryRepository, PostgresRepository
+from radar.source_discovery import load_source_score_policy, source_score_policy_digest
 from radar.worker import CollectorWorker
 from radar.budget import budget_guard
 
@@ -64,6 +67,80 @@ def test_observation_and_outbox_are_deduplicated_at_same_boundary() -> None:
     assert repository.save_observation_with_outbox(item) is False
     assert len(repository.observations) == 1
     assert len(repository.outbox) == 1
+
+
+def test_ingestion_discovers_source_without_counting_duplicate_content_as_valid() -> None:
+    repository = InMemoryRepository()
+    first = observation("source-first").model_copy(update={
+        "account_id": "rss:official-lab", "entity_id": "org:official-lab",
+        "content_fingerprint": None,
+    })
+    duplicate = first.model_copy(update={
+        "id": "source-duplicate", "external_id": "source-duplicate",
+        "collected_at": first.collected_at + timedelta(minutes=1),
+        "account_id": "mirror:official-lab",
+        "url": "https://example.com/post?utm_source=mirror",
+    })
+    distinct = first.model_copy(update={
+        "id": "source-distinct", "external_id": "source-distinct",
+        "collected_at": first.collected_at + timedelta(minutes=2),
+        "content_fingerprint": "distinct-source-content",
+    })
+    assert repository.save_observation_with_outbox(first)
+    assert repository.save_observation_with_outbox(duplicate)
+    assert repository.save_observation_with_outbox(distinct)
+    profile = repository.list_source_profiles()[0]
+    assert profile["status"] == "candidate"
+    assert profile["validObservations"] == 2
+    assert profile["qualityCalibrated"] is False
+    assert profile["accountIds"] == ["mirror:official-lab", "rss:official-lab"]
+    assert profile["entityIds"] == ["org:official-lab"]
+    assert "duplicate_content_observation" in profile["discoveryReasons"]
+
+
+def test_governed_source_promotion_is_audited_and_cannot_repeat_same_day(monkeypatch) -> None:
+    policy = load_source_score_policy().model_copy(update={"auto_promotion_enabled": True})
+    monkeypatch.setattr(storage_module, "load_source_score_policy", lambda: policy)
+    repository = InMemoryRepository()
+    promoted_at = datetime(2026, 7, 17, 1, tzinfo=timezone.utc)
+    for index in range(20):
+        repository.register_source_candidate(
+            source_id=f"seed-{index}", display_name=f"Seed {index}", platform="RSS", language="en",
+            observed_at=promoted_at - timedelta(days=30), reason="manually_reviewed_seed",
+        )
+        repository.source_profiles[f"seed-{index}"]["status"] = "active"
+    repository.register_source_candidate(
+        source_id="candidate-a", display_name="Candidate A", platform="RSS", language="en",
+        observed_at=promoted_at - timedelta(days=9), reason="early_by_trusted_source",
+    )
+    profile = repository.source_profiles["candidate-a"]
+    profile.update({
+        "validObservations": 10, "earlyHits": 7, "confirmedHits": 6,
+        "originality": 85.0, "domainFocus": 80.0, "authority": 75.0,
+        "marketingMatrixOverlap": 5.0, "qualityCalibrated": True,
+    })
+    result = repository.promote_source_candidates(promoted_at)
+    assert result["promotedSourceIds"] == ["candidate-a"]
+    assert repository.source_promotion_facts[0]["policyDigest"] == source_score_policy_digest(policy)
+
+    repository.register_source_candidate(
+        source_id="candidate-b", display_name="Candidate B", platform="RSS", language="en",
+        observed_at=promoted_at - timedelta(days=9), reason="early_by_trusted_source",
+    )
+    repository.source_profiles["candidate-b"].update({
+        "validObservations": 10, "earlyHits": 7, "confirmedHits": 6,
+        "originality": 85.0, "domainFocus": 80.0, "authority": 75.0,
+        "marketingMatrixOverlap": 5.0, "qualityCalibrated": True,
+    })
+    assert repository.promote_source_candidates(promoted_at + timedelta(hours=1))["promotedSourceIds"] == []
+
+
+def test_postgres_source_validity_claim_is_locked_before_duplicate_probe() -> None:
+    source = (Path(__file__).parents[1] / "radar" / "storage.py").read_text(encoding="utf-8")
+    start = source.index("source-valid-observation:")
+    probe = source.index("WHERE NOT EXISTS (", start)
+    assert "pg_advisory_xact_lock" in source[start - 300:start]
+    assert start < probe
 
 
 def test_new_metric_revision_does_not_break_an_active_processing_lease() -> None:
@@ -121,6 +198,7 @@ def test_each_metric_snapshot_traces_its_own_raw_archive_and_purge_cleans_all_re
         "r2://raw/metric-v1.json", "r2://raw/metric-v2.json",
     }
     repository.purge_source("official-lab")
+    assert repository.list_source_profiles() == []
     assert repository.outbox[-1]["raw_evidence_refs"] == ["r2://raw/metric-v1.json", "r2://raw/metric-v2.json"]
 
 

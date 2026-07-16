@@ -86,7 +86,7 @@ def test_frozen_policy_and_duty_clock_exclude_nights_and_weekends() -> None:
     policy = load_product_metric_policy()
     friday_1700 = datetime(2026, 7, 17, 9, 0, tzinfo=UTC)
     monday_1000 = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    assert policy.version == "product-metrics-2026-07-rc2.7"
+    assert policy.version == "product-metrics-2026-07-rc2.8"
     assert policy.status == "frozen_for_beta_collection"
     assert is_in_duty_window(friday_1700, policy)
     assert duty_seconds_between(friday_1700, monday_1000, policy) == 2 * 3600
@@ -632,11 +632,15 @@ def test_postgres_migration_contains_queue_facts_and_formal_interaction_kinds() 
     assert "DROP CONSTRAINT IF EXISTS product_interactions_kind_check" in sql
     assert "pg_advisory_xact_lock" in (Path(__file__).parents[1] / "radar" / "storage.py").read_text(encoding="utf-8")
     assert "CREATE TABLE IF NOT EXISTS content_ingest_history" in sql
+    assert "observations_source_fingerprint_idx" in sql
+    assert "first_observed_at=COALESCE(first_observed_at,created_at)" in sql
+    assert "ALTER TABLE sources ALTER COLUMN last_observed_at SET NOT NULL" in sql
     assert "CREATE TABLE IF NOT EXISTS metric_incidents" in sql
+    assert "policy_digest text NOT NULL" in sql
     assert "CREATE TABLE IF NOT EXISTS schema_attestations" in sql
-    assert "migration_version','001_init_rc2.3'" in sql
+    assert "migration_version','001_init_rc2.4'" in sql
     assert "REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON schema_attestations FROM radar_app" in sql
-    assert "'feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents'" in sql
+    assert "'feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents','source_promotion_facts'" in sql
     assert "%I_append_only" in sql
     assert "CREATE TRIGGER alert_deliveries_immutable" in sql
     assert "CREATE TRIGGER observation_processing_history_monotonic" in sql

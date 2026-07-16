@@ -154,7 +154,69 @@ export interface ConnectorStatus {
 
 export interface RadarPayload {
   generatedAt: string;
+  dataMode: "live" | "recorded_demo";
   window: string;
   events: RadarEvent[];
   connectors: ConnectorStatus[];
+}
+
+export type SourceStatus = "candidate" | "active" | "paused" | "blocked";
+
+export interface SourceProfile {
+  id: string;
+  displayName: string;
+  platform: string;
+  language: "zh" | "en" | "other";
+  status: SourceStatus;
+  validObservations: number;
+  earlyHits: number;
+  confirmedHits: number;
+  originality: number;
+  domainFocus: number;
+  authority: number;
+  marketingMatrixOverlap: number;
+  qualityCalibrated: boolean;
+  discoveryReasons: string[];
+  accountIds: string[];
+  entityIds: string[];
+  createdAt: string;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  activatedAt?: string | null;
+  candidateScore: number | null;
+  scoreEvidenceStatus: "eligible" | "insufficient";
+  promotionEligible: boolean;
+  rankEligible: boolean;
+  blockedReasons: string[];
+  historyDays: number;
+  scoreVersion: string;
+}
+
+export interface SourceCatalogResponse {
+  generatedAt: string;
+  items: SourceProfile[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+  counts: Record<SourceStatus, number>;
+  active: number;
+  activeCapacity: number;
+  candidateCapacity: number;
+  systemCapacity: number;
+  sourceScorePolicy: {
+    version: string;
+    digest: string;
+    status: string;
+    frozenAt: string;
+    timezone: string;
+    rankingEnabled: boolean;
+    autoPromotionEnabled: boolean;
+    minimumValidObservations: number;
+    minimumHistoryDays: number;
+    minimumPromotionScore: number;
+    dailyGrowthRate: number;
+    dailyGrowthRounding: "floor";
+    allowAutomaticBootstrap: boolean;
+  };
 }

@@ -2,16 +2,16 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Tooltip from "@radix-ui/react-tooltip";
-import { Activity, Bell, BookOpenCheck, ChevronRight, CircleGauge, Database, Filter, GitBranch, LayoutList, Menu, Radar, Search, Send, ShieldCheck, X } from "lucide-react";
+import { Activity, Bell, BookOpenCheck, ChevronRight, CircleGauge, Database, Filter, GitBranch, LayoutList, Menu, Radar, Search, Send, ShieldCheck, UsersRound, X } from "lucide-react";
 import type { FormEvent } from "react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { demoPayload } from "../lib/demo-data";
-import type { ConnectorStatus, CoverageBudget, EventAssessment, EventLineage, EventMember, LifecycleState, RadarEvent, RadarPayload, StructureLabel } from "../lib/types";
+import type { ConnectorStatus, CoverageBudget, EventAssessment, EventLineage, EventMember, LifecycleState, RadarEvent, RadarPayload, SourceCatalogResponse, SourceStatus, StructureLabel } from "../lib/types";
 import { QueueTable } from "./QueueTable";
 
 const RadarChart = lazy(() => import("./RadarChart").then((module) => ({ default: module.RadarChart })));
 
-type View = "queue" | "radar" | "coverage" | "method";
+type View = "queue" | "radar" | "sources" | "coverage" | "method";
 type Filters = { state: "all" | LifecycleState; eventType: "all" | RadarEvent["eventType"]; evidence: "all" | RadarEvent["evidenceStrength"] };
 type InteractionPayload = {
   kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled";
@@ -453,6 +453,43 @@ function FilterDialog({ filters, onChange }: { filters: Filters; onChange: (next
   </Dialog.Root>;
 }
 
+const sourceStatusName: Record<SourceStatus, string> = {
+  candidate: "候选", active: "活跃", paused: "暂停", blocked: "阻断",
+};
+
+function SourceView({ catalog, loading, query, status, onQueryChange, onStatusChange, onPageChange }: {
+  catalog: SourceCatalogResponse | null; loading: boolean; query: string; status: "all" | SourceStatus;
+  onQueryChange: (value: string) => void; onStatusChange: (value: "all" | SourceStatus) => void;
+  onPageChange: (offset: number) => void;
+}) {
+  const rows = catalog?.items ?? [];
+  return (
+    <div className="content-view source-view">
+      <div className="view-heading"><div><div className="eyebrow">SOURCE GOVERNANCE</div><h1>热点信源治理</h1><p>自动发现候选，证据充分后再校准与晋级；缺失质量特征不等于低分。</p></div></div>
+      {!catalog && <div className="boundary-card boundary-warning"><ShieldCheck size={22} /><div><h3>{loading ? "正在读取信源登记表" : "信源目录尚不可用"}</h3><p>{loading ? "正在从 API 获取候选生命周期与策略证明。" : "录制演示不会伪造真实信源排名；启动 API 后才能查看候选登记表。"}</p></div></div>}
+      {catalog && <>
+        <section className="source-policy-card">
+          <div><span>SOURCESCORE</span><b>{catalog.sourceScorePolicy.rankingEnabled ? "排行已启用" : "排行关闭"}</b><small>{catalog.sourceScorePolicy.version}</small></div>
+          <p>{catalog.sourceScorePolicy.rankingEnabled ? "已通过历史结果集与反馈回路校准。" : `等待真实历史结果集校准；候选分不参与排序。最低 ${catalog.sourceScorePolicy.minimumValidObservations} 次有效观测、${catalog.sourceScorePolicy.minimumHistoryDays} 天历史；${catalog.sourceScorePolicy.timezone} 单日晋级按 floor 取整且不超过 ${(catalog.sourceScorePolicy.dailyGrowthRate * 100).toFixed(0)}%，首批 active 种子需人工审核。`}</p>
+          <div className="policy-flags"><span className={catalog.sourceScorePolicy.autoPromotionEnabled ? "flag-on" : "flag-off"}>自动晋级 {catalog.sourceScorePolicy.autoPromotionEnabled ? "ON" : "OFF"}</span><span>策略摘要 {catalog.sourceScorePolicy.digest.slice(0, 18)}…</span></div>
+        </section>
+        <div className="coverage-summary source-summary"><div><b>{catalog.counts.active ?? 0}/{catalog.activeCapacity}</b><span>活跃信源 / 容量</span></div><div><b>{catalog.counts.candidate ?? 0}/{catalog.candidateCapacity}</b><span>候选池 / 容量</span></div><div><b>{catalog.total}</b><span>当前查询匹配数</span></div><div><b>{catalog.systemCapacity}</b><span>系统容量上限</span></div></div>
+        <section className="source-directory">
+          <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input maxLength={200} value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索信源、平台、账号或实体…" aria-label="搜索信源" /></div><select aria-label="信源状态" value={status} onChange={(event) => onStatusChange(event.target.value as "all" | SourceStatus)}><option value="all">全部状态</option>{Object.entries(sourceStatusName).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><div className="queue-count">{catalog.total === 0 ? "0" : `${catalog.offset + 1}–${catalog.offset + rows.length}`} / {catalog.total}</div></div>
+          <div className="table-scroll"><table className="source-table"><thead><tr><th>信源</th><th>生命周期</th><th>证据历史</th><th>SourceScore</th><th>发现依据与阻断项</th></tr></thead><tbody>{rows.map((source) => <tr key={source.id}>
+            <td><b>{source.displayName}</b><small>{source.platform} · {source.language.toUpperCase()}</small><em>{source.id}</em></td>
+            <td><span className={`source-status source-${source.status}`}>{sourceStatusName[source.status]}</span><small>最近观测 {timeAgo(source.lastObservedAt)}</small></td>
+            <td><b className="mono">{source.validObservations}</b><small>有效观测 · {source.historyDays} 天历史</small><em>{source.accountIds.length} 账号 / {source.entityIds.length} 实体</em></td>
+            <td><b className="mono">{source.candidateScore === null ? "N/A" : source.candidateScore.toFixed(2)}</b><small>{source.scoreEvidenceStatus === "eligible" ? "质量证据充分" : "质量证据不足"}</small><em>{source.rankEligible ? "可参与排序" : "不参与排序"}</em></td>
+            <td><p>{source.discoveryReasons.join(" · ") || "尚无发现说明"}</p><small>{source.blockedReasons.join("；") || "没有晋级阻断项"}</small></td>
+          </tr>)}</tbody></table>{rows.length === 0 && <p className="empty-directory">没有匹配的信源。</p>}</div>
+          <div className="source-pagination"><button type="button" disabled={catalog.offset === 0} onClick={() => onPageChange(Math.max(0, catalog.offset - catalog.limit))}>上一页</button><span className="mono">PAGE {Math.floor(catalog.offset / catalog.limit) + 1}</span><button type="button" disabled={!catalog.hasMore} onClick={() => onPageChange(catalog.offset + catalog.limit)}>下一页</button></div>
+        </section>
+      </>}
+    </div>
+  );
+}
+
 function CoverageView({ connectors, budget }: { connectors: ConnectorStatus[]; budget: CoverageBudget | null }) {
   const healthy = connectors.filter((c) => c.status === "healthy").length;
   const observations = connectors.reduce((sum, c) => sum + c.observations24h, 0);
@@ -504,6 +541,12 @@ export function RadarShell() {
   const [detailDecisionContext, setDetailDecisionContext] = useState<DecisionContext | null>(null);
   const [detailLineage, setDetailLineage] = useState<EventLineage | null>(null);
   const [coverageBudget, setCoverageBudget] = useState<CoverageBudget | null>(null);
+  const [sourceCatalog, setSourceCatalog] = useState<SourceCatalogResponse | null>(null);
+  const [sourceCatalogFailed, setSourceCatalogFailed] = useState(false);
+  const [sourceQuery, setSourceQuery] = useState("");
+  const deferredSourceQuery = useDeferredValue(sourceQuery);
+  const [sourceStatus, setSourceStatus] = useState<"all" | SourceStatus>("all");
+  const [sourceOffset, setSourceOffset] = useState(0);
   const [query, setQuery] = useState("");
   const [windowSize, setWindowSize] = useState("6H");
   const [mobileNav, setMobileNav] = useState(false);
@@ -563,10 +606,10 @@ export function RadarShell() {
         if (!response.ok) throw new Error("API unavailable");
         const data = await response.json() as RadarPayload;
         if (!disposed && Array.isArray(data.events)) {
-          hasLiveData = true;
+          hasLiveData = data.dataMode === "live";
           setPayload(data);
           setSelectedId((current) => data.events.some((item) => item.id === current) ? current : (data.events[0]?.id ?? ""));
-          setDataMode("live");
+          setDataMode(data.dataMode === "recorded_demo" ? "demo" : "live");
         }
       } catch {
         if (!disposed) setDataMode(hasLiveData ? "stale" : "demo");
@@ -596,6 +639,20 @@ export function RadarShell() {
       .catch(() => undefined);
     return () => controller.abort();
   }, [dataMode]);
+
+  useEffect(() => {
+    if (view !== "sources") return;
+    const controller = new AbortController();
+    const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
+    const parameters = new URLSearchParams({ limit: "500", offset: String(sourceOffset) });
+    if (deferredSourceQuery) parameters.set("query", deferredSourceQuery);
+    if (sourceStatus !== "all") parameters.set("status", sourceStatus);
+    void fetch(`${base}/api/v1/sources?${parameters}`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("sources unavailable")))
+      .then((data: SourceCatalogResponse) => { setSourceCatalog(data); setSourceCatalogFailed(false); })
+      .catch(() => { if (!controller.signal.aborted) { setSourceCatalog(null); setSourceCatalogFailed(true); } });
+    return () => controller.abort();
+  }, [deferredSourceQuery, sourceOffset, sourceStatus, view]);
 
   useEffect(() => {
     if (!selectedId || dataMode !== "live") {
@@ -676,7 +733,8 @@ export function RadarShell() {
           <nav aria-label="主导航">
             {([
               ["queue", LayoutList, "研判队列"], ["radar", CircleGauge, "信号雷达"],
-              ["coverage", Database, "数据覆盖"], ["method", BookOpenCheck, "方法与边界"],
+              ["sources", UsersRound, "信源治理"], ["coverage", Database, "数据覆盖"],
+              ["method", BookOpenCheck, "方法与边界"],
             ] as const).map(([id, Icon, label]) => <button key={id} className={view === id ? "active" : ""} onClick={() => { setView(id); setMobileNav(false); }}><Icon size={17} /><span>{label}</span>{id === "queue" && <em>{events.length}</em>}</button>)}
           </nav>
           <div className="sidebar-section"><span>工作区</span><button><Activity size={16} /><span>AI 行业雷达</span><i className="workspace-dot" /></button></div>
@@ -698,6 +756,7 @@ export function RadarShell() {
             </section>
           </div>}
           {view === "radar" && <div className="content-view radar-view"><div className="view-heading"><div><div className="eyebrow">SIGNAL MAP / {windowSize}</div><h1>讨论 × 行为信号雷达</h1><p>坐标只用于适配事件类型；圆点大小表示证据强度。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div><section className="radar-card"><div className="radar-legend"><span><i className="state-accelerating-dot" />加速</span><span><i className="state-emerging-dot" />萌发</span><span><i className="state-detected-dot" />已发现</span></div><Suspense fallback={<div className="radar-chart" role="status">正在加载雷达图…</div>}><RadarChart events={radarEvents} onSelect={selectEvent} /></Suspense><details className="radar-data"><summary>查看图表数据表</summary><div className="table-scroll"><table><thead><tr><th>事件</th><th>讨论</th><th>行为</th><th>证据</th></tr></thead><tbody>{radarEvents.map((event) => <tr key={event.id}><td>{event.title}</td><td>{event.attention}</td><td>{event.behavior}</td><td>{({ low: "低", medium: "中", high: "高" })[event.evidenceStrength]}</td></tr>)}</tbody></table></div></details></section><div className="radar-insight"><Activity size={18} /><div><b>当前结构</b><p>{strongLifecycle} 个事件处于加速或已建立阶段，{gap} 个事件存在注意力与实际行为的显著偏离。</p></div></div></div>}
+          {view === "sources" && <SourceView catalog={sourceCatalog} loading={!sourceCatalogFailed} query={sourceQuery} status={sourceStatus} onQueryChange={(value) => { setSourceQuery(value); setSourceOffset(0); }} onStatusChange={(value) => { setSourceStatus(value); setSourceOffset(0); }} onPageChange={setSourceOffset} />}
           {view === "coverage" && <CoverageView connectors={payload.connectors} budget={coverageBudget} />}
           {view === "method" && <MethodView />}
         </main>

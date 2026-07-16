@@ -87,6 +87,11 @@
 | O-10 | 长期验收监控 | 单样本 canary、72H 连续样本和 7D 产品/人工证据分别报告 | canary 永不满足时长门槛；正式样本必须按 900 秒 cadence 由登记 scheduler 签名，并绑定 policy、monitor、schema、keyring digest；72H 校验 rights/连接器/管道，7D 额外校验产品与人工证据 |
 | O-11 | 正式运行时证明 | 在 InMemory、超级用户、未强制 RLS、无审计 trigger、可写 migration marker 或未认证环境生成样本 | 任一条件均使 runtime attestation 失败；只有稳定 instance ID、受限 `radar_app`、数据库时钟和冻结迁移标记全部满足才可计入正式窗口 |
 | O-12 | 运行时证明防替身 | 在其他 schema 创建同名表，或把同名 trigger 挂到错误表/函数、禁用或删除 UPDATE/DELETE 事件 | 必须限定 public 表，并逐项匹配 trigger 名、表/函数 schema、函数名、行级 BEFORE UPDATE/DELETE 与 enabled 状态，否则 attestation 失败 |
+| O-13 | 候选自动发现 | 同一信源进入两条独立内容和一条同指纹复制内容 | 自动建立 candidate；有效观测只计 2，复制内容保留发现痕迹但不抬高晋级样本 |
+| O-14 | 信源缺失语义 | 候选尚未完成原创度、领域集中度、权威度和营销矩阵重合度校准 | `candidateScore=N/A`、`scoreEvidenceStatus=insufficient`，不得当作 0 分或进入排行 |
+| O-15 | SourceScore 闭环闸门 | 冻结策略尚未通过真实结果集和反馈回路校准 | 排行与自动晋级均关闭；离线治理 Owner 运行晋级也返回空结果并附策略版本 |
+| O-16 | 扩源重复执行 | 起始日 120 个 active，当日已晋级 6 个后再次运行 | 按 Asia/Shanghai 自然日计算，第二次不得继续晋级；晋级事实只增不改 |
+| O-17 | 有效观测并发去重 | 两个 PG 事务同时写同一 source+fingerprint、不同 Observation ID | Observation 仍可保留用于重复率审计，但 source 有效观测只增加 1；同键事务锁必须位于重复探测前 |
 | E-01 | 评估 | 排名结果 | Precision@K 与宏 F1 分开计算 |
 | E-02 | 评估 | 提前发现后被确认 | 单独计算中位提前量 |
 | E-03 | 聚类评估 | 两事件被错误合并 | Pairwise Precision 能发现 false merge |
@@ -97,11 +102,12 @@
 | E-08 | 人工证据预登记 | 影子窗口开始前冻结规则，但不预知未来事件 ID | schema v2 冻结完整本地日期日历、Top-5 排名算法/digest、阈值、bootstrap seed/迭代/抽样单元；每天 09:00±5 分钟快照由 scheduler 签名并提交到监控链 |
 | E-09 | 完整排序账本 | 调度器用第 6 名替换 Top5、修改 score，或只签名所选候选 | 同一采样时点必须存在独立 ledger key 签名的完整排序账本；Top5 逐项等于前五个合格条目，摘要/签名任一不符即失败 |
 | E-10 | 提前量 crossing 连续性 | 事件过阈值后被 supersede，或中途从后续账本删除 crossing | 首次阈值跨越按 event/threshold/policy 版本化追加并保留；正式窗口只纳入窗内 crossing，但后续签名账本不得缩减或改写已有事实 |
-| E-09 | Precision 与提前量防自证 | Top-5 快照和 baseline 首次发现时间由同一角色或未登记密钥签名 | 拒绝；Precision 要求两个 reviewer 独立签名且点估计、95% CI 下界均 ≥ 0.70，提前量必须使用独立 baseline collector 的全量 eligible manifest 和首次发现日志 |
+| E-11 | Precision 与提前量防自证 | Top-5 快照和 baseline 首次发现时间由同一角色或未登记密钥签名 | 拒绝；Precision 要求两个 reviewer 独立签名且点估计、95% CI 下界均 ≥ 0.70，提前量必须使用独立 baseline collector 的全量 eligible manifest 和首次发现日志 |
 | W-01 | Web | 服务端渲染首页 | 返回 200、正确标题、研判队列与覆盖说明 |
 | W-02 | Web | 静态产品契约 | 四个核心视图、移动断点和 reduced motion 均存在 |
 | W-03 | Web 静态可访问性 | 检查移动端详情实现 | 使用 Radix Dialog 模态、可访问标题、移动断点及 reduced-motion 规则；真实焦点行为仍进入浏览器验收 |
 | W-04 | Web 时间窗契约 | 检查 1H/6H/24H/7D 绑定 | 请求参数、列表轨迹标题和详情轨迹标题引用同一 `windowSize` 状态 |
+| W-05 | 信源治理视图 | 打开信源中心且 SourceScore 尚未校准 | 显示候选/活跃容量、生命周期、有效观测、发现与阻断原因；明确“排行关闭”和 N/A，不按候选分排序；服务端分页可访问 200 active + 500 candidate，账号/实体搜索能命中末页候选 |
 
 ## 必须在真实环境执行的验收
 

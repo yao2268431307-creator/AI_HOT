@@ -297,6 +297,7 @@ class ConnectorStatus(BaseModel):
 
 class RadarPayload(BaseModel):
     generated_at: datetime = Field(alias="generatedAt")
+    data_mode: Literal["live", "recorded_demo"] = Field(alias="dataMode")
     window: str
     events: list[RadarEvent]
     connectors: list[ConnectorStatus]

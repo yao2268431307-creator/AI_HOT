@@ -20,6 +20,7 @@ def test_radar_contract_and_evidence_traceability() -> None:
         assert response.status_code == 200
         payload = response.json()
         assert payload["window"] == "6h"
+        assert payload["dataMode"] == "recorded_demo"
         assert len(payload["events"]) >= 5
         confirmed = next(event for event in payload["events"] if event["state"] == "accelerating")
         assert len(confirmed["evidence"]) >= 3
@@ -195,6 +196,7 @@ def test_role_enforcement_when_auth_is_enabled(monkeypatch) -> None:
         "analyst-key": {"subject": "analyst", "role": "ANALYST", "workspaceId": "workspace-a"},
         "owner-key": {"subject": "owner", "role": "OWNER", "workspaceId": "workspace-a"},
         "governance-key": {"subject": "cluster-reviewer", "role": "ANALYST", "workspaceId": "system-governance"},
+        "governance-owner-key": {"subject": "source-governor", "role": "OWNER", "workspaceId": "system-governance"},
     }
     monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("RADAR_API_KEYS", json.dumps(keys))
@@ -230,6 +232,15 @@ def test_role_enforcement_when_auth_is_enabled(monkeypatch) -> None:
             json={"targetEventId": "evt-benchmark", "reason": "offline-reviewed global topology correction"},
         )
         assert governance_cluster_change.status_code == 202
+        assert http.post(
+            "/api/v1/sources/promotions/run", headers={"X-API-Key": "owner-key"},
+        ).status_code == 403
+        governed_promotion = http.post(
+            "/api/v1/sources/promotions/run", headers={"X-API-Key": "governance-owner-key"},
+        )
+        assert governed_promotion.status_code == 200
+        assert governed_promotion.json()["autoPromotionEnabled"] is False
+        assert governed_promotion.json()["promotedSourceIds"] == []
 
 
 def test_graph_and_source_capacity_contract() -> None:
@@ -240,6 +251,49 @@ def test_graph_and_source_capacity_contract() -> None:
         sources = http.get("/api/v1/sources").json()
         assert sources["candidateCapacity"] == 500
         assert sources["systemCapacity"] == 2000
+        assert sources["counts"]["candidate"] > 0
+        assert sources["sourceScorePolicy"]["rankingEnabled"] is False
+        assert sources["sourceScorePolicy"]["autoPromotionEnabled"] is False
+        assert sources["sourceScorePolicy"]["timezone"] == "Asia/Shanghai"
+        assert sources["sourceScorePolicy"]["minimumValidObservations"] == 5
+        assert sources["sourceScorePolicy"]["minimumHistoryDays"] == 7
+        assert sources["sourceScorePolicy"]["dailyGrowthRounding"] == "floor"
+        assert sources["sourceScorePolicy"]["allowAutomaticBootstrap"] is False
+        assert sources["items"][0]["candidateScore"] is None
+        assert sources["items"][0]["scoreEvidenceStatus"] == "insufficient"
+        assert sources["items"][0]["rankEligible"] is False
+        assert any("尚未完成历史校准" in reason for reason in sources["items"][0]["blockedReasons"])
+
+
+def test_source_catalog_paginates_and_searches_all_active_and_candidate_capacity() -> None:
+    repository = InMemoryRepository()
+    app = create_app(repository)
+    repository.source_profiles.clear()
+    observed_at = datetime.now(timezone.utc) - timedelta(days=10)
+    for index in range(700):
+        source_id = f"source-{index:03d}"
+        repository.register_source_candidate(
+            source_id=source_id, display_name=f"Source {index:03d}", platform="RSS", language="en",
+            observed_at=observed_at, reason="capacity_regression_fixture",
+            account_id="account-tail-699" if index == 699 else None,
+            entity_id="entity-tail-699" if index == 699 else None,
+        )
+        if index < 200:
+            repository.source_profiles[source_id]["status"] = "active"
+    with TestClient(app) as http:
+        first = http.get("/api/v1/sources?limit=500").json()
+        assert first["total"] == 700
+        assert len(first["items"]) == 500
+        assert first["hasMore"] is True
+        assert first["offset"] == 0
+        second = http.get("/api/v1/sources?limit=500&offset=500").json()
+        assert len(second["items"]) == 200
+        assert second["hasMore"] is False
+        tail = http.get("/api/v1/sources?status=candidate&query=source-699&limit=20").json()
+        assert tail["total"] == 1
+        assert [item["id"] for item in tail["items"]] == ["source-699"]
+        assert http.get("/api/v1/sources?query=account-tail-699").json()["items"][0]["id"] == "source-699"
+        assert http.get("/api/v1/sources?query=entity-tail-699").json()["items"][0]["id"] == "source-699"
 
 
 def test_revised_assessment_contract_exposes_na_masks_and_non_precise_strength() -> None:

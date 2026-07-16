@@ -19,6 +19,10 @@ from .auth import Principal, Role, current_principal, require_role
 from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, EventType, FeedbackRequest, MetricIncidentRequest, MutationReceipt, ProductInteractionRequest, RadarPayload, WatchlistRequest
 from .fixtures import seed_repository
 from .product_metrics import beta_product_metrics, load_product_metric_policy, review_funnel
+from .source_discovery import (
+    SourceCandidate, candidate_score, eligible as source_promotion_eligible,
+    evidence_eligible as source_evidence_eligible, load_source_score_policy, source_score_policy_digest,
+)
 from .storage import InMemoryRepository, PostgresRepository
 from .connectors.base import ConnectorError, ensure_safe_public_url_resolved
 
@@ -40,7 +44,7 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         production_ready = (
             attestation.get("storageBackend") == "postgresql"
             and attestation.get("rlsVerified") is True
-            and attestation.get("migrationVersion") == "001_init_rc2.3"
+            and attestation.get("migrationVersion") == "001_init_rc2.4"
             and attestation.get("auditTriggersVerified") is True
             and attestation.get("migrationMarkerReadOnly") is True
             and attestation.get("databaseUser") == "radar_app"
@@ -68,7 +72,11 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             points = [point for point in event.timeline if point.at >= cutoff]
             if event.updated_at >= cutoff or points:
                 events.append(event.model_copy(update={"timeline": points}))
-        return RadarPayload(generatedAt=generated_at, window=window, events=events, connectors=connectors)
+        return RadarPayload(
+            generatedAt=generated_at,
+            dataMode="recorded_demo" if isinstance(repo, InMemoryRepository) else "live",
+            window=window, events=events, connectors=connectors,
+        )
 
     def require_event(event_id: str):
         event = repo.get_event(event_id)
@@ -80,7 +88,7 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         require_role(principal, Role.ANALYST)
         system_workspace = os.getenv("RADAR_SYSTEM_WORKSPACE_ID", "system-governance")
         if os.getenv("AUTH_REQUIRED", "false").lower() == "true" and principal.workspace_id != system_workspace:
-            raise HTTPException(403, "global cluster topology changes require the offline governance workspace")
+            raise HTTPException(403, "global governance changes require the offline governance workspace")
 
     @app.get("/api/v1/review-queue")
     async def review_queue(_: Principal = Depends(current_principal)):
@@ -291,13 +299,118 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         return {"eventId": event_id, "nodes": nodes, "links": links}
 
     @app.get("/api/v1/sources")
-    async def sources(_: Principal = Depends(current_principal)):
-        grouped: dict[str, dict[str, object]] = {}
-        for event in repo.list_events():
-            for item in event.evidence:
-                current = grouped.setdefault(item.source, {"id": item.source.lower().replace(" ", "-"), "name": item.source, "platform": item.platform, "hits": 0})
-                current["hits"] = int(current["hits"]) + 1
-        return {"items": list(grouped.values()), "active": len(grouped), "candidateCapacity": 500, "systemCapacity": 2000}
+    async def sources(
+        status: str | None = Query(default=None, pattern="^(candidate|active|paused|blocked)$"),
+        language: str | None = Query(default=None, pattern="^(zh|en|other)$"),
+        platform: str | None = Query(default=None, max_length=100),
+        query: str | None = Query(default=None, max_length=200),
+        limit: int = Query(default=200, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: Principal = Depends(current_principal),
+    ) -> dict[str, object]:
+        generated_at = datetime.now(timezone.utc)
+        policy = load_source_score_policy()
+        items: list[dict[str, object]] = []
+        all_profiles = repo.list_source_profiles()
+        for row in all_profiles:
+            created_at = row.get("createdAt")
+            if not isinstance(created_at, datetime):
+                continue
+            candidate = SourceCandidate(
+                id=str(row["id"]), discovered_at=created_at,
+                valid_observations=int(row.get("validObservations") or 0),
+                early_hits=int(row.get("earlyHits") or 0), confirmed_hits=int(row.get("confirmedHits") or 0),
+                originality=float(row.get("originality") or 0), domain_focus=float(row.get("domainFocus") or 0),
+                authority=float(row.get("authority") or 0),
+                marketing_matrix_overlap=float(row.get("marketingMatrixOverlap") or 0),
+            )
+            quality_calibrated = row.get("qualityCalibrated") is True
+            history_eligible = source_evidence_eligible(candidate, now=generated_at, policy=policy)
+            promotion_eligible = (
+                quality_calibrated
+                and source_promotion_eligible(candidate, now=generated_at, policy=policy)
+            )
+            age_days = max(0, int((generated_at - created_at.astimezone(timezone.utc)).total_seconds() // 86400))
+            blocked_reasons = []
+            if not quality_calibrated:
+                blocked_reasons.append("原创度、领域集中度、权威度和营销矩阵重合度尚未完成历史校准")
+            if candidate.valid_observations < policy.minimum_valid_observations:
+                blocked_reasons.append(
+                    f"有效观测 {candidate.valid_observations}/{policy.minimum_valid_observations}"
+                )
+            if age_days < policy.minimum_history_days:
+                blocked_reasons.append(f"历史 {age_days}/{policy.minimum_history_days} 天")
+            score = candidate_score(candidate, policy) if quality_calibrated else None
+            if score is not None and score < policy.minimum_promotion_score:
+                blocked_reasons.append(f"候选分 {score:.2f}/{policy.minimum_promotion_score:.2f}")
+            if not policy.auto_promotion_enabled:
+                blocked_reasons.append("冻结策略尚未开启自动晋级")
+            if not policy.ranking_enabled:
+                blocked_reasons.append("SourceScore 排行等待真实结果集校准")
+            item = {
+                **row,
+                "candidateScore": score,
+                "scoreEvidenceStatus": "eligible" if quality_calibrated and history_eligible else "insufficient",
+                "promotionEligible": promotion_eligible,
+                "rankEligible": promotion_eligible and policy.ranking_enabled,
+                "blockedReasons": blocked_reasons,
+                "historyDays": age_days,
+                "scoreVersion": policy.version,
+            }
+            items.append(item)
+        if status:
+            items = [item for item in items if item.get("status") == status]
+        if language:
+            items = [item for item in items if item.get("language") == language]
+        if platform:
+            items = [item for item in items if str(item.get("platform", "")).lower() == platform.lower()]
+        if query:
+            lowered = query.lower()
+            items = [
+                item for item in items
+                if lowered in (
+                    f"{item.get('id', '')} {item.get('displayName', '')} {item.get('platform', '')} "
+                    f"{' '.join(str(value) for value in item.get('accountIds', []))} "
+                    f"{' '.join(str(value) for value in item.get('entityIds', []))}"
+                ).lower()
+            ]
+        status_order = {"active": 0, "candidate": 1, "paused": 2, "blocked": 3}
+        items.sort(key=lambda item: (
+            status_order.get(str(item.get("status")), 9),
+            -int(item.get("validObservations") or 0), str(item.get("id")),
+        ))
+        counts = {
+            source_status: sum(item.get("status") == source_status for item in all_profiles)
+            for source_status in ("candidate", "active", "paused", "blocked")
+        }
+        total = len(items)
+        page = items[offset:offset + limit]
+        return {
+            "generatedAt": generated_at.isoformat(), "items": page, "total": total,
+            "offset": offset, "limit": limit, "hasMore": offset + len(page) < total,
+            "counts": counts, "active": counts["active"],
+            "activeCapacity": policy.active_capacity, "candidateCapacity": policy.candidate_capacity,
+            "systemCapacity": policy.system_capacity,
+            "sourceScorePolicy": {
+                "version": policy.version, "digest": source_score_policy_digest(policy),
+                "status": policy.status, "frozenAt": policy.frozen_at.isoformat(),
+                "timezone": policy.timezone_name,
+                "rankingEnabled": policy.ranking_enabled,
+                "autoPromotionEnabled": policy.auto_promotion_enabled,
+                "minimumValidObservations": policy.minimum_valid_observations,
+                "minimumHistoryDays": policy.minimum_history_days,
+                "minimumPromotionScore": policy.minimum_promotion_score,
+                "dailyGrowthRate": policy.daily_growth_rate,
+                "dailyGrowthRounding": policy.daily_growth_rounding,
+                "allowAutomaticBootstrap": policy.allow_automatic_bootstrap,
+            },
+        }
+
+    @app.post("/api/v1/sources/promotions/run")
+    async def run_source_promotions(principal: Principal = Depends(current_principal)) -> dict[str, object]:
+        require_role(principal, Role.OWNER)
+        require_global_governance(principal)
+        return repo.promote_source_candidates()
 
     @app.get("/api/v1/connectors")
     async def connectors(_: Principal = Depends(current_principal)):

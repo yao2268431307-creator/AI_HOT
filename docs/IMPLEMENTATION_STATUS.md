@@ -4,7 +4,7 @@
 
 ## 已实现
 
-- 深色情报终端式网页：研判队列、事件详情、信号雷达、覆盖页、方法页、移动端、键盘行选择、减少动态效果；移动端详情使用带焦点约束和关闭后焦点恢复的模态层。
+- 深色情报终端式网页：研判队列、事件详情、信号雷达、信源治理、覆盖页、方法页、移动端、键盘行选择、减少动态效果；移动端详情使用带焦点约束和关闭后焦点恢复的模态层。
 - 事件详情：Event/Narrative、生命周期、结构标签、六维指标、24H/7D 结果占位、反向信号、正常时滞、方法边界、状态时间线、证据链和谱系；支持关注备注、接受/拒绝/需观察、合并/拆分、操作状态与撤销。拆分成员来自完整 Observation ID 接口，不复用截断证据卡 ID。尚无真实结果标签时明确显示 N/A。
 - 待研判队列为默认首页，具有全文搜索及生命周期、事件类型、证据强度筛选；二维雷达只绘制讨论与行为均可用的事件，并提供数据表替代。
 - FastAPI 核心接口：review queue、event、assessment、timeline、evidence、lineage、radar、sources、coverage、watchlist 列表/幂等新增/删除、alert rules/feed、feedback、产品研判指标、SSE，以及兼容旧路径。
@@ -20,15 +20,16 @@
 - 每个 Observation revision 另存 collected/enqueued/completed/failed 时间、尝试次数和错误；合并处理多个待处理 revision 时逐条写入完成事实。Owner 只读接口报告“采集时间→评分完成”15 分钟 SLA、成熟未完成项、未来时间污染和未恢复失败，不再用连接器轮次耗时冒充端到端延迟。
 - 评分事件到告警规则的真实闭环：规则匹配、至少三项证据、工作区/领域日预算、四小时冷却、新增证据或状态升级、签名 Webhook、持久化投递记录和 Web 内告警接口；预算、幂等键和冷却在数据库预留事务内原子检查，Webhook 失败会释放预留。
 - 连接器失败降级、处理失败持久化待重试、成功后才推进的持久化 checkpoint、24H 滚动观测与轮次耗时统计、来源候选晋级、5% 日增长上限、运行时月度成本台账与逐连接器预算降频/停机（未配置合约单价时 fail-closed）。连接器 Registry 明示发现、增量、刷新、回补、配额、成本、字段权利、删除和 72H 验收状态。
+- 每条独立内容在入库事务中自动登记候选信源；同信源同指纹复制内容不增加有效观测，但保留发现痕迹和账号/实体关联。`source-score-2026-07-rc2.2` 冻结最低样本、历史天数、容量、Asia/Shanghai 严格 floor 日增长、人工种子规则和权重；质量特征未校准时 API 与信源中心显示 N/A 而非 0。SourceScore 排行和自动晋级保持关闭，直到真实历史结果集与反馈回路校准获批；未来晋级使用离线治理 Owner、事务锁、确定性 tie-break 和 append-only 策略摘要事实。信源 API/网页使用服务端查询与分页，可覆盖 200 active + 500 candidate 以及 2,000 系统容量。
 - 来源删除覆盖逐 item 原始对象、全部指标修订、成员关系、派生分数、标题和缓存；保留成员会在同一事务提高 processing revision，因此即使没有新采集也会重新评分，无保留成员的事件会被删除。
 - 每条观测记录连接器 rightsPolicy；到期任务清除原始对象引用和指标修订引用，保留最小事实，并通过逐对象确认、租约和指数退避的删除队列物理删除本地/R2 对象；S3/R2 部分失败不会被确认，毒对象不阻塞其他对象，共享的未到期引用不会被误删。
 - 全局行为 N/A 变更在生产认证开启时只允许 `RADAR_SYSTEM_WORKSPACE_ID` 的 Owner 执行；普通工作区反馈不会修改全局评分。后续首次出现类型有效行为事实会在同一评分周期覆盖旧 N/A。
 - 人工合并/拆分采用可审计异步命令；生产认证开启时只有离线治理工作区的 Analyst/Owner 能修改全局共享拓扑，普通租户工作区返回 403。Worker 以乐观锁创建新 Event，旧 Event 标记 `supersededBy`，迁移成员并重算，保留历史评分/告警；任意工作区的关注都解析到当前有效后继；撤销提升父事件版本，阻止撤销前排队的旧命令继续执行；谱系可查且支持撤销。
-- rc2 产品 KPI 的冻结策略为 `product-metrics-2026-07-rc2.7`。系统在事件进入每个可研判 epoch 时原子记录 QueueEligibility，反馈必须引用当前有效 eligibility key，旧 epoch 不能污染首次分诊；强告警接受率使用已送达告警作分母和持久化反馈作判断源；错误强告警要求两个不同 Actor 复核。系统故障导致的重复告警只能由 Owner 基于两条真实投递建立不可变 MetricIncident，排除事实绑定 incident digest，不接受自由文本归因。
+- rc2 产品 KPI 的冻结策略为 `product-metrics-2026-07-rc2.8`。系统在事件进入每个可研判 epoch 时原子记录 QueueEligibility，反馈必须引用当前有效 eligibility key，旧 epoch 不能污染首次分诊；强告警接受率使用已送达告警作分母和持久化反馈作判断源；错误强告警要求两个不同 Actor 复核。系统故障导致的重复告警只能由 Owner 基于两条真实投递建立不可变 MetricIncident，排除事实绑定 incident digest，不接受自由文本归因。
 - 首次分诊按 Asia/Shanghai 预登记值班窗累计；前端每 5 秒上报带 attempt/segment/sequence 的认证心跳，后端忽略客户端时长汇总，只累计 `active` 状态并跨详情关闭/重开合并全部 segment。完成研判的有效 telemetry 覆盖率必须达到 95%，否则不输出达标结论；并行的服务端观测心跳墙钟不受客户端 state 缩短，只作异常护栏，不能证明前台注意力。该有效时长口径明确不防止持证 Analyst 伪报状态。`/api/v1/metrics/beta` 对四项正式指标逐项报告最低样本和 `passesTarget`，另报告墙钟护栏；样本不足时固定返回 `insufficient/null`。
 - 正式人工评估采用预登记 schema v2：冻结完整本地日历、排名规则、阈值版本、bootstrap seed/迭代次数/抽样单元；每个采样时点由独立 ledger key 签名完整排序账本和 append-only 阈值跨越事实，每天 09:00±5 分钟的 Top-5 快照必须逐项等于同一账本前五名，并由 scheduler 签名后提交 snapshot commitment。Precision@5 同时要求点估计和 95% CI 下界均不低于 0.70；提前量使用版本化 crossing 事实和由 baseline collector 签名的首次发现日志。scheduler、reviewer、baseline、ledger 四类 Ed25519 密钥不得复用。
 - 评估工具输出 Precision@K、宏 F1、错误告警/日、提前量、eventType 分组、Pairwise、B-cubed 和 bootstrap 区间；双标注 Cohen's kappa 有独立实现。
-- 141 项 Python 自动化用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
+- 146 项 Python 自动化用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
 - 五个免密公共元数据连接器完成显式真实 smoke；该过程发现并修复 OpenAlex 空作者 ID 整批失败与异常未来发布日期污染时间线的问题。命令与运行证据独立保存，不进入确定性 CI，也不替代 72 小时 soak。
 - owner-only Sites 录制数据候选 v1 已部署成功；源码 SHA、归档哈希、访问策略与平台桌面截图均已归档。该版本明确显示 `RECORDED DEMO`，尚未连接生产 FastAPI 与身份联邦。
 - `tools/acceptance_monitor.py` 可由外部调度器每 15 分钟追加哈希串联、Ed25519 签名且可检出篡改的 JSONL 样本，并分别生成 canary、72H soak 和 7 天 shadow 报告。正式模式把 policy、monitor、schema 与 keyring digest 绑定到每个样本，校验只增不减的事实账本、数据权利连续性、非零观测、至少四个连接器家族、讨论与行为覆盖、连接器健康/重复率及端到端 SLA；还要求生产 PostgreSQL、受限应用角色、强制 RLS、审计触发器、只读迁移标记、认证和稳定 instance ID 的运行时证明。内存仓库和空 keyring 固定 NO-GO，单样本 canary 固定为 `acceptanceEligible=false`。
@@ -39,7 +40,7 @@
 
 ## 尚未宣称完成
 
-- 真实 120–200 活跃源和 500 候选源的运营清单。
+- 真实 120–200 活跃源和 500 候选源的运营清单，以及 SourceScore 的经验贝叶斯收缩、探索配额和反馈回路真实校准；当前只开放候选登记与治理视图，不开放排名。
 - BGE-M3 生产推理服务、持久化分层基线与分析师反馈训练闭环；仓库不捆绑 2GB+ 模型权重，当前运行时基线缓存也不能替代 28 天时间/实体隔离校准。
 - X、Bluesky、Bilibili 的生产连接；它们受授权、配额或实时流部署约束。
 - 60/240 双人标注集、时间隔离校准、F1/Precision@K 的真实数值。
@@ -55,7 +56,7 @@
 ## 本轮可复现验证
 
 ```text
-Python: 141 passed
+Python: 146 passed
 Python Ruff: passed
 Web: ESLint passed
 Web: Vinext production build passed
