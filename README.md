@@ -68,7 +68,7 @@ $env:WEBHOOK_SIGNING_SECRET="replace-with-a-secret"
 .\.venv\Scripts\python.exe -m radar.alert_worker
 ```
 
-Redis Stream 全量丢失时，先停止调度常规 Outbox publisher 和消费者并等待当前租约退出，再按冻结时间窗从 PostgreSQL 的已提交 Outbox 重建。恢复命令会原子拒绝仍有活跃 publisher/consumer 的目标 Stream；恢复期间新启动的 publisher/consumer 也会 fail closed。命令默认仅输出 dry-run 候选统计，不写 Redis；执行模式要求 `--confirm-stream` 与目标 Stream 完全一致，且 `--until` 不得晚于 PostgreSQL 时钟。它只重放 `score.created` 与 `source.erased`，使用稳定 `outbox_id`、互斥锁和 Redis 内续跑检查点，不改写 PostgreSQL 发布事实：
+Redis Stream 全量丢失时，先停止调度常规 Outbox publisher 和消费者并等待当前租约退出，再按冻结时间窗从 PostgreSQL 的已提交 Outbox 重建。恢复命令会原子拒绝仍有活跃 publisher/consumer 的目标 Stream；恢复期间新启动的 publisher/consumer 也会 fail closed。命令默认仅输出 dry-run 候选统计，不写 Redis；执行模式要求 `--confirm-stream` 与目标 Stream 完全一致，且 `--until` 不得晚于 PostgreSQL 时钟。常规 publisher、恢复和裁剪共用冻结的 `STREAM_OUTBOX_KINDS`，覆盖 observation、metric snapshot、score、feedback、cluster edit、rescore 与 source deletion 七类事件；未登记 kind 会记录失败且不得进入 Stream。恢复使用稳定 `outbox_id`、互斥锁和 Redis 内续跑检查点，不改写 PostgreSQL 发布事实：
 
 ```powershell
 $env:DATABASE_URL="postgresql://radar_app:...@host/database"
@@ -82,6 +82,22 @@ $env:REDIS_URL="redis://host:6379/0"
 
 重放仍是 at-least-once；进程在 XADD 与检查点之间中断时可能再次投递同一 `outbox_id`，所以消费者的业务幂等约束不能关闭。操作与故障窗口证据见 [Outbox/Redis 恢复验证](docs/evidence/OUTBOX_REDIS_RECOVERY_2026-07-17.md)。
 恢复锁存在或检查点仍为 `running` 时，常规 publisher 和 consumer 都会 fail closed。检查点同时保存 PostgreSQL `(created_at,id)` 与最后一条 Redis Stream ID；续跑不仅核对末条，还会以自动清理的磁盘临时账本精确对账 PostgreSQL 期望前缀与 Redis 去重后的完整 `outbox_id` 顺序及累计数。未完成检查点若存在前缀缺失、多余、乱序或找不到对应 Redis 行，会拒绝续跑并要求清理检查点后从完整窗口重启；已完成恢复的 Stream 后续再次丢失，则清除 completed cursor 后自动全量重建。命令完成后先启动消费者，再恢复常规 publisher；重放只覆盖历史上已标记 published 的相关事件，仍处于 pending 的 Outbox 会由常规 publisher 发布。保留 PostgreSQL Outbox 的时间范围必须覆盖所选恢复窗口，并为前缀校验预留足够临时磁盘空间。
+
+Redis Stream 保留采用显式维护，不由 publisher 自动 `MAXLEN` 裁剪。操作前停止该 Stream 的 publisher/consumer 与 PostgreSQL Outbox 清理任务，并等待参与者租约排空；当前租约只约束应用参与者，不能替代发布链整体的跨系统 fencing。工具会拒绝活跃参与者、恢复锁、未完成恢复状态或缺少必需 consumer group。默认只 dry-run：它以 Redis 时钟计算保留期边界，取所有现存消费者组的最早 pending/last-delivered 安全水位，只把严格早于最终边界的消息列为候选，并逐个核对其 `outbox_id` 是现有恢复工具支持的已发布 Outbox kind。execute 必须回填同一次 dry-run 的 `safeTrimMinId`；执行期间 PostgreSQL `FOR SHARE` 行锁阻断候选恢复事实被删除，Redis Lua 在同一原子操作内重新核对完整消费者组状态并精确裁剪。任何无效、状态变化或不可恢复消息都会拒绝 execute；安全边界内仍超过容量上限时只报告 `over_limit`，不会强制删除：
+
+```powershell
+$env:DATABASE_URL="postgresql://radar_app:...@host/database"
+$env:REDIS_URL="redis://host:6379/0"
+.\.venv\Scripts\python.exe tools\trim_redis_stream.py `
+  --stream radar:events --retention-hours 168 --capacity-limit 1000000 `
+  --required-group radar-alerts
+.\.venv\Scripts\python.exe tools\trim_redis_stream.py `
+  --stream radar:events --retention-hours 168 --capacity-limit 1000000 `
+  --required-group radar-alerts --execute --confirm-stream radar:events `
+  --confirm-before-id 1784200000000-0
+```
+
+`--confirm-before-id` 的值必须原样复制紧邻 dry-run 输出的 `safeTrimMinId`。该值是获批的最大裁剪边界：execute 会重新计算 `calculatedSafeTrimMinId`；若安全水位后退则拒绝，若只随时间或消费进度前移，仍严格按较早的获批 ID 裁剪，不扩大删除范围。多组场景需重复传入 `--required-group`，或设置逗号分隔的 `RADAR_REQUIRED_STREAM_GROUPS`。PostgreSQL Outbox 保留期必须不短于 Redis 可恢复窗口。实现、实测断言与尚未覆盖的 Redis Cluster/目标规模边界见 [Redis Stream 安全保留验证](docs/evidence/REDIS_STREAM_RETENTION_2026-07-17.md)。
 
 生产认证开启时，修改全局“行为不适用”只允许离线治理工作区的 Owner。请为治理身份单独配置 `RADAR_SYSTEM_WORKSPACE_ID`；普通工作区的 Analyst/Owner 反馈不会直接改写全局事件分数。
 
@@ -97,7 +113,7 @@ npm.cmd test
 
 测试不调用外部平台；连接器使用录制/MockTransport 响应，避免配额、网络与授权状态让 CI 变得不确定。真实源的连通性属于部署环境 smoke test。
 
-默认套件会跳过 10 项真实基础设施用例。启动 `docker compose` 并显式配置 `POSTGRES_INTEGRATION_DSN`、`POSTGRES_INTEGRATION_ADMIN_DSN`、`REDIS_INTEGRATION_URL` 与 `S3_INTEGRATION_*` 后，可验证实际迁移/RLS/trigger、并发去重、Outbox→Redis、consumer group 和 MinIO 对象操作。协调重启脚本还要求用 `DOCKER_INTEGRATION_CONTEXT` 指定经校验的本地 Docker context，并 fail-closed 限定 compose 的 loopback 端口 `5432/6379/9000`，不会接触远端服务：
+默认套件会跳过 11 项真实基础设施用例。启动 `docker compose` 并显式配置 `POSTGRES_INTEGRATION_DSN`、`POSTGRES_INTEGRATION_ADMIN_DSN`、`REDIS_INTEGRATION_URL` 与 `S3_INTEGRATION_*` 后，可验证实际迁移/RLS/trigger、并发去重、Outbox→Redis、consumer group、安全水位裁剪和 MinIO 对象操作。协调重启脚本还要求用 `DOCKER_INTEGRATION_CONTEXT` 指定经校验的本地 Docker context，并 fail-closed 限定 compose 的 loopback 端口 `5432/6379/9000`，不会接触远端服务：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest services\api\tests\test_postgres_integration.py services\api\tests\test_infrastructure_integration.py -q

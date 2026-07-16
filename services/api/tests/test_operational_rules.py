@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from radar import stream_retention as retention_module
 from radar.alerts import AlertCandidate, AlertPolicyEngine
 from radar.alert_worker import AlertDispatcher
 from radar.budget import budget_guard
@@ -23,8 +24,15 @@ from radar.source_discovery import SourceCandidate, candidate_score, load_source
 from radar.fixtures import seed_repository
 from radar.feature_registry import behavior_metric_roles, load_feature_registry
 from radar.storage import InMemoryRepository
+from radar.stream_retention import (
+    ConsumerGroupWatermark,
+    ensure_watermarks_did_not_move_backwards,
+    minimum_stream_id,
+    stream_id_key,
+)
 from radar.worker import CollectorWorker
 from tools import replay_outbox_to_redis as replay_tool
+from tools import trim_redis_stream as retention_tool
 from tools.replay_outbox_to_redis import execute_replay
 
 
@@ -541,6 +549,111 @@ def test_connector_registry_has_required_rights_cost_backfill_and_acceptance_fie
     assert all(required.issubset(connector) for connector in payload["connectors"])
     assert all(connector["productionState"] == "disabled" for connector in payload["connectors"] if connector["id"] == "x")
     assert all(connector["rightsStatus"] != "active" for connector in payload["connectors"])
+
+
+def test_stream_retention_uses_oldest_group_pending_or_delivery_watermark() -> None:
+    watermarks = [
+        ConsumerGroupWatermark("alerts", "100-0", 2, "80-0", "80-0"),
+        ConsumerGroupWatermark("deletions", "90-0", 0, None, "90-0"),
+    ]
+    assert minimum_stream_id("120-0", *(item.safe_boundary_id for item in watermarks)) == "80-0"
+    assert minimum_stream_id("70-0", *(item.safe_boundary_id for item in watermarks)) == "70-0"
+    assert stream_id_key("80-2") == (80, 2)
+
+    ensure_watermarks_did_not_move_backwards(
+        watermarks,
+        [
+            ConsumerGroupWatermark("alerts", "110-0", 1, "90-0", "90-0"),
+            ConsumerGroupWatermark("deletions", "100-0", 0, None, "100-0"),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="moved backwards: alerts"):
+        ensure_watermarks_did_not_move_backwards(
+            watermarks,
+            [
+                ConsumerGroupWatermark("alerts", "79-0", 0, None, "79-0"),
+                ConsumerGroupWatermark("deletions", "100-0", 0, None, "100-0"),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_stream_retention_cli_requires_stream_and_reviewed_boundary_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setenv("REDIS_URL", "redis://unused")
+    missing_boundary = retention_tool.parser().parse_args([
+        "--stream", "radar:events", "--execute", "--confirm-stream", "radar:events",
+    ])
+    with pytest.raises(SystemExit, match="--confirm-before-id is required"):
+        await retention_tool.run(missing_boundary)
+
+    wrong_stream = retention_tool.parser().parse_args([
+        "--stream", "radar:events", "--execute", "--confirm-stream", "radar:other",
+        "--confirm-before-id", "1-0",
+    ])
+    with pytest.raises(SystemExit, match="--confirm-stream must exactly match"):
+        await retention_tool.run(wrong_stream)
+
+
+@pytest.mark.asyncio
+async def test_stream_retention_cancellation_releases_a_late_postgres_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    finish = threading.Event()
+    released = threading.Event()
+    guard = object()
+
+    def slow_acquire(_dsn: str, _path: Path) -> object:
+        started.set()
+        assert finish.wait(timeout=5)
+        return guard
+
+    def release(value: object) -> None:
+        assert value is guard
+        released.set()
+
+    monkeypatch.setattr(retention_module, "lock_outbox_ledger", slow_acquire)
+    monkeypatch.setattr(retention_module, "release_locked_outbox_ledger", release)
+    task = asyncio.create_task(retention_module.acquire_locked_outbox_ledger(
+        "postgresql://unused", Path("unused.sqlite3"),
+    ))
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert released.wait(timeout=5)
+
+    redis_started = asyncio.Event()
+    redis_finish = asyncio.Event()
+    redis_completed = asyncio.Event()
+
+    class SlowRedis:
+        async def eval(self, *_args: object) -> list[int]:
+            redis_started.set()
+            await redis_finish.wait()
+            redis_completed.set()
+            return [1, 0]
+
+    atomic_trim = asyncio.create_task(
+        retention_module.trim_stream_at_verified_watermarks(
+            SlowRedis(),  # type: ignore[arg-type]
+            "radar:events",
+            "80-0",
+            [ConsumerGroupWatermark("alerts", "100-0", 2, "80-0", "80-0")],
+        ),
+    )
+    await redis_started.wait()
+    atomic_trim.cancel()
+    await asyncio.sleep(0)
+    assert not atomic_trim.done()
+    redis_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await atomic_trim
+    assert redis_completed.is_set()
 
 
 @pytest.mark.asyncio

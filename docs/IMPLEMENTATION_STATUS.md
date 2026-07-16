@@ -16,7 +16,7 @@
 - RSS、Hacker News、GitHub、Hugging Face、arXiv、OpenAlex、YouTube 连接器适配器；限流重试、URL 规范化、指纹去重、DNS/重定向 SSRF 拦截和真实原始证据归档。跨来源搜索结果按 item 分片归档，避免因共享 batch 对象阻断选择性物理删除。
 - 可选 BGE-M3 推理服务已经接入聚类候选链路，事件向量在进程内缓存；来源删除、标题重建和人工簇编辑可通过事件 cache tag 使缓存失效，标题哈希不一致时也拒绝复用旧向量。服务不可用时回退到 URL、实体、时间与词项证据。
 - 经人工登记的 Account → Person/Organization 所有权解析；讨论度、来源多样性和协同风险均按所有权实体去重，未知所有权不做名字猜测。
-- PostgreSQL + pgvector 模型、指标时间分区、评分可复现记录、评分/当前状态/Outbox 原子提交、逐行事务化 Redis Streams 发布器、消费者组重领与 DLQ。为避免删除 PEL 内未确认消息，V1 publisher 不再执行 `MAXLEN`/时间自动裁剪；外部误删 pending ID 会由 `XAUTOCLAIM` 检出、写入 tombstone DLQ 并显式报错。XADD 成功但 PG 标记失败时保留待重试 Outbox，重复消息由稳定业务幂等键收敛；Redis Stream 全量丢失可用默认 dry-run、带批内心跳、原子检查点和正常 publisher/consumer 互斥租约的工具从已提交 Outbox 重建消费者相关事件。断点续跑会以磁盘临时账本流式、精确对账 PostgreSQL 期望前缀和 Redis 去重后的完整 `outbox_id` 顺序，不能用“只保留最后检查点行”的残缺 Stream 蒙混完成；后台 PG 扫描有 240 秒 fail-closed 时限，取消路径等待线程释放 SQLite 后保留原取消异常并清理临时文件。
+- PostgreSQL + pgvector 模型、指标时间分区、评分可复现记录、评分/当前状态/Outbox 原子提交、逐行事务化 Redis Streams 发布器、消费者组重领与 DLQ。`STREAM_OUTBOX_KINDS` 冻结 observation、metric snapshot、score、feedback、cluster edit、rescore 与 source deletion 七类消息，并由常规 publisher、恢复和裁剪共用；未登记 kind 记录失败且不进入 Stream。为避免删除 PEL 内未确认消息，V1 publisher 不执行 `MAXLEN`/时间自动裁剪；外部误删 pending ID 会由 `XAUTOCLAIM` 检出、写入 tombstone DLQ 并显式报错。独立保留工具默认 dry-run，使用与恢复相同的互斥租约拒绝活跃 publisher/consumer，基于 Redis 时钟、所有 consumer group 的 earliest-pending/last-delivered 水位和保留期计算安全边界。execute 把 dry-run ID 作为获批上限：当前安全水位后退即拒绝，只前移时仍按获批旧边界裁剪。磁盘 SQLite 账本逐条核对候选只属于冻结集合中的已发布 Outbox kind；执行期间 PostgreSQL `FOR SHARE` 事务锁住候选恢复行，Redis Lua 在单个原子操作内复核完整组状态并执行精确 `XTRIM MINID`，取消路径会等待原子命令完成后才释放 PG guard。安全删除后仍超容量只报告 `over_limit`，不越过水位强裁。XADD 成功但 PG 标记失败时保留待重试 Outbox，重复消息由稳定业务幂等键收敛；Redis Stream 全量丢失可用默认 dry-run、带批内心跳、原子检查点和正常 publisher/consumer 互斥租约的工具从已提交 Outbox 重建全部登记消息。断点续跑会以磁盘临时账本流式、精确对账 PostgreSQL 期望前缀和 Redis 去重后的完整 `outbox_id` 顺序，不能用“只保留最后检查点行”的残缺 Stream 蒙混完成；后台 PG 扫描有 240 秒 fail-closed 时限，取消路径等待线程释放 SQLite 后保留原取消异常并清理临时文件。
 - 每个 Observation revision 另存 collected/enqueued/completed/failed 时间、尝试次数和错误；合并处理多个待处理 revision 时逐条写入完成事实。Owner 只读接口报告“采集时间→评分完成”15 分钟 SLA、成熟未完成项、未来时间污染和未恢复失败，不再用连接器轮次耗时冒充端到端延迟。
 - 评分事件到告警规则的真实闭环：规则匹配、至少三项证据、工作区/领域日预算、四小时冷却、新增证据或状态升级、签名 Webhook、持久化投递记录和 Web 内告警接口；预算、幂等键和冷却在数据库预留事务内原子检查。告警身份绑定稳定 `outbox_id`：in-app confirm 失败后即使事件更新/删除也恢复为 delivered；Webhook 若事件/规则快照已不可用或重试耗尽，则写入可在告警 API 查询的 `aborted + terminalReason` 审计终态后 ACK/DLQ，不宣称已送达，也不永久停在 reserved。
 - 连接器失败降级、处理失败持久化待重试、成功后才推进的持久化 checkpoint、24H 滚动观测与轮次耗时统计、来源候选晋级、5% 日增长上限、运行时月度成本台账与逐连接器预算降频/停机（未配置合约单价时 fail-closed）。连接器 Registry 明示发现、增量、刷新、回补、配额、成本、字段权利、删除和 72H 验收状态。
@@ -29,7 +29,7 @@
 - 首次分诊按 Asia/Shanghai 预登记值班窗累计；前端每 5 秒上报带 attempt/segment/sequence 的认证心跳，后端忽略客户端时长汇总，只累计 `active` 状态并跨详情关闭/重开合并全部 segment。完成研判的有效 telemetry 覆盖率必须达到 95%，否则不输出达标结论；并行的服务端观测心跳墙钟不受客户端 state 缩短，只作异常护栏，不能证明前台注意力。该有效时长口径明确不防止持证 Analyst 伪报状态。`/api/v1/metrics/beta` 对四项正式指标逐项报告最低样本和 `passesTarget`，另报告墙钟护栏；样本不足时固定返回 `insufficient/null`。
 - 正式人工评估采用预登记 schema v2：冻结完整本地日历、排名规则、阈值版本、bootstrap seed/迭代次数/抽样单元；每个采样时点由独立 ledger key 签名完整排序账本和 append-only 阈值跨越事实，每天 09:00±5 分钟的 Top-5 快照必须逐项等于同一账本前五名，并由 scheduler 签名后提交 snapshot commitment。Precision@5 同时要求点估计和 95% CI 下界均不低于 0.70；提前量使用版本化 crossing 事实和由 baseline collector 签名的首次发现日志。scheduler、reviewer、baseline、ledger 四类 Ed25519 密钥不得复用。
 - 评估工具输出 Precision@K、宏 F1、错误告警/日、提前量、eventType 分组、Pairwise、B-cubed 和 bootstrap 区间；双标注 Cohen's kappa 有独立实现。
-- 150 项默认 Python 自动化用例、10 项显式基础设施用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
+- 153 项默认 Python 自动化用例、11 项显式基础设施用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
 - 五个免密公共元数据连接器完成显式真实 smoke；该过程发现并修复 OpenAlex 空作者 ID 整批失败与异常未来发布日期污染时间线的问题。命令与运行证据独立保存，不进入确定性 CI，也不替代 72 小时 soak。
 - owner-only Sites 录制数据候选 v1 已部署成功；源码 SHA、归档哈希、访问策略与平台桌面截图均已归档。该版本明确显示 `RECORDED DEMO`，尚未连接生产 FastAPI 与身份联邦。
 - `tools/acceptance_monitor.py` 可由外部调度器每 15 分钟追加哈希串联、Ed25519 签名且可检出篡改的 JSONL 样本，并分别生成 canary、72H soak 和 7 天 shadow 报告。正式模式把 policy、monitor、schema 与 keyring digest 绑定到每个样本，校验只增不减的事实账本、数据权利连续性、非零观测、至少四个连接器家族、讨论与行为覆盖、连接器健康/重复率及端到端 SLA；还要求生产 PostgreSQL、受限应用角色、强制 RLS、审计触发器、只读迁移标记、认证和稳定 instance ID 的运行时证明。内存仓库和空 keyring 固定 NO-GO，单样本 canary 固定为 `acceptanceEligible=false`。
@@ -50,15 +50,15 @@
 - Sites 身份到独立 FastAPI 的生产级联邦验证；当前 Sites 仅为录制数据私有候选。生产认证开启时，浏览器原生 EventSource 不能携带当前 API Key，必须通过同源身份代理或改用带凭证的流客户端。
 - 目标生产环境的 PostgreSQL/RLS/Redis/R2 集成、跨节点中断和大规模重放演练。本地 Docker 已实际应用 `001_init_rc2.6`，并通过 RLS/trigger/只读迁移标记、并发信源去重、并发 Outbox publisher、XADD/PG 标记失败窗口、生产消费者 ACK/DLQ、空 Stream 重建、MinIO put/read/delete 和协调重启持久性验证；这不替代目标环境验收。
 - PostgreSQL PITR、1 小时 RPO、4 小时 RTO 和备份过期删除演练。
-- 生产 Redis 容量与安全保留策略：V1 为保护 PEL 关闭自动裁剪；进入目标环境前必须基于 consumer-group 安全水位设计归档/裁剪并完成容量压测。
+- 生产 Redis 容量与安全保留验收：consumer-group 安全水位、Outbox 可恢复性校验和拒绝强裁已在本地真实 PG/Redis 通过；进入目标环境前仍须验证 Redis Cluster/故障转移、异常硬终止、集群外管理操作、目标流量容量告警和大规模裁剪耗时。
 
 这些项目必须保留为发布闸门，不应以演示数据或单机单测“视为通过”。
 
 ## 本轮可复现验证
 
 ```text
-Python deterministic/default: 150 passed, 10 infrastructure tests skipped
-Python with explicit local infrastructure: 160 passed, 7 upstream deprecation warnings
+Python deterministic/default: 153 passed, 11 infrastructure tests skipped
+Python with explicit local infrastructure: 164 passed, 7 upstream deprecation warnings
 Python Ruff: passed
 Web: ESLint passed
 Web: Vinext production build passed
@@ -77,3 +77,4 @@ Docker runtime integration: passed locally (PostgreSQL/Redis/MinIO; see evidence
 
 本地容器的命令、版本、断言、重启持久性结果和未覆盖范围见 [基础设施集成验证记录](evidence/INFRASTRUCTURE_INTEGRATION_2026-07-17.md)。
 Outbox 故障窗口、生产消费者 ACK/DLQ 和 Redis 丢失重建证据见 [Outbox/Redis 恢复验证](evidence/OUTBOX_REDIS_RECOVERY_2026-07-17.md)。
+Redis Stream 安全水位、Outbox 可恢复性校验和拒绝强裁证据见 [Redis Stream 安全保留验证](evidence/REDIS_STREAM_RETENTION_2026-07-17.md)。

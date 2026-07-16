@@ -29,10 +29,14 @@ from redis.asyncio import Redis
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "services" / "api"))
 
-from radar.outbox import RedisOutboxPublisher, outbox_recovery_keys  # noqa: E402
+from radar.outbox import (  # noqa: E402
+    RedisOutboxPublisher,
+    STREAM_OUTBOX_KINDS,
+    outbox_recovery_keys,
+)
 
 
-REPLAY_KINDS = ("score.created", "source.erased")
+REPLAY_KINDS = STREAM_OUTBOX_KINDS
 REPLAY_LOCK_SECONDS = 300
 REPLAY_HEARTBEAT_SECONDS = 30
 REPLAY_PREFIX_VERIFY_TIMEOUT_SECONDS = 240

@@ -13,17 +13,24 @@ import pytest
 from fastapi.testclient import TestClient
 from redis.asyncio import Redis
 
+from radar import stream_retention as retention_module
 from radar.alert_worker import AlertDispatcher, RedisAlertWorker
 from radar.contracts import AlertRuleRequest, Observation, StoredScore
 from radar.fixtures import demo_events
 from radar.main import create_app
 from radar.outbox import (
     RedisOutboxPublisher,
+    STREAM_OUTBOX_KINDS,
     outbox_recovery_keys,
     register_stream_participant,
     release_stream_participant,
 )
 from radar.storage import InMemoryRepository, PostgresRepository
+from radar.stream_retention import (
+    inspect_consumer_groups,
+    maintain_stream_retention,
+    trim_stream_at_verified_watermarks,
+)
 from tools.replay_outbox_to_redis import execute_replay, main as replay_main
 
 
@@ -257,7 +264,7 @@ async def test_outbox_failure_retry_consumer_ack_and_redis_loss_replay() -> None
             outbox_id = cursor.fetchone()[0]
             cursor.execute(
                 """INSERT INTO outbox (kind,aggregate_id,payload)
-                VALUES ('integration.created',%s,%s::jsonb) RETURNING id""",
+                VALUES ('feedback.created',%s,%s::jsonb) RETURNING id""",
                 (f"{prefix}-later", json.dumps({"later": True})),
             )
             later_outbox_id = cursor.fetchone()[0]
@@ -286,7 +293,7 @@ async def test_outbox_failure_retry_consumer_ack_and_redis_loss_replay() -> None
         assert len(rows) == 3
         assert [fields["outbox_id"] for _, fields in rows].count(str(outbox_id)) == 2
         assert [fields["outbox_id"] for _, fields in rows].count(str(later_outbox_id)) == 1
-        assert {fields["kind"] for _, fields in rows} == {"score.created", "integration.created"}
+        assert {fields["kind"] for _, fields in rows} == {"score.created", "feedback.created"}
 
         with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
             cursor.execute("SELECT published_at,attempts,last_error FROM outbox WHERE id=%s", (outbox_id,))
@@ -307,27 +314,29 @@ async def test_outbox_failure_retry_consumer_ack_and_redis_loss_replay() -> None
         assert deliveries[0]["status"] == "delivered"
         assert deliveries[0]["eventId"] == aggregate_id
 
-        # Simulate complete Redis stream loss. Rebuild only consumer-relevant
-        # committed rows; replaying the stable outbox id must not duplicate the
-        # already committed business delivery.
+        # Simulate complete Redis stream loss. Rebuild every registered Stream
+        # kind; the worker ACKs unrelated kinds, and the stable score outbox id
+        # must not duplicate the already committed business delivery.
         await redis.delete(stream)
         replay = await publisher.replay_batch(
             since=started_at - timedelta(minutes=1),
             until=datetime.now(timezone.utc) + timedelta(minutes=1),
             limit=10,
         )
-        assert replay.replayed == 1
+        assert replay.replayed == 2
         assert replay.complete is True
         replayed_rows = await redis.xrange(stream)
-        assert len(replayed_rows) == 1
-        assert replayed_rows[0][1]["outbox_id"] == str(outbox_id)
-        assert replayed_rows[0][1]["replay"] == "true"
+        assert len(replayed_rows) == 2
+        assert {row[1]["outbox_id"] for row in replayed_rows} == {
+            str(outbox_id), str(later_outbox_id),
+        }
+        assert all(row[1]["replay"] == "true" for row in replayed_rows)
         replay_group = f"{prefix}-replay-group"
         replay_worker = RedisAlertWorker(
             redis, AlertDispatcher(repository, signing_secret="integration-secret"), [workspace_id],
             stream=stream, group=replay_group, consumer=f"{prefix}-replay-consumer", claim_min_idle_ms=0,
         )
-        assert await replay_worker.run_once(block_ms=10, count=10) == 1
+        assert await replay_worker.run_once(block_ms=10, count=10) == 2
         assert (await redis.xpending(stream, replay_group))["pending"] == 0
         assert len(repository.list_alert_deliveries(workspace_id, started_at - timedelta(minutes=1))) == 1
     finally:
@@ -412,7 +421,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         resumed_state_key, resumed_lock_key, resumed_publishers_key = stream_keys[resumed_stream]
         await redis.hset(resumed_state_key, mapping={
             "since": since.isoformat(), "until": until.isoformat(),
-            "stream": resumed_stream, "kinds": "score.created,source.erased",
+            "stream": resumed_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
             "status": "running", "replayed": "1", "startedAt": now.isoformat(),
             "afterCreatedAt": outbox_created_at.isoformat(), "afterId": str(outbox_id),
             "afterStreamId": resumed_message_id,
@@ -425,7 +434,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         lost_state_key, lost_lock_key, lost_publishers_key = stream_keys[lost_stream]
         await redis.hset(lost_state_key, mapping={
             "since": since.isoformat(), "until": until.isoformat(),
-            "stream": lost_stream, "kinds": "score.created,source.erased",
+            "stream": lost_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
             "status": "running", "replayed": "1", "startedAt": now.isoformat(),
             "afterCreatedAt": outbox_created_at.isoformat(), "afterId": str(outbox_id),
             "afterStreamId": "1-0",
@@ -437,7 +446,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         tampered_state_key, tampered_lock_key, tampered_publishers_key = stream_keys[tampered_stream]
         await redis.hset(tampered_state_key, mapping={
             "since": since.isoformat(), "until": until.isoformat(),
-            "stream": tampered_stream, "kinds": "score.created,source.erased",
+            "stream": tampered_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
             "status": "running", "replayed": "1", "startedAt": now.isoformat(),
             "afterCreatedAt": outbox_created_at.isoformat(), "afterId": str(outbox_id),
             "afterStreamId": tampered_message_id,
@@ -501,7 +510,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         prefix_until = prefix_since + timedelta(seconds=3)
         await redis.hset(missing_state_key, mapping={
             "since": prefix_since.isoformat(), "until": prefix_until.isoformat(),
-            "stream": missing_prefix_stream, "kinds": "score.created,source.erased",
+            "stream": missing_prefix_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
             "status": "running", "replayed": "2", "startedAt": now.isoformat(),
             "afterCreatedAt": last_prefix_created_at.isoformat(), "afterId": str(last_prefix_id),
             "afterStreamId": last_prefix_stream_id,
@@ -542,6 +551,270 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not REDIS_URL, reason="set REDIS_INTEGRATION_URL for outbox integration")
+async def test_stream_retention_trims_only_recoverable_rows_behind_every_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert APP_DSN is not None
+    assert REDIS_URL is not None
+    prefix = f"integration-retention-{uuid.uuid4().hex}"
+    stream = f"{prefix}:stream"
+    unsafe_stream = f"{prefix}:unsafe"
+    time_stream = f"{prefix}:time-boundary"
+    first_group = f"{prefix}:alerts"
+    second_group = f"{prefix}:deletions"
+    racing_group = f"{prefix}:late-group"
+    unsafe_group = f"{prefix}:unsafe-group"
+    time_group = f"{prefix}:time-group"
+    redis = Redis.from_url(REDIS_URL, decode_responses=True)
+    outbox_ids: list[uuid.UUID] = []
+    stream_keys = [stream, unsafe_stream, time_stream]
+    try:
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            for index in range(5):
+                cursor.execute(
+                    """INSERT INTO outbox (kind,aggregate_id,payload,published_at)
+                    VALUES ('score.created',%s,%s::jsonb,now()) RETURNING id""",
+                    (f"{prefix}-{index}", json.dumps({"index": index})),
+                )
+                outbox_ids.append(cursor.fetchone()[0])
+            connection.commit()
+
+        stream_ids: list[str] = []
+        for index, outbox_id in enumerate(outbox_ids):
+            stream_ids.append(await redis.xadd(
+                stream,
+                {"outbox_id": str(outbox_id), "kind": "score.created", "index": str(index)},
+            ))
+        await redis.xgroup_create(stream, first_group, id="0-0")
+        await redis.xgroup_create(stream, second_group, id="0-0")
+
+        first_delivery = await redis.xreadgroup(
+            first_group, f"{prefix}:consumer-a", {stream: ">"}, count=5,
+        )
+        assert len(first_delivery[0][1]) == 5
+        assert await redis.xack(stream, first_group, stream_ids[0]) == 1
+
+        second_delivery = await redis.xreadgroup(
+            second_group, f"{prefix}:consumer-b", {stream: ">"}, count=4,
+        )
+        assert [entry[0] for entry in second_delivery[0][1]] == stream_ids[:4]
+        assert await redis.xack(stream, second_group, *stream_ids[:4]) == 4
+
+        participant = await register_stream_participant(redis, stream, "publisher")
+        try:
+            with pytest.raises(RuntimeError, match="active replay or stream participant"):
+                await maintain_stream_retention(
+                    APP_DSN,
+                    redis,
+                    stream,
+                    required_groups={first_group, second_group},
+                    retention_hours=0,
+                    capacity_limit=4,
+                )
+        finally:
+            await release_stream_participant(redis, stream, participant)
+
+        dry_run = await maintain_stream_retention(
+            APP_DSN,
+            redis,
+            stream,
+            required_groups={first_group, second_group},
+            retention_hours=0,
+            capacity_limit=4,
+        )
+        assert dry_run["mode"] == "dry-run"
+        assert dry_run["safeTrimMinId"] == stream_ids[1]
+        assert dry_run["candidateEntries"] == 1
+        assert dry_run["uniqueOutboxIds"] == 1
+        assert dry_run["missingPublishedOutboxIds"] == 0
+        assert dry_run["estimatedAfterLength"] == 4
+        assert dry_run["capacityStatusAfterSafeTrim"] == "within_limit"
+        assert dry_run["recoverableKinds"] == list(STREAM_OUTBOX_KINDS)
+
+        with pytest.raises(RuntimeError, match="execute requires the safeTrimMinId"):
+            await maintain_stream_retention(
+                APP_DSN,
+                redis,
+                stream,
+                required_groups={first_group, second_group},
+                retention_hours=0,
+                capacity_limit=4,
+                execute=True,
+            )
+        assert await redis.xlen(stream) == 5
+
+        expected_groups = await inspect_consumer_groups(
+            redis, stream, {first_group, second_group},
+        )
+        await redis.xgroup_create(stream, racing_group, id="0-0")
+        with pytest.raises(RuntimeError, match="safety boundary moved behind"):
+            await maintain_stream_retention(
+                APP_DSN,
+                redis,
+                stream,
+                required_groups={first_group, second_group},
+                retention_hours=0,
+                capacity_limit=4,
+                execute=True,
+                confirmed_trim_min_id=str(dry_run["safeTrimMinId"]),
+            )
+        with pytest.raises(RuntimeError, match="consumer group membership changed"):
+            await trim_stream_at_verified_watermarks(
+                redis, stream, str(dry_run["safeTrimMinId"]), expected_groups,
+            )
+        assert await redis.xlen(stream) == 5
+        assert await redis.xgroup_destroy(stream, racing_group) is True
+
+        original_atomic_trim = retention_module.trim_stream_at_verified_watermarks
+
+        def concurrent_outbox_delete_is_blocked() -> bool:
+            assert ADMIN_DSN is not None
+            try:
+                with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout='100ms'")
+                    cursor.execute("DELETE FROM outbox WHERE id=%s", (outbox_ids[0],))
+                    connection.commit()
+            except psycopg.errors.LockNotAvailable:
+                return True
+            return False
+
+        async def atomic_trim_with_lock_assertion(*args: object, **kwargs: object) -> int:
+            assert await asyncio.to_thread(concurrent_outbox_delete_is_blocked)
+            return await original_atomic_trim(*args, **kwargs)
+
+        monkeypatch.setattr(
+            retention_module,
+            "trim_stream_at_verified_watermarks",
+            atomic_trim_with_lock_assertion,
+        )
+
+        executed = await maintain_stream_retention(
+            APP_DSN,
+            redis,
+            stream,
+            required_groups={first_group, second_group},
+            retention_hours=0,
+            capacity_limit=4,
+            execute=True,
+            confirmed_trim_min_id=str(dry_run["safeTrimMinId"]),
+        )
+        assert executed["trimmedEntries"] == 1
+        assert executed["afterLength"] == 4
+        assert (await redis.xrange(stream, count=1))[0][0] == stream_ids[1]
+        pending = await redis.xpending_range(stream, first_group, "-", "+", 10)
+        assert [item["message_id"] for item in pending] == stream_ids[1:]
+        remaining_for_second = await redis.xreadgroup(
+            second_group, f"{prefix}:consumer-b", {stream: ">"}, count=10,
+        )
+        assert [entry[0] for entry in remaining_for_second[0][1]] == stream_ids[4:]
+        monkeypatch.setattr(
+            retention_module,
+            "trim_stream_at_verified_watermarks",
+            original_atomic_trim,
+        )
+
+        redis_time = await redis.time()
+        now_milliseconds = int(redis_time[0]) * 1_000 + int(redis_time[1]) // 1_000
+        explicit_time_ids = [
+            f"{now_milliseconds - 7_200_000}-0",
+            f"{now_milliseconds - 7_199_000}-0",
+            f"{now_milliseconds - 1_000}-0",
+        ]
+        for index, explicit_id in enumerate(explicit_time_ids):
+            await redis.xadd(
+                time_stream,
+                {"outbox_id": str(outbox_ids[index]), "kind": "score.created"},
+                id=explicit_id,
+            )
+        await redis.xgroup_create(time_stream, time_group, id="0-0")
+        time_delivery = await redis.xreadgroup(
+            time_group, f"{prefix}:time-consumer", {time_stream: ">"}, count=3,
+        )
+        assert len(time_delivery[0][1]) == 3
+        assert await redis.xack(time_stream, time_group, *explicit_time_ids) == 3
+        time_dry_run = await maintain_stream_retention(
+            APP_DSN,
+            redis,
+            time_stream,
+            required_groups={time_group},
+            retention_hours=1,
+            capacity_limit=1,
+        )
+        confirmed_time_boundary = str(time_dry_run["safeTrimMinId"])
+        assert stream_ids[0] != confirmed_time_boundary
+        assert explicit_time_ids[1] < confirmed_time_boundary < explicit_time_ids[2]
+        assert time_dry_run["candidateEntries"] == 2
+        await asyncio.sleep(.02)
+        time_executed = await maintain_stream_retention(
+            APP_DSN,
+            redis,
+            time_stream,
+            required_groups={time_group},
+            retention_hours=1,
+            capacity_limit=1,
+            execute=True,
+            confirmed_trim_min_id=confirmed_time_boundary,
+        )
+        assert time_executed["safeTrimMinId"] == confirmed_time_boundary
+        assert time_executed["calculatedSafeTrimMinId"] != confirmed_time_boundary
+        assert time_executed["trimmedEntries"] == 2
+        assert await redis.xlen(time_stream) == 1
+
+        wrong_kind_id = uuid.uuid4()
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO outbox (id,kind,aggregate_id,payload,published_at)
+                VALUES (%s,'integration.retention',%s,'{}'::jsonb,now())""",
+                (wrong_kind_id, f"{prefix}-wrong-kind"),
+            )
+            connection.commit()
+        outbox_ids.append(wrong_kind_id)
+        unsafe_ids = [str(wrong_kind_id), str(uuid.uuid4())]
+        unsafe_stream_ids = [
+            await redis.xadd(unsafe_stream, {"outbox_id": value}) for value in unsafe_ids
+        ]
+        await redis.xgroup_create(unsafe_stream, unsafe_group, id="0-0")
+        unsafe_delivery = await redis.xreadgroup(
+            unsafe_group, f"{prefix}:unsafe-consumer", {unsafe_stream: ">"}, count=2,
+        )
+        assert len(unsafe_delivery[0][1]) == 2
+        assert await redis.xack(unsafe_stream, unsafe_group, *unsafe_stream_ids) == 2
+        unsafe_dry_run = await maintain_stream_retention(
+            APP_DSN,
+            redis,
+            unsafe_stream,
+            required_groups={unsafe_group},
+            retention_hours=0,
+            capacity_limit=1,
+        )
+        assert unsafe_dry_run["candidateEntries"] == 1
+        assert unsafe_dry_run["missingPublishedOutboxIds"] == 1
+        with pytest.raises(RuntimeError, match="not recoverable by the supported Outbox replay kinds"):
+            await maintain_stream_retention(
+                APP_DSN,
+                redis,
+                unsafe_stream,
+                required_groups={unsafe_group},
+                retention_hours=0,
+                capacity_limit=1,
+                execute=True,
+                confirmed_trim_min_id=str(unsafe_dry_run["safeTrimMinId"]),
+            )
+        assert await redis.xlen(unsafe_stream) == 2
+    finally:
+        if outbox_ids:
+            with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+                cursor.execute("DELETE FROM outbox WHERE id=ANY(%s::uuid[])", (outbox_ids,))
+                connection.commit()
+        cleanup_keys: list[str] = []
+        for value in stream_keys:
+            cleanup_keys.extend((value, *outbox_recovery_keys(value)))
+        await redis.delete(*cleanup_keys)
+        await redis.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not REDIS_URL, reason="set REDIS_INTEGRATION_URL for outbox integration")
 async def test_concurrent_outbox_publishers_do_not_duplicate_normal_delivery() -> None:
     assert APP_DSN is not None
     assert REDIS_URL is not None
@@ -557,7 +830,7 @@ async def test_concurrent_outbox_publishers_do_not_duplicate_normal_delivery() -
             for index in range(10):
                 cursor.execute(
                     """INSERT INTO outbox (kind,aggregate_id,payload)
-                    VALUES ('integration.created',%s,%s::jsonb) RETURNING id""",
+                    VALUES ('feedback.created',%s,%s::jsonb) RETURNING id""",
                     (f"{prefix}-{index}", json.dumps({"index": index})),
                 )
                 outbox_ids.append(cursor.fetchone()[0])
@@ -580,6 +853,29 @@ async def test_concurrent_outbox_publishers_do_not_duplicate_normal_delivery() -
             published, minimum_attempts, maximum_attempts = cursor.fetchone()
         assert published == 10
         assert minimum_attempts == maximum_attempts == 1
+
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO outbox (kind,aggregate_id,payload)
+                VALUES ('integration.unregistered',%s,'{}'::jsonb) RETURNING id""",
+                (f"{prefix}-unknown",),
+            )
+            unknown_id = cursor.fetchone()[0]
+            outbox_ids.append(unknown_id)
+            connection.commit()
+        unsupported = await RedisOutboxPublisher(APP_DSN, redis, stream).publish_batch(limit=1)
+        assert unsupported.published == 0
+        assert unsupported.failed == 1
+        assert await redis.xlen(stream) == 10
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT published_at,attempts,last_error FROM outbox WHERE id=%s",
+                (unknown_id,),
+            )
+            unknown_published_at, unknown_attempts, unknown_error = cursor.fetchone()
+        assert unknown_published_at is None
+        assert unknown_attempts == 1
+        assert "not registered for stream publication" in unknown_error
     finally:
         if outbox_ids:
             with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:

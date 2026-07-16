@@ -10,7 +10,7 @@
 - 告警 reservation 已写入但 durable confirm 暂时失败时，Redis 消息保持 pending；投递身份绑定稳定 `outbox_id`。in-app 在事件升级/删除后仍恢复为 delivered；Webhook 无事件/规则快照或重试耗尽时写入 `aborted + terminalReason`，不宣称已送达，也不永久留下 reserved。
 - poison message 首次保留 pending，达到重领上限后写入包含原 Stream ID、`outbox_id`、聚合 ID 和错误的 DLQ，再 ACK 原消息。
 - `XAUTOCLAIM` 保存并推进 Redis 返回的游标；前部 poison 消息仍 pending 时，后部消息仍能进入后续处理批次。
-- 删除整个 Redis Stream 后，可按冻结时间窗从 PostgreSQL 已发布 Outbox 选择性重建 `score.created` 与 `source.erased`，且不改写历史发布事实。
+- 删除整个 Redis Stream 后，可按冻结时间窗从 PostgreSQL 已发布 Outbox 重建冻结 `STREAM_OUTBOX_KINDS` 的全部七类消息，且不改写历史发布事实；常规 publisher、恢复和裁剪共享同一集合。
 - 恢复命令使用互斥锁、批内心跳、原子检查点、稳定 PostgreSQL/Redis 双游标和正常处理器租约；锁被替换时检查点不会前移。续跑不仅检查末条，而是以磁盘临时账本精确去重 Redis 前缀，再由后台线程流式对账 PostgreSQL 期望前缀的完整 `outbox_id` 顺序与累计数；只保留最后检查点行、前缀多余或乱序都会拒绝。已完成恢复的 Stream 再次丢失时会清除 completed cursor 并从完整窗口重建。
 
 这些结果证明本地单机 at-least-once 链路和空 Stream 重建机制，不证明跨系统 exactly-once、Redis Cluster 故障转移、生产网络分区或目标规模恢复时长。
@@ -20,7 +20,7 @@
 - `services/api/radar/outbox.py`
   - 每条待发布行使用独立 PostgreSQL 事务；XADD 后 SQL 标记失败会回滚，再用新事务记录可重试错误。
   - 正常成功清除旧 `last_error` 并增加 `attempts`。
-  - `replay_batch` 只读取已发布、位于冻结时间窗且消费者实际处理的事件类型，不更新 `published_at`。
+  - `replay_batch` 只读取已发布、位于冻结时间窗且属于冻结 `STREAM_OUTBOX_KINDS` 的消息，不更新 `published_at`；常规 publisher 遇未登记 kind 会记录失败而不写 Stream。
   - publisher 与 consumer 通过同一 Redis participant lease 注册；恢复锁或 `running` 状态存在时拒绝加入。
 - `services/api/radar/alert_worker.py`
   - consumer participant lease 每 30 秒续租；lease 丢失时消息保持 pending，不进入正常 ACK/DLQ 分支。
@@ -37,9 +37,9 @@
 ## 可复跑结果
 
 ```text
-Default deterministic suite: 150 passed, 10 skipped in 14.46s
-Explicit PostgreSQL/Redis/MinIO suite: 160 passed, 7 warnings in 16.60s
-Focused infrastructure suite: 10 passed, 7 warnings in 2.15s
+Default deterministic suite: 153 passed, 11 skipped in 15.30s
+Explicit PostgreSQL/Redis/MinIO suite: 164 passed, 7 warnings in 17.90s
+Focused PostgreSQL/Redis integration: 7 passed in 2.24s
 Ruff: passed
 ```
 
@@ -51,7 +51,7 @@ Ruff: passed
 {
   "mode": "dry-run",
   "stream": "radar:events",
-  "kinds": ["score.created", "source.erased"],
+  "kinds": ["observation.created", "metric_snapshots.created", "score.created", "feedback.created", "cluster.edit.requested", "event.rescore.requested", "source.erased"],
   "candidateCount": 0,
   "scoreEvents": 0,
   "sourceDeletions": 0
@@ -64,7 +64,7 @@ Ruff: passed
 
 - 在 XADD 与 SQL 标记之间实际终止进程，而不只是确定性故障注入。
 - PostgreSQL/Redis 网络分区、Redis Cluster 主从切换和消费者跨实例争用；participant lease 有心跳但不是跨系统 fencing token。
-- 基于所有 consumer group 安全水位的生产归档/裁剪与 Redis 容量上限；当前为避免 PEL 数据损失而不自动裁剪。
+- 基于所有 consumer group 安全水位的显式裁剪已在本地真实 PG/Redis 通过；Redis Cluster/故障转移、目标规模耗时与容量告警仍是生产门禁，publisher 仍不自动裁剪。
 - 目标数据量下的重放积压、临时磁盘空间、吞吐和恢复耗时；当前结果不能作为 RTO。
 - `source.erased` 在真实 R2 上重复执行、部分删除失败和跨区域恢复。
 - PostgreSQL WAL/PITR、备份恢复和 RPO ≤ 1 小时、RTO ≤ 4 小时。

@@ -13,6 +13,15 @@ from redis.asyncio import Redis
 
 
 PARTICIPANT_LEASE_SECONDS = 300
+STREAM_OUTBOX_KINDS = (
+    "observation.created",
+    "metric_snapshots.created",
+    "score.created",
+    "feedback.created",
+    "cluster.edit.requested",
+    "event.rescore.requested",
+    "source.erased",
+)
 
 
 def outbox_recovery_keys(stream: str) -> tuple[str, str, str]:
@@ -62,6 +71,79 @@ async def release_stream_participant(redis: Redis, stream: str, token: str) -> N
     """Leave normal stream processing after a bounded unit of work."""
     _, _, participants_key = outbox_recovery_keys(stream)
     await redis.zrem(participants_key, token)
+
+
+async def acquire_stream_exclusive(
+    redis: Redis,
+    stream: str,
+    role: str,
+    *,
+    allow_running_replay_state: bool = False,
+    lease_seconds: int = PARTICIPANT_LEASE_SECONDS,
+) -> str:
+    """Fence normal participants for a bounded maintenance operation."""
+    state_key, lock_key, participants_key = outbox_recovery_keys(stream)
+    token = f"{role}:{secrets.token_hex(16)}"
+    acquired = await redis.eval(
+        """local now=tonumber(redis.call('TIME')[1])
+        redis.call('ZREMRANGEBYSCORE',KEYS[3],'-inf',now)
+        if redis.call('EXISTS',KEYS[2])==1 or redis.call('ZCARD',KEYS[3])>0 then return 0 end
+        if ARGV[3]=='0' and redis.call('HGET',KEYS[1],'status')=='running' then return 0 end
+        redis.call('SET',KEYS[2],ARGV[1],'EX',ARGV[2])
+        return 1""",
+        3, state_key, lock_key, participants_key,
+        token, lease_seconds, "1" if allow_running_replay_state else "0",
+    )
+    if acquired != 1:
+        raise RuntimeError(f"active replay or stream participant prevents exclusive maintenance for {stream}")
+    return token
+
+
+async def renew_stream_exclusive(
+    redis: Redis,
+    stream: str,
+    token: str,
+    *,
+    lease_seconds: int = PARTICIPANT_LEASE_SECONDS,
+) -> None:
+    _, lock_key, _ = outbox_recovery_keys(stream)
+    renewed = await redis.eval(
+        """if redis.call('GET',KEYS[1])==ARGV[1]
+        then return redis.call('EXPIRE',KEYS[1],ARGV[2]) else return 0 end""",
+        1, lock_key, token, lease_seconds,
+    )
+    if renewed != 1:
+        raise RuntimeError(f"exclusive stream maintenance lease was lost for {stream}")
+
+
+async def release_stream_exclusive(redis: Redis, stream: str, token: str) -> None:
+    _, lock_key, _ = outbox_recovery_keys(stream)
+    released = await redis.eval(
+        "if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",
+        1, lock_key, token,
+    )
+    if released != 1:
+        raise RuntimeError(f"exclusive stream maintenance lease is no longer owned for {stream}")
+
+
+async def maintain_stream_exclusive(
+    redis: Redis,
+    stream: str,
+    token: str,
+    lost: asyncio.Event,
+    interval_seconds: int = 30,
+) -> None:
+    while not lost.is_set():
+        try:
+            await asyncio.wait_for(lost.wait(), timeout=interval_seconds)
+            return
+        except TimeoutError:
+            pass
+        try:
+            await renew_stream_exclusive(redis, stream, token)
+        except Exception:
+            lost.set()
+            return
 
 
 async def maintain_stream_participant(
@@ -170,6 +252,10 @@ class RedisOutboxPublisher:
                             after_created_at = created_at
                             after_id = outbox_id
                             attempted += 1
+                            if kind not in STREAM_OUTBOX_KINDS:
+                                raise RuntimeError(
+                                    f"outbox kind is not registered for stream publication: {kind}",
+                                )
                             await self.redis.xadd(self.stream, {
                                 "outbox_id": outbox_id, "kind": kind, "aggregate_id": aggregate_id,
                                 "payload": json.dumps(payload, ensure_ascii=False),
@@ -211,7 +297,7 @@ class RedisOutboxPublisher:
         after_created_at: datetime | None = None,
         after_id: str | None = None,
         limit: int = 200,
-        kinds: tuple[str, ...] = ("score.created", "source.erased"),
+        kinds: tuple[str, ...] = STREAM_OUTBOX_KINDS,
     ) -> ReplayResult:
         """Replay consumer-relevant committed rows after a Redis data loss.
 
