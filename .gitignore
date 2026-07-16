@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+*.log
+.data/
+web/node_modules/
+web/.next/
+web/dist/
+web/.wrangler/
+web/.vinext/
+.DS_Store

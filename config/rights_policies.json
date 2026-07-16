@@ -1,0 +1,15 @@
+{
+  "policyVersion": "rights-2026-07-rc2",
+  "reviewedAt": "2026-07-16",
+  "defaultPolicy": "metadata-and-excerpt",
+  "policies": {
+    "metadata-and-excerpt": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
+    "rss-public-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending-per-feed"},
+    "hn-official-api-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
+    "github-api-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
+    "hf-hub-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
+    "arxiv-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
+    "openalex-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
+    "youtube-api-review-required-v1": {"rawRetentionDays": 7, "excerptMaxCharacters": 500, "legalApproval": "blocked-without-approved-key"}
+  }
+}

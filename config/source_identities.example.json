@@ -1,0 +1,12 @@
+[
+  {
+    "sourceId": "example-lab-rss",
+    "accountId": "rss:example-lab",
+    "entityId": "org:example-lab"
+  },
+  {
+    "sourceId": "github:example-lab",
+    "accountId": "github:example-lab",
+    "entityId": "org:example-lab"
+  }
+]

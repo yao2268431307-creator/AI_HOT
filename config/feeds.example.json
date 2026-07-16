@@ -1,0 +1,4 @@
+[
+  {"sourceId": "your-lab", "url": "https://lab.example/rss.xml", "signalFamily": "official"},
+  {"sourceId": "your-ai-media", "url": "https://media.example/ai/feed.xml", "signalFamily": "discussion"}
+]

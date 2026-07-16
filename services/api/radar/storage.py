@@ -1,0 +1,1852 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+
+from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, ConnectorStatus, EvidenceState, EvidenceStrength, FeedbackRequest, LifecycleState, MetricSnapshot, MutationReceipt, Observation, ProductInteractionRequest, RadarEvent, StoredScore, WatchlistItem, WatchlistRequest
+from .facts import split_observation
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def score_cycle(value: datetime) -> str:
+    bucket = value.replace(minute=(value.minute // 15) * 15, second=0, microsecond=0)
+    return bucket.isoformat()
+
+
+class InMemoryRepository:
+    """Deterministic repository for tests, local preview and disconnected operation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.observations: dict[str, Observation] = {}
+        self.events: dict[str, RadarEvent] = {}
+        self.connectors: dict[str, ConnectorStatus] = {}
+        self.feedback: dict[str, tuple[str, str, FeedbackRequest]] = {}
+        self.alerts: dict[str, tuple[str, str, AlertRuleRequest]] = {}
+        self.alert_deliveries: list[dict[str, object]] = []
+        self.watchlists: dict[str, tuple[str, str, WatchlistRequest, datetime]] = {}
+        self.cluster_edits: dict[str, dict[str, object]] = {}
+        self.lineage_edges: list[dict[str, object]] = []
+        self.outbox: list[dict[str, object]] = []
+        self.score_runs: list[StoredScore] = []
+        self.event_observations: dict[str, dict[str, float]] = {}
+        self.metric_facts: dict[str, MetricSnapshot] = {}
+        self.observation_processing: dict[str, dict[str, object]] = {}
+        self.connector_runs: list[dict[str, object]] = []
+        self.connector_checkpoints: dict[str, dict[str, object]] = {}
+        self.product_interactions: list[dict[str, object]] = []
+        self.raw_evidence_deletions: dict[str, dict[str, object]] = {}
+
+    def save_observation_with_outbox(self, observation: Observation) -> bool:
+        """Observation and outbox record share the same lock/commit boundary."""
+        with self._lock:
+            _, snapshots = split_observation(observation)
+            content_inserted = observation.id not in self.observations
+            if content_inserted:
+                self.observations[observation.id] = observation
+                self.outbox.append({"id": str(uuid.uuid4()), "kind": "observation.created", "aggregate_id": observation.id, "created_at": utcnow()})
+            new_snapshots = [snapshot for snapshot in snapshots if snapshot.id not in self.metric_facts]
+            for snapshot in new_snapshots:
+                self.metric_facts[snapshot.id] = snapshot
+            if new_snapshots:
+                self.outbox.append({"id": str(uuid.uuid4()), "kind": "metric_snapshots.created", "aggregate_id": observation.id, "created_at": utcnow(), "snapshot_ids": [item.id for item in new_snapshots]})
+            changed = content_inserted or bool(new_snapshots)
+            if changed:
+                state = self.observation_processing.setdefault(observation.id, {"revision": 0, "processedRevision": 0, "attempts": 0, "leaseUntil": None, "lastError": None})
+                state["revision"] = int(state["revision"]) + 1
+            return changed
+
+    def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
+        with self._lock:
+            state = self.observation_processing.get(observation_id)
+            if not state or int(state["processedRevision"]) >= int(state["revision"]):
+                return None
+            lease_until = state.get("leaseUntil")
+            if isinstance(lease_until, datetime) and lease_until > utcnow():
+                return None
+            state["leaseUntil"] = utcnow() + timedelta(seconds=lease_seconds)
+            state["attempts"] = int(state["attempts"]) + 1
+            return int(state["revision"])
+
+    def complete_observation_processing(self, observation_id: str, revision: int) -> None:
+        with self._lock:
+            state = self.observation_processing[observation_id]
+            state["processedRevision"] = max(int(state["processedRevision"]), revision)
+            state["leaseUntil"] = None
+            state["lastError"] = None
+
+    def fail_observation_processing(self, observation_id: str, revision: int, error: str) -> None:
+        with self._lock:
+            state = self.observation_processing[observation_id]
+            if int(state["processedRevision"]) < revision:
+                state["leaseUntil"] = None
+                state["lastError"] = error[:1000]
+
+    def list_pending_observation_ids(self, limit: int = 100) -> list[str]:
+        now = utcnow()
+        with self._lock:
+            return [
+                item_id for item_id, state in self.observation_processing.items()
+                if int(state["processedRevision"]) < int(state["revision"])
+                and (state.get("leaseUntil") is None or state["leaseUntil"] < now)
+            ][:limit]
+
+    def get_latest_observation(self, observation_id: str) -> Observation | None:
+        base = self.observations.get(observation_id)
+        if base is None:
+            return None
+        snapshots = [item for item in self.metric_facts.values() if item.subject_id == observation_id]
+        if not snapshots:
+            return base
+        latest_at = max(item.collected_at for item in snapshots)
+        latest = [item for item in snapshots if item.collected_at == latest_at]
+        return base.model_copy(update={
+            "collected_at": latest_at,
+            "metrics": {item.metric_name: item.value for item in latest},
+            "raw_evidence_ref": next((item.source_revision for item in latest if item.source_revision), base.raw_evidence_ref),
+        })
+
+    def upsert_event(self, event: RadarEvent) -> None:
+        with self._lock:
+            self.events[event.id] = event
+
+    def save_score(self, score: StoredScore) -> None:
+        with self._lock:
+            cycle = score_cycle(score.input_to)
+            index = next((index for index, item in enumerate(self.score_runs) if item.event_id == score.event_id and score_cycle(item.input_to) == cycle), None)
+            if index is None:
+                self.score_runs.append(score)
+                self.outbox.append({"id": str(uuid.uuid4()), "kind": "score.created", "aggregate_id": score.event_id, "created_at": utcnow(), "cycle_id": cycle})
+            else:
+                self.score_runs[index] = score
+
+    def has_score_input_digest(self, event_id: str, input_digest: str) -> bool:
+        return any(score.event_id == event_id and score.input_digest == input_digest for score in self.score_runs)
+
+    def commit_scored_event(self, event: RadarEvent, score: StoredScore) -> None:
+        """Atomically update current state, append its reproducibility record and enqueue outbox."""
+        with self._lock:
+            self.events[event.id] = event
+            cycle = score_cycle(score.input_to)
+            index = next((index for index, item in enumerate(self.score_runs) if item.event_id == score.event_id and score_cycle(item.input_to) == cycle), None)
+            if index is None:
+                self.score_runs.append(score)
+                self.outbox.append({"id": str(uuid.uuid4()), "kind": "score.created", "aggregate_id": event.id, "created_at": utcnow(), "cycle_id": cycle})
+            else:
+                self.score_runs[index] = score
+
+    def assign_observation(self, event_id: str, observation_id: str, cluster_score: float, assignment_version: str) -> bool:
+        with self._lock:
+            members = self.event_observations.setdefault(event_id, {})
+            created = observation_id not in members
+            members[observation_id] = cluster_score
+            return created
+
+    def list_event_observations(self, event_id: str) -> list[Observation]:
+        ids = self.event_observations.get(event_id, {})
+        values: list[Observation] = []
+        for item_id in ids:
+            if item_id not in self.observations:
+                continue
+            base = self.observations[item_id]
+            snapshots = sorted((item for item in self.metric_facts.values() if item.subject_id == item_id), key=lambda item: item.collected_at)
+            by_capture: dict[datetime, dict[str, float]] = {}
+            for snapshot in snapshots:
+                by_capture.setdefault(snapshot.collected_at, {})[snapshot.metric_name] = snapshot.value
+            if by_capture:
+                values.extend(base.model_copy(update={"collected_at": captured_at, "metrics": metrics}) for captured_at, metrics in by_capture.items())
+            else:
+                values.append(base.model_copy(update={"metrics": {}}))
+        return sorted(values, key=lambda item: (item.published_at, item.collected_at))
+
+    def upsert_connector(self, connector: ConnectorStatus) -> None:
+        with self._lock:
+            self.connectors[connector.id] = connector
+
+    def record_connector_run(self, connector_id: str, started_at: datetime, finished_at: datetime, status: str, inserted: int, duplicates: int, coverage: float, error: str | None = None, estimated_cost_rmb: float = 0) -> None:
+        with self._lock:
+            self.connector_runs.append({
+                "connectorId": connector_id, "startedAt": started_at, "finishedAt": finished_at,
+                "status": status, "inserted": inserted, "duplicates": duplicates,
+                "latencyMs": max(0, int((finished_at - started_at).total_seconds() * 1000)),
+                "coverage": coverage, "error": error, "estimatedCostRmb": max(0, estimated_cost_rmb),
+            })
+            # Keep enough ledger history to cover any calendar month plus
+            # operational lookback; pruning at 8 days would silently forget
+            # earlier monthly spend.
+            cutoff = utcnow() - timedelta(days=40)
+            self.connector_runs = [item for item in self.connector_runs if item["startedAt"] >= cutoff]
+
+    def connector_stats_24h(self, connector_id: str) -> tuple[int, int]:
+        cutoff = utcnow() - timedelta(hours=24)
+        rows = [item for item in self.connector_runs if item["connectorId"] == connector_id and item["startedAt"] >= cutoff]
+        inserted = sum(int(item["inserted"]) for item in rows)
+        latencies = sorted(int(item["latencyMs"]) for item in rows)
+        p95_ms = latencies[max(0, (len(latencies) * 95 + 99) // 100 - 1)] if latencies else 0
+        return inserted, (p95_ms + 59_999) // 60_000
+
+    def monthly_connector_spend(self, at: datetime | None = None) -> float:
+        current = at or utcnow()
+        return round(sum(
+            float(item.get("estimatedCostRmb", 0)) for item in self.connector_runs
+            if item["startedAt"].year == current.year and item["startedAt"].month == current.month
+        ), 4)
+
+    def get_connector(self, connector_id: str) -> ConnectorStatus | None:
+        return self.connectors.get(connector_id)
+
+    def get_connector_checkpoint(self, connector_id: str) -> dict[str, object]:
+        with self._lock:
+            return self.connector_checkpoints.get(connector_id, {}).copy()
+
+    def save_connector_checkpoint(self, connector_id: str, payload: dict[str, object]) -> None:
+        with self._lock:
+            self.connector_checkpoints[connector_id] = payload.copy()
+
+    def expire_raw_evidence(self, retention_days: dict[str, int], at: datetime) -> list[str]:
+        with self._lock:
+            candidates: dict[str, str] = {}
+            for observation_id, observation in list(self.observations.items()):
+                days = retention_days.get(observation.rights_policy_id)
+                if days is None or observation.collected_at > at - timedelta(days=days):
+                    continue
+                if observation.raw_evidence_ref:
+                    candidates[observation.raw_evidence_ref] = observation.rights_policy_id
+                    self.observations[observation_id] = observation.model_copy(update={"raw_evidence_ref": ""})
+                for snapshot_id, snapshot in list(self.metric_facts.items()):
+                    if snapshot.subject_id == observation_id and snapshot.source_revision and snapshot.collected_at <= at - timedelta(days=days):
+                        candidates[snapshot.source_revision] = observation.rights_policy_id
+                        self.metric_facts[snapshot_id] = snapshot.model_copy(update={"source_revision": None})
+            remaining = {item.raw_evidence_ref for item in self.observations.values() if item.raw_evidence_ref} | {item.source_revision for item in self.metric_facts.values() if item.source_revision}
+            for reference, policy_id in candidates.items():
+                if reference not in remaining:
+                    self.raw_evidence_deletions.setdefault(reference, {
+                        "rightsPolicyId": policy_id, "status": "pending", "attempts": 0,
+                        "nextAttemptAt": at, "leaseUntil": None, "lastError": None,
+                    })
+            pending: list[str] = []
+            for reference, item in self.raw_evidence_deletions.items():
+                if item["status"] != "pending" or item["nextAttemptAt"] > at or (item["leaseUntil"] and item["leaseUntil"] > at):
+                    continue
+                item["attempts"] = int(item["attempts"]) + 1
+                item["leaseUntil"] = at + timedelta(minutes=5)
+                pending.append(reference)
+                if len(pending) >= 1000:
+                    break
+            return pending
+
+    def confirm_raw_evidence_deletions(self, references: list[str]) -> None:
+        with self._lock:
+            for reference in references:
+                if reference in self.raw_evidence_deletions:
+                    self.raw_evidence_deletions[reference].update({"status": "completed", "deletedAt": utcnow(), "leaseUntil": None, "lastError": None})
+
+    def fail_raw_evidence_deletion(self, reference: str, error: str, at: datetime | None = None) -> None:
+        with self._lock:
+            item = self.raw_evidence_deletions.get(reference)
+            if not item:
+                return
+            current = at or utcnow()
+            delay = min(3600, 60 * (2 ** min(int(item["attempts"]), 6)))
+            item.update({"lastError": error[:1000], "leaseUntil": None, "nextAttemptAt": current + timedelta(seconds=delay)})
+
+    def get_event(self, event_id: str) -> RadarEvent | None:
+        return self.events.get(event_id)
+
+    def list_events(self) -> list[RadarEvent]:
+        return sorted((event for event in self.events.values() if not event.superseded_by), key=lambda event: (event.velocity, event.evidence_score), reverse=True)
+
+    def apply_connector_coverage_penalty(self, platform: str, penalty: float, note: str) -> int:
+        changed = 0
+        with self._lock:
+            for event_id, event in list(self.events.items()):
+                if not any(item.lower() == platform.lower() for item in event.platforms):
+                    continue
+                score = max(0, event.evidence_score - penalty)
+                tier = "low" if score < 45 else "medium" if score < 70 else "high"
+                self.events[event_id] = event.model_copy(update={
+                    "coverage": max(0, event.coverage - penalty), "evidence_score": score,
+                    "evidence_strength": EvidenceStrength(tier), "uncertainty": min(100, event.uncertainty + penalty),
+                    "coverage_note": f"{event.coverage_note}；{note}",
+                })
+                changed += 1
+        return changed
+
+    def add_feedback(self, request: FeedbackRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), operation=f"feedback.{request.action}", createdAt=utcnow())
+        self.feedback[receipt.id] = (workspace_id, actor_id, request)
+        self.outbox.append({"id": str(uuid.uuid4()), "kind": "feedback.created", "aggregate_id": receipt.id, "created_at": utcnow()})
+        return receipt
+
+    def set_behavior_applicability(self, event_id: str, request: BehaviorApplicabilityRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), status="queued", operation="event.behavior_applicability", createdAt=utcnow())
+        with self._lock:
+            event = self.events[event_id]
+            coverage = event.coverage
+            if request.state == "not_applicable" and event.behavior_evidence_state != "not_applicable":
+                coverage = min(100, coverage + 32.5)
+            elif request.state == "missing" and event.behavior_evidence_state == "not_applicable":
+                coverage = max(0, coverage - 32.5)
+            self.events[event_id] = event.model_copy(update={
+                "behavior_evidence_state": EvidenceState(request.state), "state": LifecycleState.INSUFFICIENT_DATA, "labels": [],
+                "behavior": 0, "gap_residual": 0, "coverage": coverage,
+                "driver": "行为适用性已人工修订，重新评分完成前不输出强结论。",
+                "coverage_note": "行为适用性已人工修订并更新覆盖分母；重新评分已排队。",
+            })
+            for observation_id in self.event_observations.get(event_id, {}):
+                state = self.observation_processing.get(observation_id)
+                if state:
+                    state["revision"] = int(state["revision"]) + 1
+            self.outbox.append({
+                "id": str(uuid.uuid4()), "kind": "event.rescore.requested", "aggregate_id": event_id,
+                "created_at": utcnow(), "workspace_id": workspace_id, "actor_id": actor_id,
+                "payload": {"state": request.state, "reason": request.reason},
+            })
+        return receipt
+
+    def queue_cluster_edit(self, event_id: str, operation: str, request: ClusterEditRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        with self._lock:
+            source = self.events.get(event_id)
+            if source is None or source.superseded_by:
+                raise ValueError("source event is missing or superseded")
+            parents = [source]
+            if operation == "merge":
+                target = self.events.get(request.target_event_id or "")
+                if target is None or target.superseded_by:
+                    raise ValueError("target event is missing or superseded")
+                parents.append(target)
+            if operation == "split":
+                assigned = set(self.event_observations.get(event_id, {}))
+                requested = set(request.observation_ids)
+                if not requested.issubset(assigned):
+                    raise ValueError("split observations must belong to the source event")
+                if requested == assigned:
+                    raise ValueError("split must leave at least one observation in the source event")
+            receipt = MutationReceipt(id=str(uuid.uuid4()), status="queued", operation=f"cluster.{operation}", createdAt=utcnow())
+            self.cluster_edits[receipt.id] = {
+                "id": receipt.id, "eventId": event_id, "operation": operation,
+                "targetEventId": request.target_event_id, "observationIds": request.observation_ids,
+                "reason": request.reason, "workspaceId": workspace_id, "actorId": actor_id,
+                "status": "queued", "createdAt": receipt.created_at,
+                "expectedVersions": {event.id: event.cluster_version for event in parents},
+            }
+            self.outbox.append({"id": str(uuid.uuid4()), "kind": "cluster.edit.requested", "aggregate_id": event_id, "operation_id": receipt.id, "workspace_id": workspace_id, "created_at": utcnow()})
+        return receipt
+
+    @staticmethod
+    def _successor_event(template: RadarEvent, event_id: str, version: int, operation_id: str, operation: str, member_count: int, parent_cluster_id: str) -> RadarEvent:
+        now = utcnow()
+        return template.model_copy(update={
+            "id": event_id, "cluster_version": version, "parent_cluster_id": parent_cluster_id,
+            "superseded_by": [], "merge_operation_id": operation_id if operation == "merge" else None,
+            "split_operation_id": operation_id if operation == "split" else None, "effective_at": now,
+            "state": LifecycleState.INSUFFICIENT_DATA, "labels": [], "attention": 0, "behavior": 0,
+            "diversity": 0, "authority": 0, "coordination_risk": 0, "coverage": 0, "uncertainty": 100,
+            "evidence_strength": EvidenceStrength.LOW, "discussion_evidence_state": EvidenceState.MISSING,
+            "behavior_evidence_state": EvidenceState.MISSING, "evidence_score": 0, "velocity": 0, "gap_residual": 0,
+            "updated_at": now, "independent_sources": 0, "platforms": [], "signal_families": [],
+            "evidence_count": member_count, "driver": "聚类成员已修订，等待新版本重新评分。",
+            "coverage_note": "合并/拆分后的新事件尚未完成评分，不输出强结论。", "timeline": [], "evidence": [],
+        })
+
+    def _inherit_watchlists(self, parent_ids: list[str], child_ids: list[str], workspace_id: str) -> list[str]:
+        inherited: list[str] = []
+        parent_watches = [value for value in self.watchlists.values() if value[0] == workspace_id and value[2].event_id in parent_ids]
+        for inherited_workspace_id, actor_id, request, created_at in parent_watches:
+            for child_id in child_ids:
+                if any(value[0] == inherited_workspace_id and value[2].event_id == child_id for value in self.watchlists.values()):
+                    continue
+                watch_id = str(uuid.uuid4())
+                self.watchlists[watch_id] = (inherited_workspace_id, actor_id, request.model_copy(update={"event_id": child_id}), created_at)
+                inherited.append(watch_id)
+        return inherited
+
+    def execute_cluster_edit(self, operation_id: str, workspace_id: str | None = None) -> dict[str, object]:
+        with self._lock:
+            item = self.cluster_edits.get(operation_id)
+            if item is None or (workspace_id is not None and item["workspaceId"] != workspace_id):
+                raise ValueError("cluster operation not found")
+            if item["status"] != "queued":
+                raise ValueError("cluster operation is not queued")
+            parent_ids = [str(item["eventId"])] + ([str(item["targetEventId"])] if item["operation"] == "merge" else [])
+            parents = [self.events[event_id] for event_id in parent_ids]
+            expected = item["expectedVersions"]
+            if any(parent.superseded_by or parent.cluster_version != expected[parent.id] for parent in parents):
+                item.update({"status": "failed", "error": "cluster version conflict", "completedAt": utcnow()})
+                raise ValueError("cluster version conflict")
+            assignments = {event_id: dict(self.event_observations.get(event_id, {})) for event_id in parent_ids}
+            reverse_assignments = {observation_id: event_id for event_id, members in assignments.items() for observation_id in members}
+            version = max(parent.cluster_version for parent in parents) + 1
+            child_ids: list[str] = []
+            child_members: list[dict[str, float]] = []
+            if item["operation"] == "merge":
+                child_ids = [f"evt-{uuid.uuid4()}"]
+                child_members = [{observation_id: score for members in assignments.values() for observation_id, score in members.items()}]
+            else:
+                selected = set(item["observationIds"])
+                source_members = assignments[parent_ids[0]]
+                child_ids = [f"evt-{uuid.uuid4()}", f"evt-{uuid.uuid4()}"]
+                child_members = [
+                    {observation_id: score for observation_id, score in source_members.items() if observation_id in selected},
+                    {observation_id: score for observation_id, score in source_members.items() if observation_id not in selected},
+                ]
+            now = utcnow()
+            for child_id, members in zip(child_ids, child_members, strict=True):
+                self.events[child_id] = self._successor_event(parents[0], child_id, version, operation_id, str(item["operation"]), len(members), parent_ids[0])
+                self.event_observations[child_id] = members
+                for observation_id in members:
+                    state = self.observation_processing.get(observation_id)
+                    if state:
+                        state["revision"] = int(state["revision"]) + 1
+                self.outbox.append({"id": str(uuid.uuid4()), "kind": "event.rescore.requested", "aggregate_id": child_id, "created_at": now, "operation_id": operation_id})
+            for parent in parents:
+                self.events[parent.id] = parent.model_copy(update={"superseded_by": child_ids})
+                self.event_observations.pop(parent.id, None)
+            for parent_id in parent_ids:
+                for child_id in child_ids:
+                    self.lineage_edges.append({"operationId": operation_id, "parentEventId": parent_id, "childEventId": child_id, "effectiveAt": now, "revertedAt": None})
+            inherited_watch_ids = self._inherit_watchlists(parent_ids, child_ids, str(item["workspaceId"]))
+            item.update({
+                "status": "completed", "completedAt": now, "resultEventIds": child_ids,
+                "resultVersions": {child_id: version for child_id in child_ids},
+                "reversePayload": {"assignments": reverse_assignments, "parentEventIds": parent_ids, "inheritedWatchIds": inherited_watch_ids},
+            })
+            return {key: value for key, value in item.items() if key not in {"reason", "workspaceId", "actorId", "reversePayload"}}
+
+    def revert_cluster_edit(self, operation_id: str, workspace_id: str) -> dict[str, object]:
+        with self._lock:
+            item = self.cluster_edits.get(operation_id)
+            if item is None or item["workspaceId"] != workspace_id:
+                raise ValueError("cluster operation not found")
+            if item["status"] != "completed":
+                raise ValueError("only a completed cluster operation can be reverted")
+            child_ids = list(item["resultEventIds"])
+            expected = item["resultVersions"]
+            if any(self.events[child_id].superseded_by or self.events[child_id].cluster_version != expected[child_id] for child_id in child_ids):
+                raise ValueError("cluster version conflict")
+            reverse = item["reversePayload"]
+            parent_ids = list(reverse["parentEventIds"])
+            restored: dict[str, dict[str, float]] = {parent_id: {} for parent_id in parent_ids}
+            all_child_members = {observation_id: score for child_id in child_ids for observation_id, score in self.event_observations.get(child_id, {}).items()}
+            for observation_id, parent_id in reverse["assignments"].items():
+                if observation_id in all_child_members:
+                    restored[parent_id][observation_id] = all_child_members[observation_id]
+            now = utcnow()
+            for parent_id, members in restored.items():
+                parent = self.events[parent_id]
+                self.events[parent_id] = parent.model_copy(update={
+                    "superseded_by": [],
+                    # Revert is a new topology mutation. Incrementing prevents a
+                    # command queued against the pre-merge parent from executing.
+                    "cluster_version": parent.cluster_version + 1,
+                })
+                self.event_observations[parent_id] = members
+                self.outbox.append({"id": str(uuid.uuid4()), "kind": "event.rescore.requested", "aggregate_id": parent_id, "created_at": now, "operation_id": operation_id})
+            for child_id in child_ids:
+                child = self.events[child_id]
+                self.events[child_id] = child.model_copy(update={"superseded_by": parent_ids})
+                self.event_observations.pop(child_id, None)
+            for watch_id in reverse["inheritedWatchIds"]:
+                self.watchlists.pop(watch_id, None)
+            for edge in self.lineage_edges:
+                if edge["operationId"] == operation_id:
+                    edge["revertedAt"] = now
+            item.update({"status": "reverted", "revertedAt": now})
+            return {key: value for key, value in item.items() if key not in {"reason", "workspaceId", "actorId", "reversePayload"}}
+
+    def execute_pending_cluster_edits(self, limit: int = 20) -> int:
+        pending = [item_id for item_id, item in self.cluster_edits.items() if item["status"] == "queued"][:limit]
+        completed = 0
+        for operation_id in pending:
+            try:
+                self.execute_cluster_edit(operation_id)
+            except ValueError:
+                continue
+            completed += 1
+        return completed
+
+    def get_event_lineage(self, event_id: str) -> dict[str, list[dict[str, object]]]:
+        return {
+            "parents": [edge.copy() for edge in self.lineage_edges if edge["childEventId"] == event_id],
+            "children": [edge.copy() for edge in self.lineage_edges if edge["parentEventId"] == event_id],
+        }
+
+    def list_cluster_edits(self, event_id: str, workspace_id: str) -> list[dict[str, object]]:
+        return [
+            {key: value for key, value in item.items() if key not in {"reason", "workspaceId", "actorId", "reversePayload"}}
+            for item in self.cluster_edits.values()
+            if item["workspaceId"] == workspace_id and (
+                item["eventId"] == event_id
+                or item.get("targetEventId") == event_id
+                or event_id in item.get("resultEventIds", [])
+            )
+        ]
+
+    def add_alert(self, request: AlertRuleRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), status="completed", operation="alert_rule.create", createdAt=utcnow())
+        self.alerts[receipt.id] = (workspace_id, actor_id, request)
+        return receipt
+
+    def list_alert_rules(self, workspace_id: str) -> list[tuple[str, AlertRuleRequest]]:
+        return [(rule_id, value[2]) for rule_id, value in self.alerts.items() if value[0] == workspace_id]
+
+    def list_alert_deliveries(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        cutoff = utcnow() - timedelta(minutes=15)
+        return [item.copy() for item in self.alert_deliveries if item["workspaceId"] == workspace_id and item["deliveredAt"] >= since and (item.get("status", "delivered") == "delivered" or item["deliveredAt"] >= cutoff)]
+
+    def last_alert_delivery(self, workspace_id: str, event_id: str) -> dict[str, object] | None:
+        cutoff = utcnow() - timedelta(minutes=15)
+        rows = [item for item in self.alert_deliveries if item["workspaceId"] == workspace_id and item["eventId"] == event_id and (item.get("status", "delivered") == "delivered" or item["deliveredAt"] >= cutoff)]
+        return max(rows, key=lambda item: item["deliveredAt"]).copy() if rows else None
+
+    def record_alert_delivery(self, item: dict[str, object]) -> None:
+        with self._lock:
+            self.alert_deliveries.append(item.copy())
+
+    def reserve_alert_delivery(self, item: dict[str, object], *, workspace_limit: int = 10, domain_limit: int = 3, cooldown: timedelta = timedelta(hours=4), allow_cooldown_bypass: bool = False) -> bool:
+        with self._lock:
+            now = item["deliveredAt"]
+            key = str(item["idempotencyKey"])
+            self.alert_deliveries = [row for row in self.alert_deliveries if row.get("status") != "reserved" or row["deliveredAt"] >= now - timedelta(minutes=15)]
+            if any(row.get("idempotencyKey") == key for row in self.alert_deliveries):
+                return False
+            today = [row for row in self.alert_deliveries if row["workspaceId"] == item["workspaceId"] and row["deliveredAt"].date() == now.date()]
+            if len(today) >= workspace_limit or sum(row["domain"] == item["domain"] for row in today) >= domain_limit:
+                return False
+            recent = [row for row in self.alert_deliveries if row["workspaceId"] == item["workspaceId"] and row["eventId"] == item["eventId"] and row["deliveredAt"] >= now - cooldown]
+            if recent and not allow_cooldown_bypass:
+                return False
+            reserved = item.copy()
+            reserved["status"] = "reserved"
+            self.alert_deliveries.append(reserved)
+            return True
+
+    def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> None:
+        with self._lock:
+            for item in self.alert_deliveries:
+                if item.get("idempotencyKey") == idempotency_key:
+                    item["status"] = "delivered"
+                    return
+
+    def release_alert_reservation(self, idempotency_key: str, workspace_id: str | None = None) -> None:
+        with self._lock:
+            self.alert_deliveries = [item for item in self.alert_deliveries if not (item.get("idempotencyKey") == idempotency_key and item.get("status") == "reserved")]
+
+    def add_watchlist(self, request: WatchlistRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        with self._lock:
+            existing = next(((item_id, value) for item_id, value in self.watchlists.items() if value[0] == workspace_id and value[2].event_id == request.event_id), None)
+            if existing:
+                item_id, value = existing
+                self.watchlists[item_id] = (workspace_id, actor_id, request, value[3])
+                return MutationReceipt(id=item_id, status="completed", operation="watchlist.update", createdAt=value[3])
+            created_at = utcnow()
+            receipt = MutationReceipt(id=str(uuid.uuid4()), status="completed", operation="watchlist.create", createdAt=created_at)
+            self.watchlists[receipt.id] = (workspace_id, actor_id, request, created_at)
+            return receipt
+
+    def list_watchlists(self, workspace_id: str) -> list[WatchlistItem]:
+        with self._lock:
+            # Cluster topology is global while watches are workspace scoped.
+            # Resolve every workspace lazily to active leaf events so a merge
+            # performed in another workspace cannot leave stale visible watches.
+            pending = [value for value in self.watchlists.values() if value[0] == workspace_id]
+            for inherited_workspace_id, actor_id, request, created_at in pending:
+                queue = list(self.events.get(request.event_id).superseded_by) if self.events.get(request.event_id) else []
+                visited: set[str] = set()
+                while queue:
+                    successor_id = queue.pop(0)
+                    if successor_id in visited:
+                        continue
+                    visited.add(successor_id)
+                    successor = self.events.get(successor_id)
+                    if successor and successor.superseded_by:
+                        queue.extend(successor.superseded_by)
+                        continue
+                    if successor and not any(value[0] == workspace_id and value[2].event_id == successor_id for value in self.watchlists.values()):
+                        watch_id = str(uuid.uuid4())
+                        self.watchlists[watch_id] = (
+                            inherited_workspace_id,
+                            actor_id,
+                            request.model_copy(update={"event_id": successor_id}),
+                            created_at,
+                        )
+            return sorted(
+                [
+                    WatchlistItem(id=item_id, eventId=value[2].event_id, note=value[2].note, createdAt=value[3])
+                    for item_id, value in self.watchlists.items()
+                    if value[0] == workspace_id
+                    and self.events.get(value[2].event_id) is not None
+                    and not self.events[value[2].event_id].superseded_by
+                ],
+                key=lambda item: item.created_at,
+                reverse=True,
+            )
+
+    def remove_watchlist(self, event_id: str, workspace_id: str) -> MutationReceipt | None:
+        with self._lock:
+            existing_id = next((item_id for item_id, value in self.watchlists.items() if value[0] == workspace_id and value[2].event_id == event_id), None)
+            if existing_id is None:
+                return None
+            del self.watchlists[existing_id]
+            return MutationReceipt(id=existing_id, status="completed", operation="watchlist.delete", createdAt=utcnow())
+
+    def record_product_interaction(self, request: ProductInteractionRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        with self._lock:
+            existing = next(
+                (row for row in self.product_interactions if row["workspaceId"] == workspace_id and row["idempotencyKey"] == request.idempotency_key),
+                None,
+            )
+            if existing:
+                return MutationReceipt(
+                    id=str(existing["id"]), status="completed", operation=f"interaction.{existing['kind']}", createdAt=existing["occurredAt"],
+                )
+            receipt = MutationReceipt(id=str(uuid.uuid4()), status="completed", operation=f"interaction.{request.kind}", createdAt=utcnow())
+            self.product_interactions.append({
+                "id": receipt.id, "workspaceId": workspace_id, "actorId": actor_id,
+                **request.model_dump(mode="json", by_alias=True), "occurredAt": receipt.created_at,
+            })
+        return receipt
+
+    def list_product_interactions(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        with self._lock:
+            return [row.copy() for row in self.product_interactions if row["workspaceId"] == workspace_id and row["occurredAt"] >= since]
+
+    def purge_source(self, source_id: str) -> int:
+        """Delete source observations and evidence references, then emit a propagation event."""
+        with self._lock:
+            observation_ids = [item_id for item_id, item in self.observations.items() if item.source_id == source_id]
+            deleting = set(observation_ids)
+            affected_event_ids = {
+                event_id for event_id, members in self.event_observations.items()
+                if any(item_id in members for item_id in deleting)
+            } | {
+                event_id for event_id, event in self.events.items()
+                if any(item.source == source_id for item in event.evidence)
+            }
+            candidate_refs = {
+                self.observations[item_id].raw_evidence_ref for item_id in observation_ids
+            } | {
+                item.source_revision for item in self.metric_facts.values()
+                if item.subject_id in deleting and item.source_revision
+            }
+            retained_refs = {
+                item.raw_evidence_ref for item_id, item in self.observations.items() if item_id not in deleting
+            } | {
+                item.source_revision for item in self.metric_facts.values()
+                if item.subject_id not in deleting and item.source_revision
+            }
+            raw_refs = sorted(ref for ref in candidate_refs - retained_refs if ref)
+            for item_id in observation_ids:
+                del self.observations[item_id]
+                self.observation_processing.pop(item_id, None)
+            self.metric_facts = {key: value for key, value in self.metric_facts.items() if value.subject_id not in deleting}
+            for event_id, members in list(self.event_observations.items()):
+                for item_id in deleting:
+                    members.pop(item_id, None)
+                if not members:
+                    self.event_observations.pop(event_id, None)
+            for event_id in affected_event_ids:
+                event = self.events.get(event_id)
+                if event is None:
+                    continue
+                filtered = [item for item in event.evidence if item.source != source_id]
+                remaining_ids = list(self.event_observations.get(event_id, {}))
+                remaining = [self.observations[item_id] for item_id in remaining_ids if item_id in self.observations]
+                if not remaining and not filtered:
+                    # No retained source can justify even a tombstoned event
+                    # shell. Removing it also removes every derived title/body.
+                    self.events.pop(event_id, None)
+                    self.event_observations.pop(event_id, None)
+                    continue
+                if remaining:
+                    title_source = min(remaining, key=lambda item: (item.published_at, item.collected_at))
+                    rebuilt_title = title_source.title or title_source.text[:120] or "未命名 AI 事件"
+                    for item_id in remaining_ids:
+                        state = self.observation_processing.get(item_id)
+                        if state:
+                            state["revision"] = int(state["revision"]) + 1
+                else:
+                    rebuilt_title = filtered[0].title
+                self.events[event_id] = event.model_copy(update={
+                    "title": rebuilt_title, "title_en": rebuilt_title,
+                    "evidence": filtered, "state": LifecycleState.INSUFFICIENT_DATA, "labels": [],
+                    "attention": 0, "behavior": 0, "diversity": 0, "authority": 0,
+                    "coordination_risk": 0, "coverage": 0, "velocity": 0, "gap_residual": 0,
+                    "independent_sources": 0, "platforms": [],
+                    "signal_families": [], "evidence_count": 0,
+                    "evidence_strength": EvidenceStrength.LOW, "evidence_score": 0, "uncertainty": 100,
+                    "discussion_evidence_state": EvidenceState.MISSING,
+                    "behavior_evidence_state": EvidenceState.MISSING,
+                    "driver": "来源删除后派生结论已失效，等待重新评分。",
+                    "coverage_note": "删除传播已清除成员和指标事实；当前不得输出强结论。",
+                    "updated_at": utcnow(),
+                })
+            self.score_runs = [score for score in self.score_runs if score.event_id not in affected_event_ids]
+            cache_tags = ["radar", "events", f"source:{source_id}"] + [f"event:{event_id}" for event_id in sorted(affected_event_ids)]
+            self.outbox.append({
+                "id": str(uuid.uuid4()), "kind": "source.erased", "aggregate_id": source_id,
+                "created_at": utcnow(), "raw_evidence_refs": raw_refs,
+                "cache_tags": cache_tags,
+                "affected_event_ids": sorted(affected_event_ids),
+                "payload": {"rawEvidenceRefs": raw_refs, "cacheTags": cache_tags, "affectedEventIds": sorted(affected_event_ids)},
+            })
+            return len(observation_ids)
+
+
+class PostgresRepository:
+    """PostgreSQL repository. psycopg is imported lazily so scoring tests stay lightweight."""
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+
+    @contextmanager
+    def connection(self) -> Iterator[object]:
+        import psycopg
+
+        with psycopg.connect(self.dsn) as connection:
+            yield connection
+
+    def save_observation_with_outbox(self, observation: Observation) -> bool:
+        payload = observation.model_dump(mode="json", by_alias=True)
+        digest = observation.content_fingerprint or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        content, snapshots = split_observation(observation)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO observations (id,schema_version,connector,platform,external_id,source_id,account_id,entity_id,published_at,collected_at,
+                      language,title,body,url,normalized_url,content_fingerprint,metrics,raw_evidence_ref,parser_version,rights_policy_id,deletion_state,signal_family)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO NOTHING RETURNING id
+                    """,
+                    (content.id, content.schema_version, content.connector, content.platform, content.external_id, observation.source_id,
+                     content.account_id, content.entity_id, content.published_at, content.collected_at, content.language, content.title,
+                     content.text_excerpt, observation.url, content.canonical_url, digest, content.raw_ref or "", content.parser_version,
+                     content.rights_policy_id, content.deletion_state, observation.signal_family),
+                )
+                content_inserted = cursor.fetchone() is not None
+                if content_inserted:
+                    cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('observation.created',%s,%s::jsonb)", (observation.id, json.dumps({"observationId": observation.id})))
+                snapshot_ids: list[str] = []
+                for snapshot in snapshots:
+                    cursor.execute(
+                        """
+                        INSERT INTO metric_snapshots (id,subject_type,subject_id,metric_name,value,effective_at,collected_at,is_estimated,source_revision,connector)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id
+                        """,
+                        (snapshot.id, snapshot.subject_type, snapshot.subject_id, snapshot.metric_name, snapshot.value,
+                         snapshot.effective_at, snapshot.collected_at, snapshot.is_estimated, snapshot.source_revision, snapshot.connector),
+                    )
+                    if cursor.fetchone():
+                        snapshot_ids.append(snapshot.id)
+                if snapshot_ids:
+                    cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('metric_snapshots.created',%s,%s::jsonb)", (observation.id, json.dumps({"snapshotIds": snapshot_ids})))
+                if content_inserted or snapshot_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO observation_processing (observation_id,revision,processed_revision)
+                        VALUES (%s,1,0) ON CONFLICT (observation_id) DO UPDATE
+                        SET revision=observation_processing.revision+1,updated_at=now()
+                        """,
+                        (observation.id,),
+                    )
+            connection.commit()
+        return content_inserted or bool(snapshot_ids)
+
+    def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE observation_processing SET lease_until=now()+(%s * interval '1 second'),attempts=attempts+1,updated_at=now()
+                    WHERE observation_id=%s AND processed_revision < revision AND (lease_until IS NULL OR lease_until < now())
+                    RETURNING revision
+                    """,
+                    (lease_seconds, observation_id),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return int(row[0]) if row else None
+
+    def complete_observation_processing(self, observation_id: str, revision: int) -> None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE observation_processing SET processed_revision=GREATEST(processed_revision,%s),lease_until=NULL,last_error=NULL,updated_at=now()
+                    WHERE observation_id=%s
+                    """,
+                    (revision, observation_id),
+                )
+            connection.commit()
+
+    def fail_observation_processing(self, observation_id: str, revision: int, error: str) -> None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE observation_processing SET lease_until=NULL,last_error=%s,updated_at=now()
+                    WHERE observation_id=%s AND processed_revision < %s
+                    """,
+                    (error[:1000], observation_id, revision),
+                )
+            connection.commit()
+
+    def list_pending_observation_ids(self, limit: int = 100) -> list[str]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT observation_id FROM observation_processing
+                    WHERE processed_revision < revision AND (lease_until IS NULL OR lease_until < now())
+                    ORDER BY updated_at LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+        return [str(row[0]) for row in rows]
+
+    def get_latest_observation(self, observation_id: str) -> Observation | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id,platform,external_id,source_id,account_id,entity_id,published_at,collected_at,
+                           language,title,body,url,raw_evidence_ref,content_fingerprint,signal_family,rights_policy_id
+                    FROM observations WHERE id=%s
+                    """,
+                    (observation_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                cursor.execute(
+                    """
+                    SELECT metric_name,value,collected_at,source_revision FROM metric_snapshots
+                    WHERE subject_type='content' AND subject_id=%s ORDER BY collected_at DESC
+                    """,
+                    (observation_id,),
+                )
+                metric_rows = cursor.fetchall()
+        collected_at = row[7]
+        metrics: dict[str, float] = {}
+        raw_ref = row[12]
+        if metric_rows:
+            collected_at = metric_rows[0][2]
+            latest = [item for item in metric_rows if item[2] == collected_at]
+            metrics = {str(item[0]): float(item[1]) for item in latest}
+            raw_ref = next((item[3] for item in latest if item[3]), raw_ref)
+        return Observation(
+            id=row[0], platform=row[1], externalId=row[2], sourceId=row[3], accountId=row[4], entityId=row[5],
+            publishedAt=row[6], collectedAt=collected_at, language=row[8], title=row[9], text=row[10], url=row[11],
+            metrics=metrics, rawEvidenceRef=raw_ref, contentFingerprint=row[13], signalFamily=row[14], rightsPolicyId=row[15], relation="unknown",
+        )
+
+    def upsert_event(self, event: RadarEvent) -> None:
+        payload = json.dumps(event.model_dump(mode="json", by_alias=True), ensure_ascii=False)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO events (id, canonical_title_zh, canonical_title_en, event_type, lifecycle_state,
+                      structure_labels, first_seen_at, last_seen_at, current_score)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    ON CONFLICT (id) DO UPDATE SET canonical_title_zh=excluded.canonical_title_zh,
+                      canonical_title_en=excluded.canonical_title_en, event_type=excluded.event_type,
+                      lifecycle_state=excluded.lifecycle_state, structure_labels=excluded.structure_labels,
+                      last_seen_at=excluded.last_seen_at, current_score=excluded.current_score,
+                      version=events.version+1, updated_at=now()
+                    """,
+                    (event.id, event.title, event.title_en, event.event_type, event.state,
+                     [str(label) for label in event.labels], event.first_seen, event.updated_at, payload),
+                )
+            connection.commit()
+
+    def save_score(self, score: StoredScore) -> None:
+        cycle = score_cycle(score.input_to)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO score_runs (event_id,cycle_id,score_version,threshold_version,input_from,input_to,input_digest,drivers,payload,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
+                    ON CONFLICT (event_id,cycle_id) DO UPDATE SET
+                      score_version=excluded.score_version,threshold_version=excluded.threshold_version,
+                      input_from=excluded.input_from,input_to=excluded.input_to,input_digest=excluded.input_digest,
+                      drivers=excluded.drivers,payload=excluded.payload,created_at=excluded.created_at
+                    """,
+                    (score.event_id, cycle, score.score_version, score.threshold_version, score.input_from, score.input_to,
+                     score.input_digest, json.dumps(score.drivers, ensure_ascii=False), json.dumps(score.payload, ensure_ascii=False), score.created_at),
+                )
+                cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb) ON CONFLICT DO NOTHING", (score.event_id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle})))
+            connection.commit()
+
+    def has_score_input_digest(self, event_id: str, input_digest: str) -> bool:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM score_runs WHERE event_id=%s AND input_digest=%s LIMIT 1", (event_id, input_digest))
+                return cursor.fetchone() is not None
+
+    def commit_scored_event(self, event: RadarEvent, score: StoredScore) -> None:
+        payload = json.dumps(event.model_dump(mode="json", by_alias=True), ensure_ascii=False)
+        cycle = score_cycle(score.input_to)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO events (id,canonical_title_zh,canonical_title_en,event_type,lifecycle_state,
+                      structure_labels,first_seen_at,last_seen_at,current_score)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    ON CONFLICT (id) DO UPDATE SET canonical_title_zh=excluded.canonical_title_zh,
+                      canonical_title_en=excluded.canonical_title_en,event_type=excluded.event_type,
+                      lifecycle_state=excluded.lifecycle_state,structure_labels=excluded.structure_labels,
+                      last_seen_at=excluded.last_seen_at,current_score=excluded.current_score,
+                      version=events.version+1,updated_at=now()
+                    """,
+                    (event.id, event.title, event.title_en, event.event_type, event.state,
+                     [str(label) for label in event.labels], event.first_seen, event.updated_at, payload),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO score_runs (event_id,cycle_id,score_version,threshold_version,input_from,input_to,input_digest,drivers,payload,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
+                    ON CONFLICT (event_id,cycle_id) DO UPDATE SET
+                      score_version=excluded.score_version,threshold_version=excluded.threshold_version,
+                      input_from=excluded.input_from,input_to=excluded.input_to,input_digest=excluded.input_digest,
+                      drivers=excluded.drivers,payload=excluded.payload,created_at=excluded.created_at
+                    """,
+                    (score.event_id, cycle, score.score_version, score.threshold_version, score.input_from, score.input_to,
+                     score.input_digest, json.dumps(score.drivers, ensure_ascii=False), json.dumps(score.payload, ensure_ascii=False), score.created_at),
+                )
+                cursor.execute(
+                    "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb) ON CONFLICT DO NOTHING",
+                    (event.id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle})),
+                )
+            connection.commit()
+
+    def assign_observation(self, event_id: str, observation_id: str, cluster_score: float, assignment_version: str) -> bool:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM event_observations WHERE event_id=%s AND observation_id=%s", (event_id, observation_id))
+                created = cursor.fetchone() is None
+                cursor.execute(
+                    """
+                    INSERT INTO event_observations (event_id,observation_id,cluster_score,assignment_version)
+                    VALUES (%s,%s,%s,%s) ON CONFLICT (event_id,observation_id) DO UPDATE
+                    SET cluster_score=excluded.cluster_score, assignment_version=excluded.assignment_version
+                    """,
+                    (event_id, observation_id, cluster_score, assignment_version),
+                )
+            connection.commit()
+        return created
+
+    def list_event_observations(self, event_id: str) -> list[Observation]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT o.id,o.platform,o.external_id,o.source_id,o.account_id,o.entity_id,o.published_at,
+                      COALESCE(ms.collected_at,o.collected_at),o.language,o.title,o.body,o.url,
+                      COALESCE(jsonb_object_agg(ms.metric_name,ms.value) FILTER (WHERE ms.metric_name IS NOT NULL),'{}'::jsonb),
+                      o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id
+                    FROM observations o
+                    JOIN event_observations eo ON eo.observation_id=o.id
+                    LEFT JOIN metric_snapshots ms ON ms.subject_id=o.id
+                    WHERE eo.event_id=%s
+                    GROUP BY o.id,o.platform,o.external_id,o.source_id,o.account_id,o.entity_id,o.published_at,
+                      o.collected_at,ms.collected_at,o.language,o.title,o.body,o.url,o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id
+                    ORDER BY o.published_at,COALESCE(ms.collected_at,o.collected_at)
+                    """,
+                    (event_id,),
+                )
+                rows = cursor.fetchall()
+        return [Observation(
+            id=row[0], platform=row[1], externalId=row[2], sourceId=row[3], accountId=row[4], entityId=row[5],
+            publishedAt=row[6], collectedAt=row[7], language=row[8], title=row[9], text=row[10], url=row[11],
+            metrics=row[12], rawEvidenceRef=row[13], contentFingerprint=row[14], signalFamily=row[15], rightsPolicyId=row[16], relation="unknown",
+        ) for row in rows]
+
+    def get_event(self, event_id: str) -> RadarEvent | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_score FROM events WHERE id=%s", (event_id,))
+                row = cursor.fetchone()
+        return RadarEvent.model_validate(row[0]) if row else None
+
+    def list_events(self) -> list[RadarEvent]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_score FROM events WHERE cardinality(superseded_by)=0 ORDER BY (current_score->>'velocity')::numeric DESC NULLS LAST")
+                rows = cursor.fetchall()
+        return [RadarEvent.model_validate(row[0]) for row in rows]
+
+    def apply_connector_coverage_penalty(self, platform: str, penalty: float, note: str) -> int:
+        events = self.list_events()
+        changed = 0
+        for event in events:
+            if not any(item.lower() == platform.lower() for item in event.platforms):
+                continue
+            score = max(0, event.evidence_score - penalty)
+            tier = "low" if score < 45 else "medium" if score < 70 else "high"
+            self.upsert_event(event.model_copy(update={
+                "coverage": max(0, event.coverage - penalty), "evidence_score": score,
+                "evidence_strength": EvidenceStrength(tier), "uncertainty": min(100, event.uncertainty + penalty),
+                "coverage_note": f"{event.coverage_note}；{note}",
+            }))
+            changed += 1
+        return changed
+
+    def upsert_connector(self, connector: ConnectorStatus) -> None:
+        payload = json.dumps(connector.model_dump(mode="json", by_alias=True), ensure_ascii=False)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO connector_status (id,payload) VALUES (%s,%s::jsonb) ON CONFLICT (id) DO UPDATE SET payload=excluded.payload, updated_at=now()",
+                    (connector.id, payload),
+                )
+            connection.commit()
+
+    def record_connector_run(self, connector_id: str, started_at: datetime, finished_at: datetime, status: str, inserted: int, duplicates: int, coverage: float, error: str | None = None, estimated_cost_rmb: float = 0) -> None:
+        latency_ms = max(0, int((finished_at - started_at).total_seconds() * 1000))
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO connector_runs
+                      (connector_id,started_at,finished_at,status,inserted_count,duplicate_count,latency_ms,coverage,error,estimated_cost_rmb)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (connector_id, started_at, finished_at, status, inserted, duplicates, latency_ms, coverage, error, max(0, estimated_cost_rmb)),
+                )
+            connection.commit()
+
+    def connector_stats_24h(self, connector_id: str) -> tuple[int, int]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(inserted_count),0),
+                           COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms),0)
+                    FROM connector_runs WHERE connector_id=%s AND started_at >= now()-interval '24 hours'
+                    """,
+                    (connector_id,),
+                )
+                row = cursor.fetchone()
+        return int(row[0]), (int(float(row[1])) + 59_999) // 60_000
+
+    def monthly_connector_spend(self, at: datetime | None = None) -> float:
+        current = at or utcnow()
+        month_start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COALESCE(SUM(estimated_cost_rmb),0) FROM connector_runs WHERE started_at >= %s AND started_at < %s",
+                    (month_start, next_month),
+                )
+                row = cursor.fetchone()
+        return float(row[0])
+
+    def list_connectors(self) -> list[ConnectorStatus]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT payload FROM connector_status ORDER BY id")
+                rows = cursor.fetchall()
+        return [ConnectorStatus.model_validate(row[0]) for row in rows]
+
+    def get_connector(self, connector_id: str) -> ConnectorStatus | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT payload FROM connector_status WHERE id=%s", (connector_id,))
+                row = cursor.fetchone()
+        return ConnectorStatus.model_validate(row[0]) if row else None
+
+    def get_connector_checkpoint(self, connector_id: str) -> dict[str, object]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT payload FROM connector_checkpoints WHERE connector_id=%s", (connector_id,))
+                row = cursor.fetchone()
+        return dict(row[0]) if row else {}
+
+    def save_connector_checkpoint(self, connector_id: str, payload: dict[str, object]) -> None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO connector_checkpoints (connector_id,payload) VALUES (%s,%s::jsonb)
+                    ON CONFLICT (connector_id) DO UPDATE SET payload=excluded.payload,updated_at=now()""",
+                    (connector_id, json.dumps(payload, ensure_ascii=False)),
+                )
+            connection.commit()
+
+    def expire_raw_evidence(self, retention_days: dict[str, int], at: datetime) -> list[str]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                candidates: dict[str, str] = {}
+                for policy_id, days in retention_days.items():
+                    cutoff = at - timedelta(days=days)
+                    cursor.execute(
+                        """SELECT raw_evidence_ref FROM observations WHERE rights_policy_id=%s AND collected_at<=%s
+                        AND raw_evidence_ref<>'' FOR UPDATE""",
+                        (policy_id, cutoff),
+                    )
+                    for row in cursor.fetchall():
+                        candidates[row[0]] = policy_id
+                    cursor.execute(
+                        """UPDATE observations SET raw_evidence_ref='',deletion_state='tombstoned'
+                        WHERE rights_policy_id=%s AND collected_at<=%s AND raw_evidence_ref<>''""",
+                        (policy_id, cutoff),
+                    )
+                    cursor.execute(
+                        """SELECT ms.source_revision FROM metric_snapshots ms JOIN observations o ON o.id=ms.subject_id
+                        WHERE ms.subject_type='content' AND o.rights_policy_id=%s AND ms.collected_at<=%s AND ms.source_revision IS NOT NULL""",
+                        (policy_id, cutoff),
+                    )
+                    for row in cursor.fetchall():
+                        candidates[row[0]] = policy_id
+                    cursor.execute(
+                        """UPDATE metric_snapshots ms SET source_revision=NULL FROM observations o
+                        WHERE ms.subject_type='content' AND ms.subject_id=o.id AND o.rights_policy_id=%s
+                        AND ms.collected_at<=%s AND ms.source_revision IS NOT NULL""",
+                        (policy_id, cutoff),
+                    )
+                for reference, policy_id in candidates.items():
+                    cursor.execute(
+                        """SELECT EXISTS(SELECT 1 FROM observations WHERE raw_evidence_ref=%s)
+                        OR EXISTS(SELECT 1 FROM metric_snapshots WHERE source_revision=%s)""",
+                        (reference, reference),
+                    )
+                    if not cursor.fetchone()[0]:
+                        cursor.execute(
+                            """INSERT INTO raw_evidence_deletions (reference,rights_policy_id) VALUES (%s,%s)
+                            ON CONFLICT (reference) DO NOTHING""",
+                            (reference, policy_id),
+                        )
+                cursor.execute(
+                    """SELECT reference FROM raw_evidence_deletions
+                    WHERE status='pending' AND next_attempt_at<=%s AND (lease_until IS NULL OR lease_until<=%s)
+                    ORDER BY queued_at FOR UPDATE SKIP LOCKED LIMIT 1000""",
+                    (at, at),
+                )
+                pending = [row[0] for row in cursor.fetchall()]
+                if pending:
+                    cursor.execute(
+                        """UPDATE raw_evidence_deletions SET attempts=attempts+1,lease_until=%s+(interval '5 minutes')
+                        WHERE reference=ANY(%s)""",
+                        (at, pending),
+                    )
+            connection.commit()
+        return pending
+
+    def confirm_raw_evidence_deletions(self, references: list[str]) -> None:
+        if not references:
+            return
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE raw_evidence_deletions SET status='completed',deleted_at=now(),last_error=NULL,lease_until=NULL WHERE reference=ANY(%s)",
+                    (references,),
+                )
+            connection.commit()
+
+    def fail_raw_evidence_deletion(self, reference: str, error: str, at: datetime | None = None) -> None:
+        current = at or utcnow()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """UPDATE raw_evidence_deletions SET last_error=%s,lease_until=NULL,
+                    next_attempt_at=%s + (LEAST(3600,60*power(2,LEAST(attempts,6))) * interval '1 second')
+                    WHERE reference=%s AND status='pending'""",
+                    (error[:1000], current, reference),
+                )
+            connection.commit()
+
+    @staticmethod
+    def _set_workspace(cursor: object, workspace_id: str) -> None:
+        cursor.execute("SELECT set_config('app.workspace_id',%s,true)", (workspace_id,))
+
+    def add_feedback(self, request: FeedbackRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), operation=f"feedback.{request.action}", createdAt=utcnow())
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    "INSERT INTO feedback (id,workspace_id,event_id,actor_id,action,reason,target_event_id) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (receipt.id, workspace_id, request.event_id, actor_id, request.action, request.reason, request.target_event_id),
+                )
+                cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('feedback.created',%s,%s::jsonb)", (receipt.id, json.dumps({"feedbackId": receipt.id})))
+            connection.commit()
+        return receipt
+
+    def set_behavior_applicability(self, event_id: str, request: BehaviorApplicabilityRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), status="queued", operation="event.behavior_applicability", createdAt=utcnow())
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("SELECT current_score FROM events WHERE id=%s", (event_id,))
+                existing_row = cursor.fetchone()
+                if existing_row is None:
+                    raise KeyError(event_id)
+                current_payload = existing_row[0]
+                current_coverage = float(current_payload.get("coverage", 0))
+                current_state = current_payload.get("behaviorEvidenceState", "missing")
+                if request.state == "not_applicable" and current_state != "not_applicable":
+                    current_coverage = min(100, current_coverage + 32.5)
+                elif request.state == "missing" and current_state == "not_applicable":
+                    current_coverage = max(0, current_coverage - 32.5)
+                cursor.execute(
+                    """
+                    UPDATE events SET lifecycle_state='insufficient_data',structure_labels='{}',
+                      current_score=current_score || %s::jsonb,updated_at=now()
+                    WHERE id=%s
+                    """,
+                    (json.dumps({
+                        "behaviorEvidenceState": request.state, "state": "insufficient_data", "labels": [],
+                        "behavior": 0, "gapResidual": 0, "coverage": current_coverage,
+                        "driver": "行为适用性已人工修订，重新评分完成前不输出强结论。",
+                        "coverageNote": "行为适用性已人工修订并更新覆盖分母；重新评分已排队。",
+                    }, ensure_ascii=False), event_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE observation_processing SET revision=revision+1,updated_at=now()
+                    WHERE observation_id IN (SELECT observation_id FROM event_observations WHERE event_id=%s)
+                    """,
+                    (event_id,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO feedback (id,workspace_id,event_id,actor_id,action,reason)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    """,
+                    (receipt.id, workspace_id, event_id, actor_id, f"behavior_{request.state}", request.reason),
+                )
+                cursor.execute(
+                    "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('event.rescore.requested',%s,%s::jsonb)",
+                    (event_id, json.dumps({"state": request.state, "reason": request.reason, "workspaceId": workspace_id, "actorId": actor_id}, ensure_ascii=False)),
+                )
+            connection.commit()
+        return receipt
+
+    def queue_cluster_edit(self, event_id: str, operation: str, request: ClusterEditRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), status="queued", operation=f"cluster.{operation}", createdAt=utcnow())
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                parent_ids = [event_id] + ([request.target_event_id] if operation == "merge" and request.target_event_id else [])
+                cursor.execute("SELECT id,cluster_version,cardinality(superseded_by) FROM events WHERE id=ANY(%s) FOR SHARE", (parent_ids,))
+                version_rows = cursor.fetchall()
+                if len(version_rows) != len(parent_ids) or any(row[2] for row in version_rows):
+                    raise ValueError("source or target event is missing or superseded")
+                expected_versions = {row[0]: row[1] for row in version_rows}
+                if operation == "split":
+                    cursor.execute("SELECT observation_id FROM event_observations WHERE event_id=%s", (event_id,))
+                    assigned = {row[0] for row in cursor.fetchall()}
+                    requested = set(request.observation_ids)
+                    if not requested.issubset(assigned):
+                        raise ValueError("split observations must belong to the source event")
+                    if requested == assigned:
+                        raise ValueError("split must leave at least one observation in the source event")
+                cursor.execute(
+                    """
+                    INSERT INTO cluster_edit_requests
+                      (id,workspace_id,event_id,actor_id,operation,target_event_id,observation_ids,reason,status,expected_versions)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'queued',%s::jsonb)
+                    """,
+                    (receipt.id, workspace_id, event_id, actor_id, operation, request.target_event_id, request.observation_ids, request.reason, json.dumps(expected_versions)),
+                )
+                cursor.execute(
+                    "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('cluster.edit.requested',%s,%s::jsonb)",
+                    (event_id, json.dumps({"operationId": receipt.id, "operation": operation, "workspaceId": workspace_id})),
+                )
+            connection.commit()
+        return receipt
+
+    def list_cluster_edits(self, event_id: str, workspace_id: str) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """
+                    SELECT id,event_id,operation,target_event_id,observation_ids,status,created_at,completed_at,result_event_ids,reverted_at
+                    FROM cluster_edit_requests
+                    WHERE workspace_id=%s AND (event_id=%s OR target_event_id=%s OR %s=ANY(result_event_ids))
+                    ORDER BY created_at DESC
+                    """,
+                    (workspace_id, event_id, event_id, event_id),
+                )
+                rows = cursor.fetchall()
+        return [{
+            "id": str(row[0]), "eventId": row[1], "operation": row[2], "targetEventId": row[3],
+            "observationIds": row[4], "status": row[5], "createdAt": row[6], "completedAt": row[7],
+            "resultEventIds": row[8], "revertedAt": row[9],
+        } for row in rows]
+
+    def execute_cluster_edit(self, operation_id: str, workspace_id: str | None = None) -> dict[str, object]:
+        if not workspace_id:
+            raise ValueError("workspace_id is required for an RLS-scoped cluster operation")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """SELECT event_id,operation,target_event_id,observation_ids,status,expected_versions
+                    FROM cluster_edit_requests WHERE id=%s AND workspace_id=%s FOR UPDATE""",
+                    (operation_id, workspace_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("cluster operation not found")
+                event_id, operation, target_event_id, observation_ids, status, expected_versions = row
+                if status != "queued":
+                    raise ValueError("cluster operation is not queued")
+                parent_ids = [event_id] + ([target_event_id] if operation == "merge" else [])
+                cursor.execute(
+                    "SELECT id,current_score,cluster_version,superseded_by FROM events WHERE id=ANY(%s) FOR UPDATE",
+                    (parent_ids,),
+                )
+                parent_rows = cursor.fetchall()
+                if len(parent_rows) != len(parent_ids):
+                    raise ValueError("cluster version conflict")
+                parent_by_id = {item[0]: item for item in parent_rows}
+                if any(parent_by_id[parent_id][3] or parent_by_id[parent_id][2] != int(expected_versions[parent_id]) for parent_id in parent_ids):
+                    raise ValueError("cluster version conflict")
+                parents = [RadarEvent.model_validate(parent_by_id[parent_id][1]) for parent_id in parent_ids]
+                cursor.execute("SELECT event_id,observation_id,cluster_score FROM event_observations WHERE event_id=ANY(%s)", (parent_ids,))
+                assignments: dict[str, dict[str, float]] = {parent_id: {} for parent_id in parent_ids}
+                for assigned_event_id, observation_id, cluster_score in cursor.fetchall():
+                    assignments[assigned_event_id][observation_id] = float(cluster_score)
+                reverse_assignments = {observation_id: assigned_event_id for assigned_event_id, members in assignments.items() for observation_id in members}
+                version = max(int(parent_by_id[parent_id][2]) for parent_id in parent_ids) + 1
+                if operation == "merge":
+                    child_ids = [f"evt-{uuid.uuid4()}"]
+                    child_members = [{observation_id: score for members in assignments.values() for observation_id, score in members.items()}]
+                else:
+                    requested = set(observation_ids)
+                    source_members = assignments[event_id]
+                    if not requested or not requested.issubset(source_members) or requested == set(source_members):
+                        raise ValueError("split membership changed before execution")
+                    child_ids = [f"evt-{uuid.uuid4()}", f"evt-{uuid.uuid4()}"]
+                    child_members = [
+                        {observation_id: score for observation_id, score in source_members.items() if observation_id in requested},
+                        {observation_id: score for observation_id, score in source_members.items() if observation_id not in requested},
+                    ]
+                now = utcnow()
+                for child_id, members in zip(child_ids, child_members, strict=True):
+                    child = InMemoryRepository._successor_event(parents[0], child_id, version, operation_id, operation, len(members), event_id)
+                    payload = json.dumps(child.model_dump(mode="json", by_alias=True), ensure_ascii=False)
+                    cursor.execute(
+                        """INSERT INTO events (id,canonical_title_zh,canonical_title_en,event_type,lifecycle_state,structure_labels,
+                        first_seen_at,last_seen_at,current_score,cluster_version,parent_cluster_id,merge_operation_id,split_operation_id,effective_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s)""",
+                        (child.id, child.title, child.title_en, child.event_type, child.state, [], child.first_seen, child.updated_at,
+                         payload, version, event_id, operation_id if operation == "merge" else None, operation_id if operation == "split" else None, now),
+                    )
+                    if members:
+                        cursor.execute(
+                            "UPDATE event_observations SET event_id=%s,assignment_version=%s WHERE observation_id=ANY(%s)",
+                            (child_id, f"human:{operation_id}", list(members)),
+                        )
+                        cursor.execute(
+                            "UPDATE observation_processing SET revision=revision+1,updated_at=now() WHERE observation_id=ANY(%s)",
+                            (list(members),),
+                        )
+                    cursor.execute(
+                        "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('event.rescore.requested',%s,%s::jsonb)",
+                        (child_id, json.dumps({"operationId": operation_id, "clusterVersion": version})),
+                    )
+                superseded_patch = json.dumps({"supersededBy": child_ids})
+                cursor.execute(
+                    "UPDATE events SET superseded_by=%s,current_score=current_score || %s::jsonb,updated_at=now() WHERE id=ANY(%s)",
+                    (child_ids, superseded_patch, parent_ids),
+                )
+                for parent_id in parent_ids:
+                    for child_id in child_ids:
+                        cursor.execute(
+                            "INSERT INTO event_lineage_edges (operation_id,parent_event_id,child_event_id,effective_at) VALUES (%s,%s,%s,%s)",
+                            (operation_id, parent_id, child_id, now),
+                        )
+                inherited_watch_ids: list[str] = []
+                for child_id in child_ids:
+                    cursor.execute(
+                        """INSERT INTO watchlists (id,workspace_id,actor_id,event_id,note,created_at)
+                        SELECT gen_random_uuid(),workspace_id,actor_id,%s,note,created_at FROM watchlists
+                        WHERE workspace_id=%s AND event_id=ANY(%s) ON CONFLICT (workspace_id,event_id) DO NOTHING RETURNING id""",
+                        (child_id, workspace_id, parent_ids),
+                    )
+                    inherited_watch_ids.extend(str(item[0]) for item in cursor.fetchall())
+                reverse_payload = {
+                    "assignments": reverse_assignments, "parentEventIds": parent_ids,
+                    "inheritedWatchIds": inherited_watch_ids,
+                }
+                result_versions = {child_id: version for child_id in child_ids}
+                cursor.execute(
+                    """UPDATE cluster_edit_requests SET status='completed',completed_at=%s,result_event_ids=%s,
+                    result_versions=%s::jsonb,reverse_payload=%s::jsonb WHERE id=%s""",
+                    (now, child_ids, json.dumps(result_versions), json.dumps(reverse_payload), operation_id),
+                )
+            connection.commit()
+        return {
+            "id": operation_id, "eventId": event_id, "operation": operation, "targetEventId": target_event_id,
+            "observationIds": observation_ids, "status": "completed", "completedAt": now, "resultEventIds": child_ids,
+            "resultVersions": result_versions,
+        }
+
+    def revert_cluster_edit(self, operation_id: str, workspace_id: str) -> dict[str, object]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """SELECT event_id,operation,target_event_id,status,result_event_ids,result_versions,reverse_payload
+                    FROM cluster_edit_requests WHERE id=%s AND workspace_id=%s FOR UPDATE""",
+                    (operation_id, workspace_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("cluster operation not found")
+                event_id, operation, target_event_id, status, child_ids, result_versions, reverse = row
+                if status != "completed":
+                    raise ValueError("only a completed cluster operation can be reverted")
+                cursor.execute("SELECT id,cluster_version,superseded_by FROM events WHERE id=ANY(%s) FOR UPDATE", (child_ids,))
+                child_rows = cursor.fetchall()
+                child_by_id = {item[0]: item for item in child_rows}
+                if len(child_rows) != len(child_ids) or any(child_by_id[child_id][2] or child_by_id[child_id][1] != int(result_versions[child_id]) for child_id in child_ids):
+                    raise ValueError("cluster version conflict")
+                parent_ids = list(reverse["parentEventIds"])
+                cursor.execute("SELECT observation_id,cluster_score FROM event_observations WHERE event_id=ANY(%s)", (child_ids,))
+                current_scores = {item[0]: float(item[1]) for item in cursor.fetchall()}
+                for parent_id in parent_ids:
+                    member_ids = [observation_id for observation_id, original_parent in reverse["assignments"].items() if original_parent == parent_id and observation_id in current_scores]
+                    if member_ids:
+                        cursor.execute(
+                            "UPDATE event_observations SET event_id=%s,assignment_version=%s WHERE observation_id=ANY(%s)",
+                            (parent_id, f"revert:{operation_id}", member_ids),
+                        )
+                        cursor.execute("UPDATE observation_processing SET revision=revision+1,updated_at=now() WHERE observation_id=ANY(%s)", (member_ids,))
+                    cursor.execute(
+                        """UPDATE events SET superseded_by='{}',cluster_version=cluster_version+1,
+                        current_score=current_score || jsonb_build_object('supersededBy','[]'::jsonb,'clusterVersion',cluster_version+1),
+                        updated_at=now() WHERE id=%s""",
+                        (parent_id,),
+                    )
+                    cursor.execute(
+                        "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('event.rescore.requested',%s,%s::jsonb)",
+                        (parent_id, json.dumps({"operationId": operation_id, "reverted": True})),
+                    )
+                child_patch = json.dumps({"supersededBy": parent_ids})
+                cursor.execute(
+                    "UPDATE events SET superseded_by=%s,current_score=current_score || %s::jsonb,updated_at=now() WHERE id=ANY(%s)",
+                    (parent_ids, child_patch, child_ids),
+                )
+                inherited_ids = list(reverse.get("inheritedWatchIds", []))
+                if inherited_ids:
+                    cursor.execute("DELETE FROM watchlists WHERE workspace_id=%s AND id::text=ANY(%s)", (workspace_id, inherited_ids))
+                now = utcnow()
+                cursor.execute("UPDATE event_lineage_edges SET reverted_at=%s WHERE operation_id=%s", (now, operation_id))
+                cursor.execute("UPDATE cluster_edit_requests SET status='reverted',reverted_at=%s WHERE id=%s", (now, operation_id))
+            connection.commit()
+        return {
+            "id": operation_id, "eventId": event_id, "operation": operation, "targetEventId": target_event_id,
+            "status": "reverted", "revertedAt": now, "resultEventIds": child_ids,
+        }
+
+    def execute_pending_cluster_edits(self, limit: int = 20) -> int:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT payload->>'operationId',payload->>'workspaceId' FROM outbox
+                    WHERE kind='cluster.edit.requested' AND payload->>'clusterExecutedAt' IS NULL ORDER BY created_at LIMIT %s""",
+                    (limit,),
+                )
+                pending = cursor.fetchall()
+        completed = 0
+        for operation_id, workspace_id in pending:
+            if not operation_id or not workspace_id:
+                continue
+            try:
+                self.execute_cluster_edit(operation_id, workspace_id)
+            except ValueError as exc:
+                with self.connection() as connection:
+                    with connection.cursor() as cursor:
+                        self._set_workspace(cursor, workspace_id)
+                        cursor.execute(
+                            """UPDATE cluster_edit_requests SET
+                            status=CASE WHEN status='queued' THEN 'failed' ELSE status END,
+                            error=CASE WHEN status='queued' THEN %s ELSE error END,
+                            completed_at=CASE WHEN status='queued' THEN now() ELSE completed_at END
+                            WHERE id=%s""",
+                            (str(exc), operation_id),
+                        )
+                        cursor.execute(
+                            """UPDATE outbox SET payload=jsonb_set(
+                            jsonb_set(payload,'{clusterExecutedAt}',to_jsonb(now()::text),true),
+                            '{clusterExecutionError}',to_jsonb(%s::text),true)
+                            WHERE kind='cluster.edit.requested' AND payload->>'operationId'=%s""",
+                            (str(exc), operation_id),
+                        )
+                    connection.commit()
+                continue
+            with self.connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """UPDATE outbox SET payload=jsonb_set(payload,'{clusterExecutedAt}',to_jsonb(now()::text),true)
+                        WHERE kind='cluster.edit.requested' AND payload->>'operationId'=%s""",
+                        (operation_id,),
+                    )
+                connection.commit()
+            completed += 1
+        return completed
+
+    def get_event_lineage(self, event_id: str) -> dict[str, list[dict[str, object]]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT operation_id,parent_event_id,child_event_id,effective_at,reverted_at
+                    FROM event_lineage_edges WHERE parent_event_id=%s OR child_event_id=%s ORDER BY effective_at""",
+                    (event_id, event_id),
+                )
+                rows = cursor.fetchall()
+        values = [{
+            "operationId": str(row[0]), "parentEventId": row[1], "childEventId": row[2],
+            "effectiveAt": row[3], "revertedAt": row[4],
+        } for row in rows]
+        return {
+            "parents": [item for item in values if item["childEventId"] == event_id],
+            "children": [item for item in values if item["parentEventId"] == event_id],
+        }
+
+    def add_alert(self, request: AlertRuleRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        receipt = MutationReceipt(id=str(uuid.uuid4()), status="completed", operation="alert_rule.create", createdAt=utcnow())
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("INSERT INTO alert_rules (id,workspace_id,actor_id,payload) VALUES (%s,%s,%s,%s::jsonb)", (receipt.id, workspace_id, actor_id, request.model_dump_json(by_alias=True)))
+            connection.commit()
+        return receipt
+
+    def list_alert_rules(self, workspace_id: str) -> list[tuple[str, AlertRuleRequest]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("SELECT id,payload FROM alert_rules WHERE workspace_id=%s ORDER BY created_at", (workspace_id,))
+                rows = cursor.fetchall()
+        return [(str(row[0]), AlertRuleRequest.model_validate(row[1])) for row in rows]
+
+    def list_alert_deliveries(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """
+                    SELECT rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel
+                    FROM alert_deliveries WHERE workspace_id=%s AND delivered_at >= %s
+                      AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
+                    ORDER BY delivered_at
+                    """,
+                    (workspace_id, since),
+                )
+                rows = cursor.fetchall()
+        return [{
+            "ruleId": str(row[0]), "workspaceId": workspace_id, "eventId": row[1], "domain": row[2],
+            "lifecycleState": row[3], "evidenceStrength": row[4], "evidenceCount": row[5],
+            "deliveredAt": row[6], "channel": row[7],
+        } for row in rows]
+
+    def last_alert_delivery(self, workspace_id: str, event_id: str) -> dict[str, object] | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """
+                    SELECT rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel
+                    FROM alert_deliveries WHERE workspace_id=%s AND event_id=%s
+                      AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
+                    ORDER BY delivered_at DESC LIMIT 1
+                    """,
+                    (workspace_id, event_id),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "ruleId": str(row[0]), "workspaceId": workspace_id, "eventId": row[1], "domain": row[2],
+            "lifecycleState": row[3], "evidenceStrength": row[4], "evidenceCount": row[5],
+            "deliveredAt": row[6], "channel": row[7],
+        }
+
+    def record_alert_delivery(self, item: dict[str, object]) -> None:
+        workspace_id = str(item["workspaceId"])
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """
+                    INSERT INTO alert_deliveries
+                      (rule_id,workspace_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,channel,delivered_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (item["ruleId"], workspace_id, item["eventId"], item["domain"], item["lifecycleState"],
+                     item["evidenceStrength"], item["evidenceCount"], item["channel"], item["deliveredAt"]),
+                )
+            connection.commit()
+
+    def reserve_alert_delivery(self, item: dict[str, object], *, workspace_limit: int = 10, domain_limit: int = 3, cooldown: timedelta = timedelta(hours=4), allow_cooldown_bypass: bool = False) -> bool:
+        workspace_id = str(item["workspaceId"])
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (workspace_id,))
+                cursor.execute("DELETE FROM alert_deliveries WHERE workspace_id=%s AND status='reserved' AND delivered_at < now()-interval '15 minutes'", (workspace_id,))
+                cursor.execute("SELECT 1 FROM alert_deliveries WHERE idempotency_key=%s", (item["idempotencyKey"],))
+                if cursor.fetchone():
+                    connection.commit()
+                    return False
+                cursor.execute(
+                    "SELECT count(*),count(*) FILTER (WHERE domain=%s) FROM alert_deliveries WHERE workspace_id=%s AND (delivered_at AT TIME ZONE 'UTC')::date=(%s::timestamptz AT TIME ZONE 'UTC')::date",
+                    (item["domain"], workspace_id, item["deliveredAt"]),
+                )
+                budget_row = cursor.fetchone()
+                if int(budget_row[0]) >= workspace_limit or int(budget_row[1]) >= domain_limit:
+                    connection.commit()
+                    return False
+                if not allow_cooldown_bypass:
+                    cursor.execute(
+                        "SELECT 1 FROM alert_deliveries WHERE workspace_id=%s AND event_id=%s AND delivered_at >= %s LIMIT 1",
+                        (workspace_id, item["eventId"], item["deliveredAt"] - cooldown),
+                    )
+                    if cursor.fetchone():
+                        connection.commit()
+                        return False
+                cursor.execute(
+                    """
+                    INSERT INTO alert_deliveries
+                      (rule_id,workspace_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,channel,delivered_at,idempotency_key,status)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'reserved')
+                    """,
+                    (item["ruleId"], workspace_id, item["eventId"], item["domain"], item["lifecycleState"],
+                     item["evidenceStrength"], item["evidenceCount"], item["channel"], item["deliveredAt"], item["idempotencyKey"]),
+                )
+            connection.commit()
+        return True
+
+    def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> None:
+        if not workspace_id:
+            raise ValueError("workspace_id is required for an RLS-scoped alert confirmation")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("UPDATE alert_deliveries SET status='delivered' WHERE workspace_id=%s AND idempotency_key=%s AND status='reserved'", (workspace_id, idempotency_key))
+            connection.commit()
+
+    def release_alert_reservation(self, idempotency_key: str, workspace_id: str | None = None) -> None:
+        if not workspace_id:
+            raise ValueError("workspace_id is required for an RLS-scoped alert release")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("DELETE FROM alert_deliveries WHERE workspace_id=%s AND idempotency_key=%s AND status='reserved'", (workspace_id, idempotency_key))
+            connection.commit()
+
+    def add_watchlist(self, request: WatchlistRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        proposed_id = str(uuid.uuid4())
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """INSERT INTO watchlists (id,workspace_id,actor_id,event_id,note)
+                    VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT (workspace_id,event_id) DO UPDATE SET actor_id=EXCLUDED.actor_id,note=EXCLUDED.note
+                    RETURNING id,created_at,(xmax = 0) AS inserted""",
+                    (proposed_id, workspace_id, actor_id, request.event_id, request.note),
+                )
+                item_id, created_at, inserted = cursor.fetchone()
+            connection.commit()
+        return MutationReceipt(id=str(item_id), status="completed", operation="watchlist.create" if inserted else "watchlist.update", createdAt=created_at)
+
+    def list_watchlists(self, workspace_id: str) -> list[WatchlistItem]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """WITH RECURSIVE watched(actor_id,event_id,note,created_at) AS (
+                      SELECT actor_id,event_id,note,created_at FROM watchlists WHERE workspace_id=%s
+                      UNION
+                      SELECT watched.actor_id,successor.event_id,watched.note,watched.created_at
+                      FROM watched JOIN events ON events.id=watched.event_id
+                      CROSS JOIN LATERAL unnest(events.superseded_by) AS successor(event_id)
+                    )
+                    INSERT INTO watchlists (id,workspace_id,actor_id,event_id,note,created_at)
+                    SELECT gen_random_uuid(),%s,actor_id,event_id,note,created_at FROM watched
+                    JOIN events ON events.id=watched.event_id
+                    WHERE cardinality(events.superseded_by)=0
+                    ON CONFLICT (workspace_id,event_id) DO NOTHING""",
+                    (workspace_id, workspace_id),
+                )
+                cursor.execute(
+                    """SELECT watchlists.id,watchlists.event_id,watchlists.note,watchlists.created_at
+                    FROM watchlists JOIN events ON events.id=watchlists.event_id
+                    WHERE watchlists.workspace_id=%s AND cardinality(events.superseded_by)=0
+                    ORDER BY watchlists.created_at DESC""",
+                    (workspace_id,),
+                )
+                return [WatchlistItem(id=str(row[0]), eventId=row[1], note=row[2], createdAt=row[3]) for row in cursor.fetchall()]
+
+    def remove_watchlist(self, event_id: str, workspace_id: str) -> MutationReceipt | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute("DELETE FROM watchlists WHERE workspace_id=%s AND event_id=%s RETURNING id", (workspace_id, event_id))
+                row = cursor.fetchone()
+            connection.commit()
+        if row is None:
+            return None
+        return MutationReceipt(id=str(row[0]), status="completed", operation="watchlist.delete", createdAt=utcnow())
+
+    def record_product_interaction(self, request: ProductInteractionRequest, workspace_id: str, actor_id: str) -> MutationReceipt:
+        proposed_id = str(uuid.uuid4())
+        proposed_at = utcnow()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """INSERT INTO product_interactions
+                    (id,workspace_id,actor_id,event_id,session_id,idempotency_key,kind,metadata,occurred_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                    ON CONFLICT (workspace_id,idempotency_key) DO NOTHING
+                    RETURNING id,occurred_at,kind""",
+                    (proposed_id, workspace_id, actor_id, request.event_id, request.session_id, request.idempotency_key,
+                     request.kind, json.dumps(request.metadata, ensure_ascii=False), proposed_at),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        "SELECT id,occurred_at,kind FROM product_interactions WHERE workspace_id=%s AND idempotency_key=%s",
+                        (workspace_id, request.idempotency_key),
+                    )
+                    row = cursor.fetchone()
+            connection.commit()
+        return MutationReceipt(id=str(row[0]), status="completed", operation=f"interaction.{row[2]}", createdAt=row[1])
+
+    def list_product_interactions(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """SELECT session_id,event_id,kind,metadata,occurred_at FROM product_interactions
+                    WHERE workspace_id=%s AND occurred_at>=%s ORDER BY occurred_at""",
+                    (workspace_id, since),
+                )
+                rows = cursor.fetchall()
+        return [{"sessionId": row[0], "eventId": row[1], "kind": row[2], "metadata": row[3], "occurredAt": row[4]} for row in rows]
+
+    def purge_source(self, source_id: str) -> int:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT id FROM observations WHERE source_id=%s", (source_id,))
+                observation_ids = [row[0] for row in cursor.fetchall()]
+                cursor.execute(
+                    """
+                    SELECT DISTINCT eo.event_id
+                    FROM event_observations eo JOIN observations o ON o.id=eo.observation_id
+                    WHERE o.source_id=%s
+                    UNION
+                    SELECT id FROM events WHERE current_score->'evidence' @> %s::jsonb
+                    """,
+                    (source_id, json.dumps([{"source": source_id}])),
+                )
+                affected_event_ids = [row[0] for row in cursor.fetchall()]
+                cursor.execute(
+                    """
+                    WITH candidate(ref) AS (
+                      SELECT deleting.raw_evidence_ref FROM observations deleting WHERE deleting.source_id=%s
+                      UNION
+                      SELECT snapshots.source_revision
+                      FROM metric_snapshots snapshots
+                      JOIN observations deleting ON deleting.id=snapshots.subject_id
+                      WHERE snapshots.subject_type='content' AND deleting.source_id=%s
+                    ), retained(ref) AS (
+                      SELECT kept.raw_evidence_ref FROM observations kept WHERE kept.source_id<>%s
+                      UNION
+                      SELECT snapshots.source_revision
+                      FROM metric_snapshots snapshots
+                      JOIN observations kept ON kept.id=snapshots.subject_id
+                      WHERE snapshots.subject_type='content' AND kept.source_id<>%s
+                    )
+                    SELECT ref FROM candidate WHERE ref IS NOT NULL AND ref<>''
+                    EXCEPT SELECT ref FROM retained WHERE ref IS NOT NULL AND ref<>''
+                    """,
+                    (source_id, source_id, source_id, source_id),
+                )
+                raw_refs = [row[0] for row in cursor.fetchall()]
+                if observation_ids:
+                    cursor.execute("DELETE FROM metric_snapshots WHERE subject_type='content' AND subject_id=ANY(%s)", (observation_ids,))
+                cursor.execute("DELETE FROM observations WHERE source_id=%s", (source_id,))
+                deleted = cursor.rowcount
+                cursor.execute("DELETE FROM sources WHERE id=%s", (source_id,))
+                reset_at = utcnow()
+                for event_id in affected_event_ids:
+                    cursor.execute(
+                        """
+                        SELECT o.id,COALESCE(NULLIF(o.title,''),left(o.body,120),'未命名 AI 事件')
+                        FROM event_observations eo JOIN observations o ON o.id=eo.observation_id
+                        WHERE eo.event_id=%s ORDER BY o.published_at,o.collected_at LIMIT 1
+                        """,
+                        (event_id,),
+                    )
+                    title_row = cursor.fetchone()
+                    if title_row is None:
+                        # With no retained members, deleting the event is the
+                        # only way to guarantee title/body/embedding erasure.
+                        cursor.execute("DELETE FROM events WHERE id=%s", (event_id,))
+                        continue
+                    rebuilt_title = str(title_row[1])
+                    cursor.execute(
+                        """
+                        UPDATE observation_processing SET revision=revision+1,updated_at=now()
+                        WHERE observation_id IN (
+                          SELECT observation_id FROM event_observations WHERE event_id=%s
+                        )
+                        """,
+                        (event_id,),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE events SET canonical_title_zh=%s,canonical_title_en=%s,
+                          lifecycle_state='insufficient_data',structure_labels='{}',
+                          current_score = jsonb_set(
+                            current_score || %s::jsonb,
+                            '{evidence}', COALESCE((
+                              SELECT jsonb_agg(item) FROM jsonb_array_elements(current_score->'evidence') item
+                              WHERE item->>'source' <> %s
+                            ), '[]'::jsonb)
+                          ), updated_at=now()
+                        WHERE id=%s
+                        """,
+                        (rebuilt_title, rebuilt_title, json.dumps({
+                            "title": rebuilt_title, "titleEn": rebuilt_title,
+                            "state": "insufficient_data", "labels": [], "attention": 0, "behavior": 0,
+                            "diversity": 0, "authority": 0, "coordinationRisk": 0, "coverage": 0,
+                            "velocity": 0, "gapResidual": 0, "independentSources": 0, "platforms": [],
+                            "signalFamilies": [], "evidenceCount": 0,
+                            "evidenceStrength": "low", "evidenceScore": 0, "uncertainty": 100,
+                            "discussionEvidenceState": "missing", "behaviorEvidenceState": "missing",
+                            "driver": "来源删除后派生结论已失效，等待重新评分。",
+                            "coverageNote": "删除传播已清除成员和指标事实；当前不得输出强结论。",
+                            "updatedAt": reset_at.isoformat(),
+                        }, ensure_ascii=False), source_id, event_id),
+                    )
+                if affected_event_ids:
+                    cursor.execute("DELETE FROM score_runs WHERE event_id=ANY(%s)", (affected_event_ids,))
+                cache_tags = ["radar", "events", f"source:{source_id}"] + [f"event:{event_id}" for event_id in sorted(affected_event_ids)]
+                cursor.execute(
+                    "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('source.erased',%s,%s::jsonb)",
+                    (source_id, json.dumps({"rawEvidenceRefs": raw_refs, "cacheTags": cache_tags, "affectedEventIds": sorted(affected_event_ids)})),
+                )
+            connection.commit()
+        return deleted

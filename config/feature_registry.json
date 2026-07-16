@@ -1,0 +1,56 @@
+{
+  "registryVersion": "features-2026-07-rc2.1",
+  "frozen": true,
+  "defaults": {
+    "unit": "cumulative_count_delta",
+    "direction": "increase_is_signal",
+    "windows": ["1h", "6h", "24h"],
+    "platformFamily": "display_only",
+    "entityDedupeLevel": "resolved_ownership_entity_per_capture_window",
+    "baselineKey": ["eventType", "platform", "metric", "hourOfWeek"],
+    "weight": 0.0,
+    "familyCap": 0.0,
+    "minimumSample": 5,
+    "revisionPolicy": "append_metric_snapshot_and_recompute_affected_cycle",
+    "testVectors": ["zero_delta", "positive_delta", "outlier_robust_mad", "late_revision", "fixed_denominator_missing", "family_cap"]
+  },
+  "features": [
+    {"featureId":"discussion.comments","eventTypes":["model_release","developer_tool_release","research_or_benchmark","official_product_release","security_incident"],"signalCategory":"discussion","inputMetric":"comments","role":"attention_only","normalDelayHours":[0,24]},
+    {"featureId":"discussion.replies","eventTypes":["model_release","developer_tool_release","research_or_benchmark","official_product_release","security_incident"],"signalCategory":"discussion","inputMetric":"replies","role":"attention_only","normalDelayHours":[0,24]},
+    {"featureId":"discussion.mentions","eventTypes":["model_release","developer_tool_release","research_or_benchmark","official_product_release","security_incident"],"signalCategory":"discussion","inputMetric":"mentions","role":"attention_only","normalDelayHours":[0,24]},
+    {"featureId":"discussion.score","eventTypes":["model_release","developer_tool_release","research_or_benchmark","official_product_release","security_incident"],"signalCategory":"discussion","inputMetric":"score","role":"attention_only","normalDelayHours":[0,24]},
+
+    {"featureId":"model.downloads","eventTypes":["model_release"],"signalCategory":"behavior","inputMetric":"downloads","role":"primary_adoption","platformFamily":"model_downloads","weight":0.35,"familyCap":0.35,"normalDelayHours":[0,24]},
+    {"featureId":"model.repository_adoption","eventTypes":["model_release"],"signalCategory":"behavior","inputMetric":"repository_adoption","role":"primary_adoption","platformFamily":"repository_or_package_adoption","weight":0.30,"familyCap":0.30,"normalDelayHours":[0,24]},
+    {"featureId":"model.derivatives","eventTypes":["model_release"],"signalCategory":"behavior","inputMetric":"derivatives","role":"primary_adoption","platformFamily":"derivative_projects","weight":0.20,"familyCap":0.20,"normalDelayHours":[0,24]},
+    {"featureId":"model.contributors","eventTypes":["model_release"],"signalCategory":"behavior","inputMetric":"contributors","role":"primary_adoption","platformFamily":"active_contributors","weight":0.15,"familyCap":0.15,"normalDelayHours":[0,24]},
+    {"featureId":"model.likes","eventTypes":["model_release"],"signalCategory":"behavior","inputMetric":"likes","role":"secondary_intent","normalDelayHours":[0,24]},
+    {"featureId":"model.forks","eventTypes":["model_release"],"signalCategory":"behavior","inputMetric":"forks","role":"secondary_intent","normalDelayHours":[0,24]},
+
+    {"featureId":"tool.stars","eventTypes":["developer_tool_release"],"signalCategory":"behavior","inputMetric":"stars","role":"secondary_intent","platformFamily":"repository_intent","weight":0.125,"familyCap":0.25,"normalDelayHours":[0,48]},
+    {"featureId":"tool.forks","eventTypes":["developer_tool_release"],"signalCategory":"behavior","inputMetric":"forks","role":"secondary_intent","platformFamily":"repository_intent","weight":0.125,"familyCap":0.25,"normalDelayHours":[0,48]},
+    {"featureId":"tool.installs","eventTypes":["developer_tool_release"],"signalCategory":"behavior","inputMetric":"installs","role":"primary_adoption","platformFamily":"package_usage","weight":0.30,"familyCap":0.30,"normalDelayHours":[0,48]},
+    {"featureId":"tool.dependent_repositories","eventTypes":["developer_tool_release"],"signalCategory":"behavior","inputMetric":"dependent_repositories","role":"primary_adoption","platformFamily":"dependent_integrations","weight":0.25,"familyCap":0.25,"normalDelayHours":[0,48]},
+    {"featureId":"tool.contributors","eventTypes":["developer_tool_release"],"signalCategory":"behavior","inputMetric":"contributors","role":"primary_adoption","platformFamily":"contributor_response","weight":0.20,"familyCap":0.20,"normalDelayHours":[0,48]},
+
+    {"featureId":"research.reproductions","eventTypes":["research_or_benchmark"],"signalCategory":"behavior","inputMetric":"reproductions","role":"primary_adoption","platformFamily":"independent_reproduction","weight":0.35,"familyCap":0.35,"normalDelayHours":[6,168]},
+    {"featureId":"research.dependencies","eventTypes":["research_or_benchmark"],"signalCategory":"behavior","inputMetric":"dependencies","role":"primary_adoption","platformFamily":"code_dataset_usage","weight":0.30,"familyCap":0.30,"normalDelayHours":[6,168]},
+    {"featureId":"research.benchmark_reuse","eventTypes":["research_or_benchmark"],"signalCategory":"behavior","inputMetric":"benchmark_reuse","role":"primary_adoption","platformFamily":"benchmark_reuse","weight":0.20,"familyCap":0.20,"normalDelayHours":[6,168]},
+    {"featureId":"research.citations","eventTypes":["research_or_benchmark"],"signalCategory":"behavior","inputMetric":"citations","role":"secondary_intent","platformFamily":"downstream_scholarly_use","weight":0.15,"familyCap":0.15,"normalDelayHours":[6,168]},
+    {"featureId":"research.forks","eventTypes":["research_or_benchmark"],"signalCategory":"behavior","inputMetric":"forks","role":"secondary_intent","normalDelayHours":[6,168]},
+    {"featureId":"research.issues","eventTypes":["research_or_benchmark"],"signalCategory":"behavior","inputMetric":"issues","role":"secondary_intent","normalDelayHours":[6,168]},
+
+    {"featureId":"product.active_usage","eventTypes":["official_product_release"],"signalCategory":"behavior","inputMetric":"active_usage","role":"primary_adoption","platformFamily":"active_usage_api_calls","weight":0.40,"familyCap":0.40,"normalDelayHours":[1,72]},
+    {"featureId":"product.signups","eventTypes":["official_product_release"],"signalCategory":"behavior","inputMetric":"signups","role":"primary_adoption","platformFamily":"trial_activation","weight":0.25,"familyCap":0.25,"normalDelayHours":[1,72]},
+    {"featureId":"product.downloads","eventTypes":["official_product_release"],"signalCategory":"behavior","inputMetric":"downloads","role":"primary_adoption","platformFamily":"package_integration_growth","weight":0.20,"familyCap":0.20,"normalDelayHours":[1,72]},
+    {"featureId":"product.retained_usage","eventTypes":["official_product_release"],"signalCategory":"behavior","inputMetric":"retained_usage","role":"primary_adoption","platformFamily":"retained_usage","weight":0.15,"familyCap":0.15,"normalDelayHours":[1,72]},
+    {"featureId":"product.reviews","eventTypes":["official_product_release"],"signalCategory":"behavior","inputMetric":"reviews","role":"secondary_intent","normalDelayHours":[1,72]},
+    {"featureId":"product.views","eventTypes":["official_product_release"],"signalCategory":"behavior","inputMetric":"views","role":"attention_only","normalDelayHours":[1,72]},
+
+    {"featureId":"security.patch_downloads","eventTypes":["security_incident"],"signalCategory":"behavior","inputMetric":"patch_downloads","role":"primary_response","platformFamily":"remediation_release","weight":0.35,"familyCap":0.35,"normalDelayHours":[0,48]},
+    {"featureId":"security.fixed_dependents","eventTypes":["security_incident"],"signalCategory":"behavior","inputMetric":"fixed_dependents","role":"primary_response","platformFamily":"affected_repository_response","weight":0.25,"familyCap":0.25,"normalDelayHours":[0,48]},
+    {"featureId":"security.advisories","eventTypes":["security_incident"],"signalCategory":"behavior","inputMetric":"advisories","role":"secondary_intent","platformFamily":"issue_advisory_activity","weight":0.25,"familyCap":0.25,"normalDelayHours":[0,48]},
+    {"featureId":"security.mitigation_adoption","eventTypes":["security_incident"],"signalCategory":"behavior","inputMetric":"mitigation_adoption","role":"primary_response","platformFamily":"mitigation_adoption","weight":0.15,"familyCap":0.15,"normalDelayHours":[0,48]},
+    {"featureId":"security.forks","eventTypes":["security_incident"],"signalCategory":"behavior","inputMetric":"forks","role":"attention_only","normalDelayHours":[0,48]}
+  ]
+}

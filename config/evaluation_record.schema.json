@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://signal-ai.local/schemas/evaluation-record-rc2.json",
+  "title": "AI Radar point-in-time evaluation record",
+  "type": "object",
+  "required": ["eventId", "entityId", "eventType", "predicted", "actual", "rankScore", "predictedAt", "labelerA", "labelerB", "adjudicated"],
+  "properties": {
+    "eventId": {"type": "string", "minLength": 1},
+    "entityId": {"type": "string", "minLength": 1},
+    "narrativeId": {"type": ["string", "null"]},
+    "releaseSeriesId": {"type": ["string", "null"]},
+    "eventType": {"enum": ["model_release", "developer_tool_release", "research_or_benchmark", "official_product_release", "security_incident"]},
+    "predicted": {"type": "string"},
+    "actual": {"type": "string"},
+    "rankScore": {"type": "number"},
+    "predictedAt": {"type": "string", "format": "date-time"},
+    "confirmedAt": {"type": ["string", "null"], "format": "date-time"},
+    "outcome24h": {"type": ["string", "null"]},
+    "outcome7d": {"type": ["string", "null"]},
+    "labelerA": {"type": "string", "minLength": 1},
+    "labelerB": {"type": "string", "minLength": 1},
+    "adjudicated": {"type": "boolean"},
+    "observationId": {"type": "string"},
+    "predictedCluster": {"type": "string"},
+    "actualCluster": {"type": "string"}
+  },
+  "additionalProperties": false
+}
