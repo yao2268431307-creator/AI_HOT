@@ -27,6 +27,7 @@
 - 评估工具输出 Precision@K、宏 F1、错误告警/日、提前量、eventType 分组、Pairwise、B-cubed 和 bootstrap 区间；双标注 Cohen's kappa 有独立实现。
 - 103 项 Python 自动化用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
 - 五个免密公共元数据连接器完成显式真实 smoke；该过程发现并修复 OpenAlex 空作者 ID 整批失败与异常未来发布日期污染时间线的问题。命令与运行证据独立保存，不进入确定性 CI，也不替代 72 小时 soak。
+- owner-only Sites 录制数据候选 v1 已部署成功；源码 SHA、归档哈希、访问策略与平台桌面截图均已归档。该版本明确显示 `RECORDED DEMO`，尚未连接生产 FastAPI 与身份联邦。
 
 ## 以录制数据运行
 
@@ -39,7 +40,7 @@
 - X、Bluesky、Bilibili 的生产连接；它们受授权、配额或实时流部署约束。
 - 60/240 双人标注集、时间隔离校准、F1/Precision@K 的真实数值。
 - 72 小时采集 soak、7 天影子运行、2,000 信源真实容量与 500 万观测数据库压测。
-- Sites 身份到独立 FastAPI 的生产级联邦验证；生产认证开启时，浏览器原生 EventSource 不能携带当前 API Key，必须通过同源身份代理或改用带凭证的流客户端。
+- Sites 身份到独立 FastAPI 的生产级联邦验证；当前 Sites 仅为录制数据私有候选。生产认证开启时，浏览器原生 EventSource 不能携带当前 API Key，必须通过同源身份代理或改用带凭证的流客户端。
 - PostgreSQL 迁移、RLS、Redis、MinIO/R2 的真实容器集成测试。本机 `docker compose config --quiet` 已通过，但 Docker Desktop 引擎未运行，不能声称数据库迁移已实际应用。
 - PostgreSQL PITR、1 小时 RPO、4 小时 RTO 和备份过期删除演练。
 
@@ -53,6 +54,8 @@ Python Ruff: passed
 Web: ESLint passed
 Web: Vinext production build passed
 Web: 2 SSR/product-contract tests passed
+Sites: owner-only recorded-data deployment v1 succeeded; platform desktop screenshot inspected
+Browser interaction: not run (enterprise policy blocks localhost and chatgpt.site automation)
 Python bytecode compile: passed
 Python dependency check: passed
 Docker Compose configuration parse: passed

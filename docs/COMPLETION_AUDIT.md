@@ -39,10 +39,10 @@
 | 产品 KPI：强告警接受率、错误告警、首次分诊和有效研判时长 | 部分完成 | 工作区交互埋点具备幂等键；`/api/v1/metrics/review` 仅输出明确标记的“详情打开→提交研判”探索性代理，字段名和 limitations 禁止冒充 rc2 KPI | 另行实现已送达强告警分母、队列可研判时间、值班时段/排除项与前台有效时长；达到最低样本量后再判定 |
 | Owner/Analyst/Viewer 与工作区隔离 | 已证实（API key/RLS 单测）/待环境验证（联邦） | 服务器派生 workspace、RLS SQL、权限与隔离用例 | Sites/替代部署的真实身份、成员撤销和 SSE 凭证验证 |
 | 外部文本、SSRF、Prompt Injection、Webhook 安全 | 已证实（代码） | URL/DNS/重定向限制、Unicode NFKC/Bidi 清理、React 转义、LLM 不参与数值评分 | 渗透测试、域名重绑定和真实出口代理验证 |
-| AA、键盘、移动端、图表数据表 | 待环境验证 | Radix Dialog、reduced-motion、断点和静态契约已通过 | Chrome/Firefox、键盘、屏幕阅读器、对比度实测 |
+| AA、键盘、移动端、图表数据表 | 部分完成/待环境验证 | Radix Dialog、reduced-motion、断点和静态契约已通过；Sites 平台桌面截图已核验 | 企业策略禁止自动化访问 localhost/chatgpt.site；仍需 Chrome/Firefox、键盘、屏幕阅读器、对比度实测 |
 | PostgreSQL Outbox、Redis、R2 一致性 | 待环境验证 | SQL、发布器、DLQ、对象存储适配器和单元用例存在 | Docker daemon/目标环境启动后跑迁移、断网和恢复演练 |
 | PITR、RPO ≤1h、RTO ≤4h、Redis 丢失恢复 | 外部闸门 | 无本机生产备份环境 | 配置 WAL/PITR，执行恢复并记录实际 RPO/RTO |
-| Sites 或替代部署 | 外部闸门 | 本地 Web/API 可运行，Sites 能力已在计划中设 Week 0 闸门 | 组织管理员完成域名、身份、SSE/轮询和回滚验证 |
+| Sites 或替代部署 | 部分完成/待联邦 | owner-only 录制数据候选 v1 已部署成功，源码 SHA、归档哈希、访问人数和平台截图可追溯 | 部署独立 API/存储，完成 Sites 身份、SSE/轮询、成员撤销和回滚验证 |
 | X、YouTube、中文受限源授权 | 外部闸门 | 未授权源默认关闭；YouTube 仅在 key 存在时装载 | 合同/配额/字段权利审批，不得绕过平台控制 |
 | 72H soak、7 天影子运行 | 外部闸门 | 瞬时自动化不能提供时间证据 | 按日复核误报、漏报、状态时机和证据支持度 |
 
@@ -59,7 +59,7 @@ npm.cmd run lint
 npm.cmd test
 ```
 
-运行态 smoke 使用 `http://127.0.0.1:8017` 与 `http://localhost:3001`，验证 health、radar、关注 CRUD、研判埋点、指标接口和网页 200。Docker Compose 配置可解析，但本机 Docker Desktop daemon 不可用，所以数据库迁移、RLS、Redis 与 R2 仍是明确的环境闸门。
+运行态 smoke 使用 `http://127.0.0.1:8017` 与 `http://localhost:3001`，验证 health、radar、关注 CRUD、研判埋点、指标接口和网页 200。owner-only Sites 录制数据候选部署成功，证据见 [Sites 私有部署记录](evidence/SITES_PRIVATE_DEPLOYMENT_2026-07-16.md)。Docker Compose 配置可解析，但本机 Docker Desktop daemon 不可用，所以数据库迁移、RLS、Redis 与 R2 仍是明确的环境闸门。
 
 ## 当前发布结论
 

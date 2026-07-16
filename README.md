@@ -4,6 +4,8 @@
 
 当前仓库提供一个生产形态纵向切片：Vinext/React 研判工作台、FastAPI 契约与 SSE、事件类型感知评分、P0/P1 连接器、PostgreSQL + pgvector 数据模型、Transactional Outbox、Redis Streams、R2/MinIO 原始证据、所有权去重、权限、预算化签名 Webhook 告警、来源晋级与自动化用例。
 
+owner-only 的 Sites 录制数据候选位于 <https://signal-ai-radar-rc2-seasun.m4gicarp.chatgpt.site>。它用于视觉和产品流程评审，不代表 FastAPI、真实数据、身份联邦或 rc2 正式 Beta 已上线；部署证据见 [Sites 私有候选记录](docs/evidence/SITES_PRIVATE_DEPLOYMENT_2026-07-16.md)。
+
 ## 工程结构
 
 ```text
