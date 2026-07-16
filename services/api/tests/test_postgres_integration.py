@@ -20,10 +20,15 @@ from radar.fixtures import demo_events
 from radar.main import create_app
 from radar.outbox import (
     RedisOutboxPublisher,
+    STREAM_FENCE_PROTOCOL_VERSION,
     STREAM_OUTBOX_KINDS,
+    acquire_stream_exclusive,
     outbox_recovery_keys,
     register_stream_participant,
+    release_stream_exclusive,
     release_stream_participant,
+    xadd_as_stream_exclusive,
+    xadd_as_stream_participant,
 )
 from radar.storage import InMemoryRepository, PostgresRepository
 from radar.stream_retention import (
@@ -318,11 +323,16 @@ async def test_outbox_failure_retry_consumer_ack_and_redis_loss_replay() -> None
         # kind; the worker ACKs unrelated kinds, and the stable score outbox id
         # must not duplicate the already committed business delivery.
         await redis.delete(stream)
-        replay = await publisher.replay_batch(
-            since=started_at - timedelta(minutes=1),
-            until=datetime.now(timezone.utc) + timedelta(minutes=1),
-            limit=10,
-        )
+        replay_token = await acquire_stream_exclusive(redis, stream, "integration-replay")
+        try:
+            replay = await publisher.replay_batch(
+                since=started_at - timedelta(minutes=1),
+                until=datetime.now(timezone.utc) + timedelta(minutes=1),
+                limit=10,
+                exclusive_token=replay_token,
+            )
+        finally:
+            await release_stream_exclusive(redis, stream, replay_token)
         assert replay.replayed == 2
         assert replay.complete is True
         replayed_rows = await redis.xrange(stream)
@@ -363,6 +373,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
     locked_stream = f"{prefix}:locked"
     stolen_stream = f"{prefix}:stolen"
     missing_prefix_stream = f"{prefix}:missing-prefix"
+    legacy_completed_stream = f"{prefix}:legacy-completed"
     redis = Redis.from_url(REDIS_URL, decode_responses=True)
     outbox_id: uuid.UUID | None = None
     prefix_outbox_ids: list[uuid.UUID] = []
@@ -372,6 +383,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         for value in (
             stream, unrelated_stream, resumed_stream, lost_stream, tampered_stream,
             active_stream, locked_stream, stolen_stream, missing_prefix_stream,
+            legacy_completed_stream,
         )
     }
     try:
@@ -417,11 +429,27 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
             )
         since = now - timedelta(minutes=1)
         until = now + timedelta(minutes=1)
+        legacy_state_key, _, _ = stream_keys[legacy_completed_stream]
+        await redis.hset(legacy_state_key, mapping={
+            "since": since.isoformat(), "until": until.isoformat(),
+            "stream": legacy_completed_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
+            "protocolVersion": "stream-fence-legacy",
+            "status": "completed", "replayed": "1", "completedAt": now.isoformat(),
+        })
+        legacy_state_before = await redis.hgetall(legacy_state_key)
+        with pytest.raises(RuntimeError, match="kind/protocol set"):
+            await execute_replay(
+                APP_DSN, REDIS_URL, legacy_completed_stream, since, until, 1,
+            )
+        assert await redis.hgetall(legacy_state_key) == legacy_state_before
+        assert not await redis.exists(legacy_completed_stream)
+
         resumed_message_id = await redis.xadd(resumed_stream, {"outbox_id": str(outbox_id), "kind": "score.created"})
         resumed_state_key, resumed_lock_key, resumed_publishers_key = stream_keys[resumed_stream]
         await redis.hset(resumed_state_key, mapping={
             "since": since.isoformat(), "until": until.isoformat(),
             "stream": resumed_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
+            "protocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
             "status": "running", "replayed": "1", "startedAt": now.isoformat(),
             "afterCreatedAt": outbox_created_at.isoformat(), "afterId": str(outbox_id),
             "afterStreamId": resumed_message_id,
@@ -435,6 +463,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         await redis.hset(lost_state_key, mapping={
             "since": since.isoformat(), "until": until.isoformat(),
             "stream": lost_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
+            "protocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
             "status": "running", "replayed": "1", "startedAt": now.isoformat(),
             "afterCreatedAt": outbox_created_at.isoformat(), "afterId": str(outbox_id),
             "afterStreamId": "1-0",
@@ -447,6 +476,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         await redis.hset(tampered_state_key, mapping={
             "since": since.isoformat(), "until": until.isoformat(),
             "stream": tampered_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
+            "protocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
             "status": "running", "replayed": "1", "startedAt": now.isoformat(),
             "afterCreatedAt": outbox_created_at.isoformat(), "afterId": str(outbox_id),
             "afterStreamId": tampered_message_id,
@@ -511,6 +541,7 @@ async def test_resumable_replay_command_refuses_unrelated_or_completed_stream(
         await redis.hset(missing_state_key, mapping={
             "since": prefix_since.isoformat(), "until": prefix_until.isoformat(),
             "stream": missing_prefix_stream, "kinds": ",".join(STREAM_OUTBOX_KINDS),
+            "protocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
             "status": "running", "replayed": "2", "startedAt": now.isoformat(),
             "afterCreatedAt": last_prefix_created_at.isoformat(), "afterId": str(last_prefix_id),
             "afterStreamId": last_prefix_stream_id,
@@ -560,6 +591,7 @@ async def test_stream_retention_trims_only_recoverable_rows_behind_every_group(
     stream = f"{prefix}:stream"
     unsafe_stream = f"{prefix}:unsafe"
     time_stream = f"{prefix}:time-boundary"
+    fence_stream = f"{prefix}:fence"
     first_group = f"{prefix}:alerts"
     second_group = f"{prefix}:deletions"
     racing_group = f"{prefix}:late-group"
@@ -567,7 +599,7 @@ async def test_stream_retention_trims_only_recoverable_rows_behind_every_group(
     time_group = f"{prefix}:time-group"
     redis = Redis.from_url(REDIS_URL, decode_responses=True)
     outbox_ids: list[uuid.UUID] = []
-    stream_keys = [stream, unsafe_stream, time_stream]
+    stream_keys = [stream, unsafe_stream, time_stream, fence_stream]
     try:
         with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
             for index in range(5):
@@ -614,6 +646,26 @@ async def test_stream_retention_trims_only_recoverable_rows_behind_every_group(
         finally:
             await release_stream_participant(redis, stream, participant)
 
+        stale_token = await register_stream_participant(redis, fence_stream, "stale-publisher")
+        _, fence_lock_key, fence_participants_key = outbox_recovery_keys(fence_stream)
+        await redis.zadd(fence_participants_key, {stale_token: 0})
+        exclusive_fence = await acquire_stream_exclusive(redis, fence_stream, "recovery")
+        with pytest.raises(RuntimeError, match="participant fencing rejected XADD"):
+            await xadd_as_stream_participant(
+                redis, fence_stream, stale_token, {"outbox_id": str(uuid.uuid4())},
+            )
+        assert await redis.xlen(fence_stream) == 0
+        await xadd_as_stream_exclusive(
+            redis, fence_stream, exclusive_fence, {"outbox_id": str(uuid.uuid4())},
+        )
+        assert await redis.xlen(fence_stream) == 1
+        await redis.set(fence_lock_key, "replacement-owner", ex=60)
+        with pytest.raises(RuntimeError, match="exclusive stream fencing rejected XADD"):
+            await xadd_as_stream_exclusive(
+                redis, fence_stream, exclusive_fence, {"outbox_id": str(uuid.uuid4())},
+            )
+        assert await redis.xlen(fence_stream) == 1
+
         dry_run = await maintain_stream_retention(
             APP_DSN,
             redis,
@@ -630,6 +682,27 @@ async def test_stream_retention_trims_only_recoverable_rows_behind_every_group(
         assert dry_run["estimatedAfterLength"] == 4
         assert dry_run["capacityStatusAfterSafeTrim"] == "within_limit"
         assert dry_run["recoverableKinds"] == list(STREAM_OUTBOX_KINDS)
+        assert dry_run["fenceProtocolVersion"] == STREAM_FENCE_PROTOCOL_VERSION
+
+        groups_before_stale_trim = await inspect_consumer_groups(
+            redis,
+            stream,
+            {first_group, second_group},
+        )
+        stale_trim_token = await acquire_stream_exclusive(redis, stream, "stale-retention")
+        _, stream_lock_key, _ = outbox_recovery_keys(stream)
+        await redis.set(stream_lock_key, "replacement-retention-owner", ex=60)
+        before_stale_trim_length = await redis.xlen(stream)
+        with pytest.raises(RuntimeError, match="exclusive maintenance lease changed"):
+            await trim_stream_at_verified_watermarks(
+                redis,
+                stream,
+                stale_trim_token,
+                str(dry_run["safeTrimMinId"]),
+                groups_before_stale_trim,
+            )
+        assert await redis.xlen(stream) == before_stale_trim_length
+        await redis.delete(stream_lock_key)
 
         with pytest.raises(RuntimeError, match="execute requires the safeTrimMinId"):
             await maintain_stream_retention(
@@ -658,10 +731,18 @@ async def test_stream_retention_trims_only_recoverable_rows_behind_every_group(
                 execute=True,
                 confirmed_trim_min_id=str(dry_run["safeTrimMinId"]),
             )
-        with pytest.raises(RuntimeError, match="consumer group membership changed"):
-            await trim_stream_at_verified_watermarks(
-                redis, stream, str(dry_run["safeTrimMinId"]), expected_groups,
-            )
+        race_token = await acquire_stream_exclusive(redis, stream, "retention-race")
+        try:
+            with pytest.raises(RuntimeError, match="consumer group membership changed"):
+                await trim_stream_at_verified_watermarks(
+                    redis,
+                    stream,
+                    race_token,
+                    str(dry_run["safeTrimMinId"]),
+                    expected_groups,
+                )
+        finally:
+            await release_stream_exclusive(redis, stream, race_token)
         assert await redis.xlen(stream) == 5
         assert await redis.xgroup_destroy(stream, racing_group) is True
 

@@ -81,9 +81,9 @@ $env:REDIS_URL="redis://host:6379/0"
 ```
 
 重放仍是 at-least-once；进程在 XADD 与检查点之间中断时可能再次投递同一 `outbox_id`，所以消费者的业务幂等约束不能关闭。操作与故障窗口证据见 [Outbox/Redis 恢复验证](docs/evidence/OUTBOX_REDIS_RECOVERY_2026-07-17.md)。
-恢复锁存在或检查点仍为 `running` 时，常规 publisher 和 consumer 都会 fail closed。检查点同时保存 PostgreSQL `(created_at,id)` 与最后一条 Redis Stream ID；续跑不仅核对末条，还会以自动清理的磁盘临时账本精确对账 PostgreSQL 期望前缀与 Redis 去重后的完整 `outbox_id` 顺序及累计数。未完成检查点若存在前缀缺失、多余、乱序或找不到对应 Redis 行，会拒绝续跑并要求清理检查点后从完整窗口重启；已完成恢复的 Stream 后续再次丢失，则清除 completed cursor 后自动全量重建。命令完成后先启动消费者，再恢复常规 publisher；重放只覆盖历史上已标记 published 的相关事件，仍处于 pending 的 Outbox 会由常规 publisher 发布。保留 PostgreSQL Outbox 的时间范围必须覆盖所选恢复窗口，并为前缀校验预留足够临时磁盘空间。
+恢复锁存在或检查点仍为 `running` 时，常规 publisher 和 consumer 都会 fail closed。常规发布的参与者 token、恢复的排他 token 与 `XADD` 在同一个 Redis Lua 内校验、续租并写入，过期或被替换的 writer 无法继续修改 Stream。Stream 与恢复 state/lock/participants 键使用同一 Redis Cluster hash slot；检查点和运维报告记录围栏协议版本。检查点同时保存 PostgreSQL `(created_at,id)` 与最后一条 Redis Stream ID；续跑不仅核对末条，还会以自动清理的磁盘临时账本精确对账 PostgreSQL 期望前缀与 Redis 去重后的完整 `outbox_id` 顺序及累计数。未完成检查点若存在前缀缺失、多余、乱序或找不到对应 Redis 行，会拒绝续跑并要求清理检查点后从完整窗口重启；已完成恢复的 Stream 后续再次丢失，则清除 completed cursor 后自动全量重建。命令完成后先启动消费者，再恢复常规 publisher；重放只覆盖历史上已标记 published 的相关事件，仍处于 pending 的 Outbox 会由常规 publisher 发布。保留 PostgreSQL Outbox 的时间范围必须覆盖所选恢复窗口，并为前缀校验预留足够临时磁盘空间。
 
-Redis Stream 保留采用显式维护，不由 publisher 自动 `MAXLEN` 裁剪。操作前停止该 Stream 的 publisher/consumer 与 PostgreSQL Outbox 清理任务，并等待参与者租约排空；当前租约只约束应用参与者，不能替代发布链整体的跨系统 fencing。工具会拒绝活跃参与者、恢复锁、未完成恢复状态或缺少必需 consumer group。默认只 dry-run：它以 Redis 时钟计算保留期边界，取所有现存消费者组的最早 pending/last-delivered 安全水位，只把严格早于最终边界的消息列为候选，并逐个核对其 `outbox_id` 是现有恢复工具支持的已发布 Outbox kind。execute 必须回填同一次 dry-run 的 `safeTrimMinId`；执行期间 PostgreSQL `FOR SHARE` 行锁阻断候选恢复事实被删除，Redis Lua 在同一原子操作内重新核对完整消费者组状态并精确裁剪。任何无效、状态变化或不可恢复消息都会拒绝 execute；安全边界内仍超过容量上限时只报告 `over_limit`，不会强制删除：
+Redis Stream 保留采用显式维护，不由 publisher 自动 `MAXLEN` 裁剪。操作前停止该 Stream 的 publisher/consumer 与 PostgreSQL Outbox 清理任务，并等待参与者租约排空；应用围栏不能提供 PostgreSQL 与 Redis 的 exactly-once，也不能约束绕过协议的基础设施操作。工具会拒绝活跃参与者、恢复锁、未完成恢复状态或缺少必需 consumer group。默认只 dry-run：它以 Redis 时钟计算保留期边界，取所有现存消费者组的最早 pending/last-delivered 安全水位，只把严格早于最终边界的消息列为候选，并逐个核对其 `outbox_id` 是现有恢复工具支持的已发布 Outbox kind。execute 必须回填同一次 dry-run 的 `safeTrimMinId`；执行期间 PostgreSQL `FOR SHARE` 行锁阻断候选恢复事实被删除，Redis Lua 在同一原子操作内校验排他 token、续租、重新核对完整消费者组状态并精确裁剪。任何无效、状态变化或不可恢复消息都会拒绝 execute；安全边界内仍超过容量上限时只报告 `over_limit`，不会强制删除：
 
 ```powershell
 $env:DATABASE_URL="postgresql://radar_app:...@host/database"
@@ -98,6 +98,8 @@ $env:REDIS_URL="redis://host:6379/0"
 ```
 
 `--confirm-before-id` 的值必须原样复制紧邻 dry-run 输出的 `safeTrimMinId`。该值是获批的最大裁剪边界：execute 会重新计算 `calculatedSafeTrimMinId`；若安全水位后退则拒绝，若只随时间或消费进度前移，仍严格按较早的获批 ID 裁剪，不扩大删除范围。多组场景需重复传入 `--required-group`，或设置逗号分隔的 `RADAR_REQUIRED_STREAM_GROUPS`。PostgreSQL Outbox 保留期必须不短于 Redis 可恢复窗口。实现、实测断言与尚未覆盖的 Redis Cluster/目标规模边界见 [Redis Stream 安全保留验证](docs/evidence/REDIS_STREAM_RETENTION_2026-07-17.md)。
+
+当前围栏协议为 `stream-fence-2026-07-rc2.1`。该版本改变了恢复键布局，使所有 Lua key 与 Stream 同槽；同一新布局 state key 中协议缺失或不匹配时，工具会拒绝复用并保留原检查点。旧布局与新布局互不可见，因此从旧候选升级前必须停止旧二进制、完成或人工终止旧恢复任务，并确认旧布局没有 `running` 检查点和活跃租约；工具不会自动迁移或静默删除旧状态。
 
 生产认证开启时，修改全局“行为不适用”只允许离线治理工作区的 Owner。请为治理身份单独配置 `RADAR_SYSTEM_WORKSPACE_ID`；普通工作区的 Analyst/Owner 反馈不会直接改写全局事件分数。
 

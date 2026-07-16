@@ -10,7 +10,7 @@
 3. 保留期边界使用 Redis `TIME`，不信任操作机时钟。最终 `safeTrimMinId` 是保留期边界和消费者边界的较早者；`XTRIM MINID` 只删除严格小于该 ID 的消息，因此边界消息仍保留。
 4. `STREAM_OUTBOX_KINDS` 冻结 observation、metric snapshot、score、feedback、cluster edit、rescore 与 source deletion 七类消息，常规 publisher、恢复和裁剪共用；未登记 kind 不得进入 Stream。dry-run 用磁盘 SQLite 精确登记所有候选行和去重后的 UUID `outbox_id`，分批查询 PostgreSQL，要求每个 ID 属于该集合且 `published_at IS NOT NULL`。无效 ID、错误 kind 或缺失发布事实均阻断 execute。
 5. execute 必须提交 dry-run `safeTrimMinId` 作为获批上限，并重新计算 `calculatedSafeTrimMinId`。当前安全边界小于确认值时拒绝；边界因时间或消费进度前移时，仍以确认值建账和裁剪，删除范围不会超过已审阅计划。验证线程用 PostgreSQL `FOR SHARE` 持有所有候选行直到 Redis 操作结束，阻断并发清理或事实改写；取消期间也等待线程返回并释放连接。
-6. 裁剪前再次读取所有组并确认维护租约仍有效；最终 Redis Lua 在一个原子操作内重新读取完整组集合、last-delivered、pending 数和最早 pending，任一变化都拒绝，然后执行精确而非近似的 `XTRIM MINID`。若安全裁剪后仍超过容量，只报告 `over_limit`，不强制越过消费者水位。
+6. 裁剪前再次读取所有组并确认维护租约仍有效；最终 Redis Lua 在一个原子操作内校验排他 token、续租、重新读取完整组集合、last-delivered、pending 数和最早 pending，任一锁或组状态变化都拒绝，然后执行精确而非近似的 `XTRIM MINID`。若安全裁剪后仍超过容量，只报告 `over_limit`，不强制越过消费者水位。Stream 与围栏键处于同一 Redis Cluster hash slot，报告包含 `stream-fence-2026-07-rc2.1` 协议版本。
 
 ## 真实集成断言
 
@@ -18,6 +18,7 @@
 
 - 组 A 已读 5 条、只 ACK 第 1 条，第 2 条成为全局最早 PEL；组 B 读并 ACK 前 4 条，因此裁剪水位确实由 PEL 而非慢组 last-delivered 控制。
 - 活跃 publisher 参与者租约存在时，维护程序拒绝启动。
+- 过期 participant token 即使已通过早先检查也不能 `XADD`；排他锁被替换后，旧 exclusive token 同样不能 `XADD`，两种拒绝均保持 Stream 长度不变。
 - dry-run 把第 2 条消息判为安全边界，只列第 1 条为候选；候选 Outbox 覆盖完整。
 - dry-run 后新增 `0-0` consumer group 时，原子裁剪因组集合变化拒绝且 Stream 长度不变。
 - execute 不提供 dry-run 边界确认时拒绝；提供精确确认后删除 1 条，组 A 的 4 条 pending 保留，组 B 随后仍能读取第 5 条未见消息。
@@ -44,8 +45,9 @@ Web production dependency audit: 0 vulnerabilities
 
 ## 未覆盖与上线闸门
 
-- 参与者互斥依赖应用 publisher/consumer 遵守租约；PG 行锁与 Redis 原子脚本关闭了本次候选删除和组状态 TOCTOU，但不等于发布链 XADD/PG 标记窗口的完整跨系统 fencing，也不能约束绕过数据库/Redis 协议的基础设施级操作。执行窗口仍应暂停 Outbox 清理任务作为运维双保险。
+- 参与者互斥依赖应用 publisher/consumer 遵守协议；Redis 内的 `XADD`/`XTRIM` 已原子校验对应 token，PG 行锁与 Redis 原子脚本也关闭了候选删除和组状态 TOCTOU，但这不等于 PostgreSQL/Redis exactly-once，也不能约束绕过数据库/Redis 协议的基础设施级操作。执行窗口仍应暂停 Outbox 清理任务作为运维双保险。
 - 尚未在 Redis Cluster、主从故障转移、网络分区和进程硬终止窗口中验证。
+- 旧版恢复键与新同槽布局跨槽且互不可见；版本升级必须停止旧二进制并人工确认旧租约/检查点清空，不能把新布局的原子 Lua 当作跨版本在线迁移屏障。
 - 尚未用目标消息量测量 SQLite 临时空间、Outbox 查询负载、精确裁剪时长与积压恢复时间；生产容量和告警阈值仍需压测。
 - CLI 对 Redis 连接和单条命令设置 10 秒连接、30 秒 socket timeout；目标容量必须证明原子组复核与精确 `XTRIM` 在该时限内完成，不能靠放宽超时替代容量治理。
 - PostgreSQL Outbox 的实际保留期必须覆盖 Redis 可恢复窗口；PITR、备份恢复和目标 RPO/RTO 仍是独立闸门。

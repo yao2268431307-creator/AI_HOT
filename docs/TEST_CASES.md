@@ -121,13 +121,13 @@
 | I-04 | 插入真实 PG Outbox 后发布到真实 Redis Stream | 流中字段和 payload 一致；Outbox 标记已发布、尝试次数为 1、无错误 |
 | I-05 | Redis consumer group 与 MinIO S3 对象闭环 | Stream 可读取/ACK 且 pending 清零；对象可 put/read/delete，字节与 Content-Type 一致 |
 | I-06 | 同时重启 PostgreSQL、Redis 和 MinIO | 唯一测试事实、Stream 消息和对象在服务恢复后仍可读，脚本随后只清理本次唯一前缀数据 |
-| I-07 | XADD 成功、PG 发布标记失败后重试 | 首次消息留在 Stream，Outbox 保持未发布并记录失败；重试使用相同 `outbox_id`，生产 Worker ACK 两条消息但只形成一条告警事实 |
-| I-08 | 删除整个 Redis Stream 后按冻结时间窗重建 | 从已发布 Outbox 重放冻结 `STREAM_OUTBOX_KINDS` 的全部七类消息，不改写 PG 发布事实；新 consumer group ACK 后业务事实仍不重复，未登记 kind 不得由常规 publisher 进入 Stream |
+| I-07 | XADD 成功、PG 发布标记失败后重试 | participant token 校验、续租和 XADD 原子完成；首次消息留在 Stream，Outbox 保持未发布并记录失败；重试使用相同 `outbox_id`，生产 Worker ACK 两条消息但只形成一条告警事实 |
+| I-08 | 删除整个 Redis Stream 后按冻结时间窗重建 | exclusive token 校验、续租和 XADD 原子完成；从已发布 Outbox 重放冻结 `STREAM_OUTBOX_KINDS` 的全部七类消息，不改写 PG 发布事实；新 consumer group ACK 后业务事实仍不重复，未登记 kind 不得由常规 publisher 进入 Stream |
 | I-09 | poison、无 `outbox_id` fallback、畸形 JSON 和外部删除 pending | 达上限后 DLQ/ACK；cycle/inputDigest 与终态使用同一身份 helper；合法但非对象 JSON 也能进入 DLQ；`XAUTOCLAIM` 推进游标并把已删除 PEL ID 写 tombstone DLQ 后显式报错 |
 | I-10 | 两个真实 publisher 并发发布十条正常 Outbox | Stream 恰有十个不同 `outbox_id`；每条 PG 记录只标记一次且 `attempts=1` |
-| I-11 | 重放命令续跑和目标保护 | 完成状态、最后 `(created_at,id)`、Redis Stream ID 与累计数写入检查点；续跑以磁盘临时账本精确对账 PG 期望前缀和 Redis 去重后的完整 ID 顺序，两条 PG 仅保留末条 Stream 的伪检查点必须拒绝；取消发生在后台线程持有临时 SQLite 时仍保留原 `CancelledError` 并零残留；丢失/篡改检查点行、锁被替换、活跃 publisher/consumer、已完成窗口或无检查点既有 Stream 也均 fail closed，锁丢失时检查点不得前移 |
+| I-11 | 重放命令续跑和目标保护 | 完成状态、最后 `(created_at,id)`、Redis Stream ID、累计数与围栏协议版本写入检查点；Stream 与恢复键处于同一 Redis Cluster slot；续跑以磁盘临时账本精确对账 PG 期望前缀和 Redis 去重后的完整 ID 顺序，两条 PG 仅保留末条 Stream 的伪检查点必须拒绝；取消发生在后台线程持有临时 SQLite 时仍保留原 `CancelledError` 并零残留；丢失/篡改/旧协议检查点、锁被替换、活跃 publisher/consumer、已完成窗口或无检查点既有 Stream 也均 fail closed，锁丢失时不得 XADD 或前移检查点 |
 | I-12 | 告警 reservation 后 confirm 失败，随后事件/规则更新或删除 | 身份绑定稳定 `outbox_id`；in-app 恢复为唯一 delivered；Webhook 无快照/规则或重试耗尽时变为可查询的 `aborted + terminalReason`，重复消息视为终态跳过 |
-| I-13 | 两个不同进度的 Redis consumer group 执行安全保留 | 活跃 publisher 租约阻断维护；PEL 为全局最早水位并保留较慢组尚未读取消息；复核后新增组被原子拒绝；execute 绑定 dry-run ID；只精确删除当前恢复工具支持且已发布的 Outbox 前缀；并发 PG 删除被行锁阻断；错误 kind/缺失事实时 fail closed 且 Stream 不变 |
+| I-13 | 两个不同进度的 Redis consumer group 执行安全保留 | 活跃 publisher 租约阻断维护；过期 participant 与被替换的 exclusive token 均不能 XADD；PEL 为全局最早水位并保留较慢组尚未读取消息；最终 Lua 原子校验排他 token、续租、复核完整组状态并裁剪，新增组或锁替换均拒绝；execute 绑定 dry-run ID；只精确删除当前恢复工具支持且已发布的 Outbox 前缀；并发 PG 删除被行锁阻断；错误 kind/缺失事实时 fail closed 且 Stream 不变 |
 
 ## 必须在真实环境执行的验收
 

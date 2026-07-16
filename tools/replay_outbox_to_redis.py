@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT / "services" / "api"))
 
 from radar.outbox import (  # noqa: E402
     RedisOutboxPublisher,
+    STREAM_FENCE_PROTOCOL_VERSION,
     STREAM_OUTBOX_KINDS,
     outbox_recovery_keys,
 )
@@ -90,6 +91,7 @@ def expected_state(since: datetime, until: datetime, stream: str) -> dict[str, s
         "until": until.isoformat(),
         "stream": stream,
         "kinds": ",".join(REPLAY_KINDS),
+        "protocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
     }
 
 
@@ -331,6 +333,10 @@ async def execute_replay(
         state = await redis.hgetall(state_key)
         if stream_exists and not state:
             raise RuntimeError("target stream already exists without a matching replay checkpoint")
+        if state and any(state.get(key) != value for key, value in expected.items()):
+            raise RuntimeError(
+                "existing replay checkpoint does not match this stream/window/kind/protocol set",
+            )
         if state.get("status") == "completed":
             if stream_exists:
                 raise RuntimeError("this replay window is already marked completed")
@@ -338,11 +344,8 @@ async def execute_replay(
             # completed cursors are never reused against an absent target.
             await reset_completed_checkpoint(redis, lock_key, state_key, lock_token)
             state = {}
-        if state:
-            if any(state.get(key) != value for key, value in expected.items()):
-                raise RuntimeError("existing replay checkpoint does not match this stream/window/kind set")
-            if state.get("status") != "running":
-                raise RuntimeError("existing replay checkpoint has an unsupported status")
+        elif state and state.get("status") != "running":
+            raise RuntimeError("existing replay checkpoint has an unsupported status")
 
         after_created_at = aware_datetime(state["afterCreatedAt"]) if state.get("afterCreatedAt") else None
         after_id = state.get("afterId") or None
@@ -388,6 +391,7 @@ async def execute_replay(
                 after_id=after_id,
                 limit=batch_size,
                 kinds=REPLAY_KINDS,
+                exclusive_token=lock_token,
             )
             replayed += result.replayed
             after_created_at = result.next_created_at
@@ -413,6 +417,7 @@ async def execute_replay(
             "streamLength": await redis.xlen(stream),
             "stateKey": state_key,
             "status": "completed",
+            "fenceProtocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
         }
     finally:
         active_exception = sys.exc_info()[0] is not None
@@ -470,6 +475,7 @@ def main() -> int:
         "since": args.since.isoformat(),
         "until": args.until.isoformat(),
         "kinds": list(REPLAY_KINDS),
+        "fenceProtocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
         **replay_candidate_summary(dsn, args.since, args.until),
     }
     if not args.execute:

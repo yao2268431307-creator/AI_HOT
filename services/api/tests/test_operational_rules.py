@@ -11,6 +11,7 @@ import threading
 import time
 
 import pytest
+from redis.crc import key_slot
 
 from radar import stream_retention as retention_module
 from radar.alerts import AlertCandidate, AlertPolicyEngine
@@ -20,6 +21,7 @@ from radar.contracts import AlertRuleRequest, EventType, EvidenceStrength, Obser
 from radar.connectors.base import BaseConnector
 from radar.evaluation import EvaluationExample, LabeledPrediction, bcubed_cluster_precision_recall, bootstrap_confidence_interval, cohen_kappa, macro_f1, median_lead_minutes, pairwise_cluster_precision, pairwise_cluster_recall, precision_at_k, temporal_entity_holdout
 from radar.metrics import Baseline, SignalSnapshot, aggregate_metrics, to_score_input
+from radar.outbox import outbox_recovery_keys
 from radar.source_discovery import SourceCandidate, candidate_score, load_source_score_policy, promote_candidates, source_score_policy_digest
 from radar.fixtures import seed_repository
 from radar.feature_registry import behavior_metric_roles, load_feature_registry
@@ -576,6 +578,17 @@ def test_stream_retention_uses_oldest_group_pending_or_delivery_watermark() -> N
             ],
         )
 
+    plain_keys = outbox_recovery_keys("radar:events")
+    assert all("{radar:events}" in key for key in plain_keys)
+    assert len({key_slot(value.encode()) for value in ("radar:events", *plain_keys)}) == 1
+    tagged_keys = outbox_recovery_keys("radar:{events}:stream")
+    assert all("{events}" in key for key in tagged_keys)
+    assert len({key_slot(value.encode()) for value in ("radar:{events}:stream", *tagged_keys)}) == 1
+    with pytest.raises(ValueError, match="malformed Redis hash tag"):
+        outbox_recovery_keys("radar:{}:stream")
+    with pytest.raises(ValueError, match="must not be empty"):
+        outbox_recovery_keys("")
+
 
 @pytest.mark.asyncio
 async def test_stream_retention_cli_requires_stream_and_reviewed_boundary_confirmation(
@@ -642,6 +655,7 @@ async def test_stream_retention_cancellation_releases_a_late_postgres_guard(
         retention_module.trim_stream_at_verified_watermarks(
             SlowRedis(),  # type: ignore[arg-type]
             "radar:events",
+            "exclusive-token",
             "80-0",
             [ConsumerGroupWatermark("alerts", "100-0", 2, "80-0", "80-0")],
         ),

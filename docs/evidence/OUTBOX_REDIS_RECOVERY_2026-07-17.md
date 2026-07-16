@@ -12,6 +12,7 @@
 - `XAUTOCLAIM` 保存并推进 Redis 返回的游标；前部 poison 消息仍 pending 时，后部消息仍能进入后续处理批次。
 - 删除整个 Redis Stream 后，可按冻结时间窗从 PostgreSQL 已发布 Outbox 重建冻结 `STREAM_OUTBOX_KINDS` 的全部七类消息，且不改写历史发布事实；常规 publisher、恢复和裁剪共享同一集合。
 - 恢复命令使用互斥锁、批内心跳、原子检查点、稳定 PostgreSQL/Redis 双游标和正常处理器租约；锁被替换时检查点不会前移。续跑不仅检查末条，而是以磁盘临时账本精确去重 Redis 前缀，再由后台线程流式对账 PostgreSQL 期望前缀的完整 `outbox_id` 顺序与累计数；只保留最后检查点行、前缀多余或乱序都会拒绝。已完成恢复的 Stream 再次丢失时会清除 completed cursor 并从完整窗口重建。
+- 常规 publisher 的 participant token 与恢复程序的 exclusive token 都在执行 `XADD` 的同一个 Lua 中校验和续租；过期 participant 或已被替换的 exclusive token 均被拒绝，Stream 长度不变。恢复 state/lock/participants 键与目标 Stream 处于同一 Redis Cluster hash slot。
 
 这些结果证明本地单机 at-least-once 链路和空 Stream 重建机制，不证明跨系统 exactly-once、Redis Cluster 故障转移、生产网络分区或目标规模恢复时长。
 
@@ -22,6 +23,7 @@
   - 正常成功清除旧 `last_error` 并增加 `attempts`。
   - `replay_batch` 只读取已发布、位于冻结时间窗且属于冻结 `STREAM_OUTBOX_KINDS` 的消息，不更新 `published_at`；常规 publisher 遇未登记 kind 会记录失败而不写 Stream。
   - publisher 与 consumer 通过同一 Redis participant lease 注册；恢复锁或 `running` 状态存在时拒绝加入。
+  - publisher 不再把“续租成功”和 `XADD` 分成两个命令；Lua 原子校验 participant 仍有效、无排他锁/运行中恢复状态，续租后才写 Stream。恢复重放以同样方式原子校验 exclusive token、续租并写入。
 - `services/api/radar/alert_worker.py`
   - consumer participant lease 每 30 秒续租；lease 丢失时消息保持 pending，不进入正常 ACK/DLQ 分支。
   - `XAUTOCLAIM` 保存 `next_start_id`，并支持可配置的 `max_deliveries` 与 `claim_min_idle_ms`。
@@ -31,6 +33,8 @@
   - 默认 dry-run；执行要求 `--confirm-stream` 精确匹配，且 `until` 不得晚于 PostgreSQL 时钟。
   - 获取恢复锁与检查正常 participant lease 在同一个 Redis Lua 原子操作内完成。
   - 300 秒恢复锁由 30 秒后台心跳续租；“校验 lock token、写检查点、续租”由单个 Lua 脚本原子完成。
+  - 新布局检查点包含 `protocolVersion=stream-fence-2026-07-rc2.1`；同一新 state key 中协议缺失或不匹配时拒绝续跑，即使状态是 `completed` 且 Stream 已丢失也不得先删除检查点。dry-run 与 execute 运维报告都暴露同一版本。
+  - 旧 `radar:{outbox-recovery-<digest>}:*` 布局与新 Stream 同槽布局互不可见，且跨槽不能由单个 Lua 原子围栏。升级必须先停止全部旧 publisher/consumer/维护程序，再人工确认旧 lock、participants 和 `running` state 均已清空；实现不会自动迁移或静默删除旧键，这一停机检查是部署 NO-GO。
   - 检查点保存 `(created_at,id)` 和最后一条 Redis Stream ID；续跑前先验证末条，再把截止该 Stream ID 的 Redis `outbox_id` 按首次出现顺序写入自动清理的本地 SQLite 临时账本，由后台线程使用同步 psycopg server cursor 分批对账 PostgreSQL 期望前缀。这样兼容 crash duplicate，又不会把目标规模 ID 集合装入内存或阻塞恢复锁心跳。PG 连接限时 10 秒、前缀扫描限时 240 秒；取消会等待后台线程关闭 SQLite 后重抛原取消异常，不用 `WinError 32` 覆盖主错误。running 检查点对应的 Stream 消失、前缀缺失/多余/乱序、累计数错误、检查点行缺失或内容不匹配时，均要求人工清理状态并从完整窗口重启；completed 检查点对应的 Stream 再次丢失时，工具在持锁条件下原子清空旧 cursor 并自动全量重建。
   - 执行中 XADD 与检查点之间中断仍可能重复重放，依赖稳定 `outbox_id` 和业务幂等约束收敛。
 
@@ -51,6 +55,7 @@ Ruff: passed
 {
   "mode": "dry-run",
   "stream": "radar:events",
+  "fenceProtocolVersion": "stream-fence-2026-07-rc2.1",
   "kinds": ["observation.created", "metric_snapshots.created", "score.created", "feedback.created", "cluster.edit.requested", "event.rescore.requested", "source.erased"],
   "candidateCount": 0,
   "scoreEvents": 0,
@@ -63,7 +68,7 @@ Ruff: passed
 ## 仍保留的生产门禁
 
 - 在 XADD 与 SQL 标记之间实际终止进程，而不只是确定性故障注入。
-- PostgreSQL/Redis 网络分区、Redis Cluster 主从切换和消费者跨实例争用；participant lease 有心跳但不是跨系统 fencing token。
+- PostgreSQL/Redis 网络分区、Redis Cluster 主从切换和消费者跨实例争用；Redis 内的 Stream 变更已有原子 fencing，但消息链仍按 PostgreSQL/Redis at-least-once 设计，不承诺跨系统 exactly-once。
 - 基于所有 consumer group 安全水位的显式裁剪已在本地真实 PG/Redis 通过；Redis Cluster/故障转移、目标规模耗时与容量告警仍是生产门禁，publisher 仍不自动裁剪。
 - 目标数据量下的重放积压、临时磁盘空间、吞吐和恢复耗时；当前结果不能作为 RTO。
 - `source.erased` 在真实 R2 上重复执行、部分删除失败和跨区域恢复。

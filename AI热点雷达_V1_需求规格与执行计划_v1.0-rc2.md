@@ -885,9 +885,13 @@ flowchart LR
 - Consumer Group 监控 Pending Entry List。
 - 超过重试阈值进入 DLQ。
 - 毒消息保存 traceId、schemaVersion 和 rawRef。
-- Stream 保留 7 天，按长度和时间双限制。
+- Stream 目标保留 7 天，按时间、容量和所有 Consumer Group 的 earliest-pending/last-delivered 安全水位显式维护；不得由 publisher 自动强裁。
 - Redis 丢失后从 PostgreSQL Outbox、连接器检查点和 R2 原始对象恢复。
 - 连接器检查点在对应事件持久化后推进。
+- 常规 publisher 使用参与者租约，重放与裁剪使用排他租约；每次 `XADD`/`XTRIM` 必须在同一 Redis Lua 内校验 token、续租并执行变更，过期或被替换的 writer fail closed。
+- Stream、恢复状态、排他锁和参与者集合必须使用同一 Redis Cluster hash slot；围栏协议必须有版本号并写入检查点和运维报告。
+- 围栏键布局或协议版本升级前必须确认旧协议无 `running` 检查点或活跃租约；不自动迁移或静默删除旧状态。
+- 消息链仍按 at-least-once 设计；`XADD` 与 PostgreSQL 发布标记或重放检查点之间中断时允许重复稳定 `outbox_id`，由消费者业务幂等约束收敛。
 
 ### 13.5 评分分层
 

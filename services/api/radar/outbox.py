@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 
 
 PARTICIPANT_LEASE_SECONDS = 300
+STREAM_FENCE_PROTOCOL_VERSION = "stream-fence-2026-07-rc2.1"
 STREAM_OUTBOX_KINDS = (
     "observation.created",
     "metric_snapshots.created",
@@ -25,10 +26,31 @@ STREAM_OUTBOX_KINDS = (
 
 
 def outbox_recovery_keys(stream: str) -> tuple[str, str, str]:
-    """Return cluster-slot-compatible state, replay-lock and participant keys."""
-    digest = hashlib.sha256(stream.encode()).hexdigest()[:16]
-    base = f"radar:{{outbox-recovery-{digest}}}"
+    """Return state keys colocated with the Stream in a Redis Cluster slot."""
+    if not stream:
+        raise ValueError("stream key must not be empty")
+    opening = stream.find("{")
+    if opening >= 0:
+        closing = stream.find("}", opening + 1)
+        if closing <= opening + 1:
+            raise ValueError("stream key contains an empty or malformed Redis hash tag")
+        hash_tag = stream[opening + 1:closing]
+    else:
+        if "}" in stream:
+            raise ValueError("stream key contains a malformed Redis hash tag")
+        hash_tag = stream
+    digest = hashlib.sha256(stream.encode()).hexdigest()
+    base = f"radar:{{{hash_tag}}}:outbox-recovery-{digest}"
     return f"{base}:state", f"{base}:lock", f"{base}:participants"
+
+
+def stream_field_arguments(fields: dict[str, str]) -> list[str]:
+    if not fields:
+        raise ValueError("at least one Redis Stream field is required")
+    arguments: list[str] = []
+    for key, value in fields.items():
+        arguments.extend((str(key), str(value)))
+    return arguments
 
 
 async def register_stream_participant(redis: Redis, stream: str, role: str) -> str:
@@ -53,15 +75,17 @@ async def register_stream_participant(redis: Redis, stream: str, role: str) -> s
 
 async def renew_stream_participant(redis: Redis, stream: str, token: str) -> None:
     """Renew a normal-processing lease and fail closed if replay took ownership."""
-    _, lock_key, participants_key = outbox_recovery_keys(stream)
+    state_key, lock_key, participants_key = outbox_recovery_keys(stream)
     renewed = await redis.eval(
         """local now=tonumber(redis.call('TIME')[1])
-        local score=redis.call('ZSCORE',KEYS[2],ARGV[1])
-        if redis.call('EXISTS',KEYS[1])==1 or not score or tonumber(score)<=now then return 0 end
-        redis.call('ZADD',KEYS[2],now+tonumber(ARGV[2]),ARGV[1])
-        redis.call('EXPIRE',KEYS[2],tonumber(ARGV[2]))
+        local score=redis.call('ZSCORE',KEYS[3],ARGV[1])
+        if redis.call('EXISTS',KEYS[2])==1
+          or redis.call('HGET',KEYS[1],'status')=='running'
+          or not score or tonumber(score)<=now then return 0 end
+        redis.call('ZADD',KEYS[3],now+tonumber(ARGV[2]),ARGV[1])
+        redis.call('EXPIRE',KEYS[3],tonumber(ARGV[2]))
         return 1""",
-        2, lock_key, participants_key, token, PARTICIPANT_LEASE_SECONDS,
+        3, state_key, lock_key, participants_key, token, PARTICIPANT_LEASE_SECONDS,
     )
     if renewed != 1:
         raise RuntimeError(f"stream participant lease was lost for {stream}")
@@ -71,6 +95,71 @@ async def release_stream_participant(redis: Redis, stream: str, token: str) -> N
     """Leave normal stream processing after a bounded unit of work."""
     _, _, participants_key = outbox_recovery_keys(stream)
     await redis.zrem(participants_key, token)
+
+
+async def xadd_as_stream_participant(
+    redis: Redis,
+    stream: str,
+    token: str,
+    fields: dict[str, str],
+    *,
+    lease_seconds: int = PARTICIPANT_LEASE_SECONDS,
+) -> str:
+    """Atomically fence, renew and append for a normal Stream writer."""
+    state_key, lock_key, participants_key = outbox_recovery_keys(stream)
+    result = await redis.eval(
+        """local now=tonumber(redis.call('TIME')[1])
+        local score=redis.call('ZSCORE',KEYS[4],ARGV[1])
+        if redis.call('EXISTS',KEYS[3])==1
+          or redis.call('HGET',KEYS[2],'status')=='running'
+          or not score or tonumber(score)<=now then return {0,''} end
+        redis.call('ZADD',KEYS[4],now+tonumber(ARGV[2]),ARGV[1])
+        redis.call('EXPIRE',KEYS[4],tonumber(ARGV[2]))
+        local arguments={'*'}
+        for index=3,#ARGV do table.insert(arguments,ARGV[index]) end
+        local stream_id=redis.call('XADD',KEYS[1],unpack(arguments))
+        return {1,stream_id}""",
+        4,
+        stream,
+        state_key,
+        lock_key,
+        participants_key,
+        token,
+        lease_seconds,
+        *stream_field_arguments(fields),
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 2 or int(result[0]) != 1:
+        raise RuntimeError(f"stream participant fencing rejected XADD for {stream}")
+    return str(result[1])
+
+
+async def xadd_as_stream_exclusive(
+    redis: Redis,
+    stream: str,
+    token: str,
+    fields: dict[str, str],
+    *,
+    lease_seconds: int = PARTICIPANT_LEASE_SECONDS,
+) -> str:
+    """Atomically verify exclusive ownership, renew it and append."""
+    _, lock_key, _ = outbox_recovery_keys(stream)
+    result = await redis.eval(
+        """if redis.call('GET',KEYS[2])~=ARGV[1] then return {0,''} end
+        redis.call('EXPIRE',KEYS[2],tonumber(ARGV[2]))
+        local arguments={'*'}
+        for index=3,#ARGV do table.insert(arguments,ARGV[index]) end
+        local stream_id=redis.call('XADD',KEYS[1],unpack(arguments))
+        return {1,stream_id}""",
+        2,
+        stream,
+        lock_key,
+        token,
+        lease_seconds,
+        *stream_field_arguments(fields),
+    )
+    if not isinstance(result, (list, tuple)) or len(result) != 2 or int(result[0]) != 1:
+        raise RuntimeError(f"exclusive stream fencing rejected XADD for {stream}")
+    return str(result[1])
 
 
 async def acquire_stream_exclusive(
@@ -256,7 +345,7 @@ class RedisOutboxPublisher:
                                 raise RuntimeError(
                                     f"outbox kind is not registered for stream publication: {kind}",
                                 )
-                            await self.redis.xadd(self.stream, {
+                            await xadd_as_stream_participant(self.redis, self.stream, publisher_token, {
                                 "outbox_id": outbox_id, "kind": kind, "aggregate_id": aggregate_id,
                                 "payload": json.dumps(payload, ensure_ascii=False),
                             })
@@ -298,6 +387,7 @@ class RedisOutboxPublisher:
         after_id: str | None = None,
         limit: int = 200,
         kinds: tuple[str, ...] = STREAM_OUTBOX_KINDS,
+        exclusive_token: str,
     ) -> ReplayResult:
         """Replay consumer-relevant committed rows after a Redis data loss.
 
@@ -330,10 +420,12 @@ class RedisOutboxPublisher:
             rows = cursor.fetchall()
         next_stream_id: str | None = None
         for outbox_id, kind, aggregate_id, payload, _ in rows:
-            next_stream_id = await self.redis.xadd(self.stream, {
+            next_stream_id = await xadd_as_stream_exclusive(
+                self.redis, self.stream, exclusive_token, {
                 "outbox_id": str(outbox_id), "kind": kind, "aggregate_id": aggregate_id,
                 "payload": json.dumps(payload, ensure_ascii=False), "replay": "true",
-            })
+                },
+            )
         if not rows:
             return ReplayResult(0, after_created_at, after_id, None, True)
         last = rows[-1]

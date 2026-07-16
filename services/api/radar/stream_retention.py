@@ -13,9 +13,12 @@ import psycopg
 from redis.asyncio import Redis
 
 from .outbox import (
+    PARTICIPANT_LEASE_SECONDS,
+    STREAM_FENCE_PROTOCOL_VERSION,
     STREAM_OUTBOX_KINDS,
     acquire_stream_exclusive,
     maintain_stream_exclusive,
+    outbox_recovery_keys,
     release_stream_exclusive,
     renew_stream_exclusive,
 )
@@ -249,11 +252,18 @@ def ensure_watermarks_did_not_move_backwards(
 async def trim_stream_at_verified_watermarks(
     redis: Redis,
     stream: str,
+    exclusive_token: str,
     trim_min_id: str,
     expected_groups: list[ConsumerGroupWatermark],
 ) -> int:
     """Atomically recheck the complete consumer-group state and trim the prefix."""
-    arguments: list[str | int] = [trim_min_id, len(expected_groups)]
+    _, lock_key, _ = outbox_recovery_keys(stream)
+    arguments: list[str | int] = [
+        exclusive_token,
+        PARTICIPANT_LEASE_SECONDS,
+        trim_min_id,
+        len(expected_groups),
+    ]
     for group in expected_groups:
         arguments.extend((
             group.name,
@@ -262,11 +272,15 @@ async def trim_stream_at_verified_watermarks(
             group.earliest_pending_id or "",
         ))
     operation = asyncio.create_task(redis.eval(
-        """local groups=redis.call('XINFO','GROUPS',KEYS[1])
-        local expected_count=tonumber(ARGV[2])
+        """if redis.call('GET',KEYS[2])~=ARGV[1] then
+          return {0,'exclusive maintenance lease changed'}
+        end
+        redis.call('EXPIRE',KEYS[2],tonumber(ARGV[2]))
+        local groups=redis.call('XINFO','GROUPS',KEYS[1])
+        local expected_count=tonumber(ARGV[4])
         if #groups~=expected_count then return {0,'consumer group membership changed'} end
         local expected={}
-        local position=3
+        local position=5
         for index=1,expected_count do
           expected[ARGV[position]]={ARGV[position+1],ARGV[position+2],ARGV[position+3]}
           position=position+4
@@ -292,10 +306,11 @@ async def trim_stream_at_verified_watermarks(
             return {0,'consumer group state changed'}
           end
         end
-        local trimmed=redis.call('XTRIM',KEYS[1],'MINID','=',ARGV[1])
+        local trimmed=redis.call('XTRIM',KEYS[1],'MINID','=',ARGV[3])
         return {1,trimmed}""",
-        1,
+        2,
         stream,
+        lock_key,
         *arguments,
     ))
     try:
@@ -394,6 +409,7 @@ async def maintain_stream_retention(
                 "safeTrimMinId": trim_min_id,
                 "calculatedSafeTrimMinId": calculated_trim_min_id,
                 "recoverableKinds": list(STREAM_OUTBOX_KINDS),
+                "fenceProtocolVersion": STREAM_FENCE_PROTOCOL_VERSION,
                 "candidateEntries": candidate_entries,
                 "uniqueOutboxIds": unique_outbox_ids,
                 "invalidOutboxIdEntries": invalid_entries,
@@ -425,7 +441,7 @@ async def maintain_stream_retention(
             trimmed = 0
             if stream_id_key(trim_min_id) != (0, 0):
                 trimmed = await trim_stream_at_verified_watermarks(
-                    redis, stream, trim_min_id, groups_after,
+                    redis, stream, exclusive_token, trim_min_id, groups_after,
                 )
             if trimmed > candidate_entries:
                 raise RuntimeError("Redis trimmed more entries than the verified candidate ledger")
