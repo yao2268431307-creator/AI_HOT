@@ -48,7 +48,7 @@
 - 正式验收密钥登记与法律授权：仓库内冻结 keyring 当前故意为空，连接器 rights status 当前为 pending/blocked，因此正式 72H/7D 报告必须 fail closed；只有密钥保管人与数据权利负责人完成外部登记后才能开始正式窗口。
 - 72 小时采集 soak、7 天影子运行、2,000 信源真实容量与 500 万观测数据库压测。
 - Sites 身份到独立 FastAPI 的生产级联邦验证；当前 Sites 仅为录制数据私有候选。生产认证开启时，浏览器原生 EventSource 不能携带当前 API Key，必须通过同源身份代理或改用带凭证的流客户端。
-- PostgreSQL 迁移、RLS、Redis、MinIO/R2 的真实容器集成测试。本机 `docker compose config --quiet` 已通过，但 Docker Desktop 引擎未运行，不能声称数据库迁移已实际应用。
+- 目标生产环境的 PostgreSQL/RLS/Redis/R2 集成、跨节点中断和全量重放演练。本地 Docker 已实际应用 `001_init_rc2.4`，并通过 RLS/trigger/只读迁移标记、并发信源去重、Outbox→Redis、Redis consumer group、MinIO put/read/delete 和协调重启持久性验证；这不替代目标环境验收。
 - PostgreSQL PITR、1 小时 RPO、4 小时 RTO 和备份过期删除演练。
 
 这些项目必须保留为发布闸门，不应以演示数据或单机单测“视为通过”。
@@ -56,7 +56,8 @@
 ## 本轮可复现验证
 
 ```text
-Python: 146 passed
+Python deterministic/default: 146 passed, 6 infrastructure tests skipped
+Python with explicit local infrastructure: 152 passed
 Python Ruff: passed
 Web: ESLint passed
 Web: Vinext production build passed
@@ -68,7 +69,9 @@ Browser interaction: not run (enterprise policy blocks localhost and chatgpt.sit
 Python bytecode compile: passed
 Python dependency check: passed
 Docker Compose configuration parse: passed
-Docker runtime integration: not run (local Docker engine unavailable)
+Docker runtime integration: passed locally (PostgreSQL/Redis/MinIO; see evidence record)
 ```
 
 另有非生产、CPU/内存内合成检查：10,000 信源、5,000,000 计数型观测、2,000 事件的生成与评分循环为 0.94 秒；FastAPI 内存 fixture 120 次请求 P95 为 0.909ms。它们只验证算法循环没有明显数量级错误，不包含 PostgreSQL I/O、网络、向量推理或缓存，因此不用于宣称生产容量与 P95 达标。
+
+本地容器的命令、版本、断言、重启持久性结果和未覆盖范围见 [基础设施集成验证记录](evidence/INFRASTRUCTURE_INTEGRATION_2026-07-17.md)。

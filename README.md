@@ -82,6 +82,15 @@ npm.cmd test
 
 测试不调用外部平台；连接器使用录制/MockTransport 响应，避免配额、网络与授权状态让 CI 变得不确定。真实源的连通性属于部署环境 smoke test。
 
+默认套件会跳过 6 项真实基础设施用例。启动 `docker compose` 并显式配置 `POSTGRES_INTEGRATION_DSN`、`POSTGRES_INTEGRATION_ADMIN_DSN`、`REDIS_INTEGRATION_URL` 与 `S3_INTEGRATION_*` 后，可验证实际迁移/RLS/trigger、并发去重、Outbox→Redis、consumer group 和 MinIO 对象操作。协调重启脚本还要求用 `DOCKER_INTEGRATION_CONTEXT` 指定经校验的本地 Docker context，并 fail-closed 限定 compose 的 loopback 端口 `5432/6379/9000`，不会接触远端服务：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest services\api\tests\test_postgres_integration.py services\api\tests\test_infrastructure_integration.py -q
+.\.venv\Scripts\python.exe tools\infrastructure_recovery_smoke.py
+```
+
+本次实际运行结果和生产边界见 [基础设施集成验证记录](docs/evidence/INFRASTRUCTURE_INTEGRATION_2026-07-17.md)。
+
 需要显式验证当前网络与公开元数据响应时，可运行：
 
 ```powershell

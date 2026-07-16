@@ -109,6 +109,19 @@
 | W-04 | Web 时间窗契约 | 检查 1H/6H/24H/7D 绑定 | 请求参数、列表轨迹标题和详情轨迹标题引用同一 `windowSize` 状态 |
 | W-05 | 信源治理视图 | 打开信源中心且 SourceScore 尚未校准 | 显示候选/活跃容量、生命周期、有效观测、发现与阻断原因；明确“排行关闭”和 N/A，不按候选分排序；服务端分页可访问 200 active + 500 candidate，账号/实体搜索能命中末页候选 |
 
+## 显式本地基础设施集成用例
+
+这些用例默认跳过，只在调用者显式提供隔离的 PostgreSQL/Redis/MinIO 环境变量时运行。
+
+| 编号 | 场景 | 预期 |
+|---|---|---|
+| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc2.4`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过，health 返回 production-ready |
+| I-02 | 跨 workspace 查询告警规则，尝试修改 append-only 晋级事实和迁移 marker | workspace-b 看不到 workspace-a 行；晋级事实 UPDATE 被 trigger 拒绝；应用角色不能改迁移 marker |
+| I-03 | 两线程并发写同一 source+fingerprint | 两条 Observation 均可审计，信源有效观测只增加一次，并记录重复发现原因 |
+| I-04 | 插入真实 PG Outbox 后发布到真实 Redis Stream | 流中字段和 payload 一致；Outbox 标记已发布、尝试次数为 1、无错误 |
+| I-05 | Redis consumer group 与 MinIO S3 对象闭环 | Stream 可读取/ACK 且 pending 清零；对象可 put/read/delete，字节与 Content-Type 一致 |
+| I-06 | 同时重启 PostgreSQL、Redis 和 MinIO | 唯一测试事实、Stream 消息和对象在服务恢复后仍可读，脚本随后只清理本次唯一前缀数据 |
+
 ## 必须在真实环境执行的验收
 
 | 编号 | 场景 | 门槛 | 原因 |

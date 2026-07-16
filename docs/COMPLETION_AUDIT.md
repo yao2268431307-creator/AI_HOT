@@ -7,7 +7,7 @@
 ## 状态定义
 
 - `已证实`：存在实现、可复跑用例以及本轮通过记录。
-- `待环境验证`：生产形态代码已存在，但本机缺少 PostgreSQL/Redis/R2、真实部署或浏览器辅助技术，不能给出集成结论。
+- `待环境验证`：生产形态代码已存在，但目标部署、目标规模、跨节点恢复或浏览器辅助技术尚未验证；本机容器通过时也不能自动上推为生产结论。
 - `外部闸门`：必须由数据权利人、组织管理员、分析师样本或连续时间窗口提供，不能用模拟数据替代。
 - `部分完成`：本地契约或入口已完成，真实内容/模型或运营闭环尚未形成。
 
@@ -40,8 +40,8 @@
 | Owner/Analyst/Viewer 与工作区隔离 | 已证实（API key/RLS 单测）/待环境验证（联邦） | 服务器派生 workspace、RLS SQL、权限与隔离用例 | Sites/替代部署的真实身份、成员撤销和 SSE 凭证验证 |
 | 外部文本、SSRF、Prompt Injection、Webhook 安全 | 已证实（代码） | URL/DNS/重定向限制、Unicode NFKC/Bidi 清理、React 转义、LLM 不参与数值评分 | 渗透测试、域名重绑定和真实出口代理验证 |
 | AA、键盘、移动端、图表数据表 | 部分完成/待环境验证 | Radix Dialog、reduced-motion、断点和静态契约已通过；Sites 平台桌面截图已核验 | 企业策略禁止自动化访问 localhost/chatgpt.site；仍需 Chrome/Firefox、键盘、屏幕阅读器、对比度实测 |
-| PostgreSQL Outbox、Redis、R2 一致性 | 待环境验证 | SQL、发布器、DLQ、对象存储适配器和单元用例存在 | Docker daemon/目标环境启动后跑迁移、断网和恢复演练 |
-| PITR、RPO ≤1h、RTO ≤4h、Redis 丢失恢复 | 外部闸门 | 无本机生产备份环境 | 配置 WAL/PITR，执行恢复并记录实际 RPO/RTO |
+| PostgreSQL Outbox、Redis、R2 一致性 | 部分已证实（本地 PG/Redis/MinIO happy path）/待目标环境验证 | `001_init_rc2.4`、受限 `radar_app` 的 RLS/trigger/只读 marker、并发信源去重、Outbox publisher→Redis、独立 consumer group roundtrip、MinIO put/read/delete 和三服务协调重启持久性均已实际通过；没有把生产 consumer ACK 串入同一用例，也不等于真实 R2。证据见 `docs/evidence/INFRASTRUCTURE_INTEGRATION_2026-07-17.md` | 在目标环境验证完整 producer→consumer ACK、XADD 成功但 PG 标记失败的重复窗口、网络分区、Redis 全量丢失重放、真实 R2 部分失败、跨节点恢复和容量 |
+| PITR、RPO ≤1h、RTO ≤4h、Redis 丢失恢复 | 外部闸门 | 本地 volume 重启持久性已验证，但没有 WAL/PITR、备份恢复或 Redis 全量丢失演练 | 配置 WAL/PITR，执行恢复并记录实际 RPO/RTO；从 Outbox 重建空 Redis |
 | Sites 或替代部署 | 部分完成/待联邦 | owner-only 录制数据候选 v1 已部署成功，源码 SHA、归档哈希、访问人数和平台截图可追溯 | 部署独立 API/存储，完成 Sites 身份、SSE/轮询、成员撤销和回滚验证 |
 | X、YouTube、中文受限源授权 | 外部闸门 | 未授权源默认关闭；YouTube 仅在 key 存在时装载 | 合同/配额/字段权利审批，不得绕过平台控制 |
 | 72H soak、7 天影子运行 | 工具已证实/时间仍为外部闸门 | `acceptance_monitor.py` 追加哈希链与 Ed25519 签名 JSONL，绑定工具/schema/keyring digest，逐采样验证独立签名的完整排序账本、append-only 阈值跨越事实、Top5 精确选择、固定时间窗、单调事实账本、数据权利、非零来源和运行时证明；PG 排序/crossing 事实与数据库时钟水位来自同一只读 repeatable-read 快照。运行时证明限定 public RLS 表并精确核对触发器的表/函数 schema、事件、模式与启用状态。内存仓库、空 keyring、pending rights 和单样本 canary 均拒绝晋级 | 登记 scheduler、reviewer、baseline、ledger 四类隔离密钥和数据权利后，在生产 PostgreSQL/RLS/认证环境实际运行完整 72H/168H，并保留原始 JSONL、完整排序账本、预登记、快照、基线与签字报告 |
@@ -59,10 +59,10 @@ npm.cmd run lint
 npm.cmd test
 ```
 
-运行态 smoke 使用 `http://127.0.0.1:8017` 与 `http://localhost:3001`，验证 health、radar、关注 CRUD、研判埋点、指标接口和网页 200。owner-only Sites 录制数据候选部署成功，证据见 [Sites 私有部署记录](evidence/SITES_PRIVATE_DEPLOYMENT_2026-07-16.md)。Docker Compose 配置可解析，但本机 Docker Desktop daemon 不可用，所以数据库迁移、RLS、Redis 与 R2 仍是明确的环境闸门。
+默认 Python 套件为 `146 passed, 6 skipped`；6 项集成用例只有在显式提供本地 PostgreSQL/Redis/MinIO 环境变量时运行，完整结果为 `152 passed`。运行态 smoke 使用 `http://127.0.0.1:8017` 与 `http://localhost:3001`，验证 health、radar、关注 CRUD、研判埋点、指标接口和网页 200。owner-only Sites 录制数据候选部署成功，证据见 [Sites 私有部署记录](evidence/SITES_PRIVATE_DEPLOYMENT_2026-07-16.md)。本地 Docker Compose 已实际启动并通过迁移、RLS、审计 trigger、只读 marker、并发去重、Outbox→Redis、Redis consumer group、MinIO 对象读写删除和重启持久性验证，详见 [基础设施集成验证记录](evidence/INFRASTRUCTURE_INTEGRATION_2026-07-17.md)；目标生产环境、跨节点恢复和 PITR 仍是明确闸门。
 
 ## 当前发布结论
 
-第二轮独立代码复审结果为：剩余 P0/P1/P2 均为“无”，当时独立复跑 `102 passed`。真实连接器 smoke 随后暴露并修复两项 OpenAlex 数据质量缺陷。第三轮复审又指出 smoke 参数无界、空响应误报 PASS 和证据措辞不精确两项 P2；现已增加 `1..10` 边界、零观测失败语义、8 个回归实例并修正文档。最终闭环复审在 `2dbbca1` 上确认当时剩余 P0/P1/P2 均为“无”，独立复跑 Python `111 passed`、Ruff、Web Lint、Vinext build、2 项渲染测试和生产依赖审计全部通过。其后新增并加固 rc2 产品 KPI、逐 revision SLA、完整签名排序/阈值跨越账本、运行时证明与长期验收监控链。最新信源治理增量的独立审计先后发现并修复并发同指纹计数、严格 5% 日上限、完整目录分页/账号实体检索、旧迁移回填和同分晋级确定性等问题；最终复核确认当前剩余 P0/P1/P2 均为“无”，独立复跑 Python `146 passed`、Ruff、compileall、pip check、Web Lint、Vinext build、2 项渲染测试、生产依赖审计、Compose 配置解析、monitor digest 和补丁检查全部通过，因此结论为**本地代码候选 GO**。
+第二轮独立代码复审结果为：剩余 P0/P1/P2 均为“无”，当时独立复跑 `102 passed`。真实连接器 smoke 随后暴露并修复两项 OpenAlex 数据质量缺陷。第三轮复审又指出 smoke 参数无界、空响应误报 PASS 和证据措辞不精确两项 P2；现已增加 `1..10` 边界、零观测失败语义、8 个回归实例并修正文档。最终闭环复审在 `2dbbca1` 上确认当时剩余 P0/P1/P2 均为“无”，独立复跑 Python `111 passed`、Ruff、Web Lint、Vinext build、2 项渲染测试和生产依赖审计全部通过。其后新增并加固 rc2 产品 KPI、逐 revision SLA、完整签名排序/阈值跨越账本、运行时证明与长期验收监控链。最新信源治理增量的独立审计先后发现并修复并发同指纹计数、严格 5% 日上限、完整目录分页/账号实体检索、旧迁移回填和同分晋级确定性等问题；最终复核确认剩余 P0/P1/P2 均为“无”。本地基础设施增量的独立审计又发现并修复 Compose/context 目标未绑定、恢复计时不完整、远端 endpoint 假阳性和 Outbox/R2 证据口径过宽；最终复核为 P0/P1/P2 均“无”，独立复跑默认 `146 passed, 6 skipped`、显式容器 `152 passed`、Ruff、补丁检查、恢复与零残留检查全部通过。因此结论为**本地代码候选 GO**。
 
-**rc2 正式 Beta 仍为 NO-GO**：当前不能宣称达到 Definition of Done，也不能进入正式私有测试。剩余阻断项不是页面或单元测试数量，而是真实数据权利、信源规模、双人标注、72H soak、7 天影子运行、生产 PostgreSQL/R2/RLS、身份联邦、可访问性和恢复证据。
+**rc2 正式 Beta 仍为 NO-GO**：当前不能宣称达到 Definition of Done，也不能进入正式私有测试。本地数据库/队列/对象存储集成风险已从“从未运行”降为“本地容器已证实”，剩余阻断项是真实数据权利、信源规模、双人标注、72H soak、7 天影子运行、目标生产部署与容量、PITR/全量恢复、身份联邦和可访问性证据。
