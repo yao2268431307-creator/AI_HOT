@@ -25,7 +25,7 @@
 - 人工合并/拆分采用可审计异步命令；生产认证开启时只有离线治理工作区的 Analyst/Owner 能修改全局共享拓扑，普通租户工作区返回 403。Worker 以乐观锁创建新 Event，旧 Event 标记 `supersededBy`，迁移成员并重算，保留历史评分/告警；任意工作区的关注都解析到当前有效后继；撤销提升父事件版本，阻止撤销前排队的旧命令继续执行；谱系可查且支持撤销。
 - 研判漏斗埋点按工作区保存并有幂等键；当前接口只报告“详情打开→提交研判”的探索性代理。它不是强告警人工接受率，也不是从进入可研判队列开始、带值班时段排除的首次分诊 SLA，不能用于 rc2 Beta 判定。
 - 评估工具输出 Precision@K、宏 F1、错误告警/日、提前量、eventType 分组、Pairwise、B-cubed 和 bootstrap 区间；双标注 Cohen's kappa 有独立实现。
-- 103 项 Python 自动化用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
+- 111 项 Python 自动化用例、Ruff、前端 Lint、生产构建和 2 项 SSR/静态产品契约用例。
 - 五个免密公共元数据连接器完成显式真实 smoke；该过程发现并修复 OpenAlex 空作者 ID 整批失败与异常未来发布日期污染时间线的问题。命令与运行证据独立保存，不进入确定性 CI，也不替代 72 小时 soak。
 - owner-only Sites 录制数据候选 v1 已部署成功；源码 SHA、归档哈希、访问策略与平台桌面截图均已归档。该版本明确显示 `RECORDED DEMO`，尚未连接生产 FastAPI 与身份联邦。
 
@@ -49,11 +49,13 @@
 ## 本轮可复现验证
 
 ```text
-Python: 103 passed
+Python: 111 passed
 Python Ruff: passed
 Web: ESLint passed
 Web: Vinext production build passed
 Web: 2 SSR/product-contract tests passed
+Web production dependencies: 0 known vulnerabilities
+Web development toolchain: 4 moderate findings remain in Drizzle CLI's legacy esbuild chain; npm only offers a breaking downgrade, so no forced remediation was applied
 Sites: owner-only recorded-data deployment v1 succeeded; platform desktop screenshot inspected
 Browser interaction: not run (enterprise policy blocks localhost and chatgpt.site automation)
 Python bytecode compile: passed

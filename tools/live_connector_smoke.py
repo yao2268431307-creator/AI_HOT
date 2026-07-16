@@ -34,6 +34,16 @@ from radar.connectors import (  # noqa: E402
 ConnectorFactory = Callable[[argparse.Namespace], BaseConnector]
 
 
+def bounded_hn_items(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 10") from exc
+    if not 1 <= count <= 10:
+        raise argparse.ArgumentTypeError("must be from 1 to 10")
+    return count
+
+
 def connector_factories() -> dict[str, ConnectorFactory]:
     return {
         "hackernews": lambda args: HackerNewsConnector(max_items=args.hn_max_items, max_attempts=2),
@@ -48,6 +58,8 @@ async def probe(connector: BaseConnector) -> dict[str, object]:
     started = time.perf_counter()
     try:
         rows = await connector.collect()
+        if not rows:
+            raise RuntimeError("connector returned zero observations")
         return {
             "connector": connector.id,
             "status": "pass",
@@ -97,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["hackernews", "github", "huggingface", "arxiv", "openalex"],
     )
-    parser.add_argument("--hn-max-items", type=int, default=3)
+    parser.add_argument("--hn-max-items", type=bounded_hn_items, default=3)
     parser.add_argument("--github-query", default="topic:artificial-intelligence")
     parser.add_argument("--hf-search", default="")
     parser.add_argument("--arxiv-query", default="cat:cs.AI")
