@@ -537,3 +537,29 @@ def test_alert_rule_rejects_private_webhook_before_persistence() -> None:
         })
     assert response.status_code == 422
     assert repository.alerts == {}
+
+
+def test_alert_feed_exposes_aborted_terminal_reason_in_memory() -> None:
+    repository = InMemoryRepository()
+    idempotency_key = "local-workspace:deleted-rule:evt-open-model:message-token"
+    assert repository.reserve_alert_delivery({
+        "ruleId": "deleted-rule", "workspaceId": "local-workspace", "eventId": "evt-open-model",
+        "domain": "model_release", "lifecycleState": "accelerating", "evidenceStrength": "high",
+        "evidenceCount": 4, "channel": "webhook", "deliveredAt": datetime.now(timezone.utc),
+        "idempotencyKey": idempotency_key,
+    })
+    assert repository.abort_alert_reservation(
+        idempotency_key, "rule unavailable before webhook retry", "local-workspace",
+    )
+
+    with TestClient(create_app(repository)) as http:
+        response = http.get("/api/v1/alerts")
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [{
+        "ruleId": "deleted-rule", "workspaceId": "local-workspace", "eventId": "evt-open-model",
+        "domain": "model_release", "lifecycleState": "accelerating", "evidenceStrength": "high",
+        "evidenceCount": 4, "channel": "webhook", "deliveredAt": response.json()["items"][0]["deliveredAt"],
+        "idempotencyKey": idempotency_key, "status": "aborted",
+        "terminalReason": "rule unavailable before webhook retry",
+    }]

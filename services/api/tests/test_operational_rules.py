@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import hashlib
 import json
+import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -19,6 +24,8 @@ from radar.fixtures import seed_repository
 from radar.feature_registry import behavior_metric_roles, load_feature_registry
 from radar.storage import InMemoryRepository
 from radar.worker import CollectorWorker
+from tools import replay_outbox_to_redis as replay_tool
+from tools.replay_outbox_to_redis import execute_replay
 
 
 NOW = datetime.now(timezone.utc)
@@ -279,6 +286,164 @@ async def test_committed_score_event_matches_rule_and_creates_durable_in_app_ale
     assert repeated.delivered == 0
     assert len(repository.alert_deliveries) == 1
     assert repository.alert_deliveries[0]["channel"] == "in_app"
+
+
+@pytest.mark.asyncio
+async def test_alert_confirmation_failure_keeps_reservation_retryable_until_durable() -> None:
+    class FlakyConfirmationRepository(InMemoryRepository):
+        confirmation_attempts = 0
+
+        def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> bool:
+            self.confirmation_attempts += 1
+            if self.confirmation_attempts == 1:
+                raise RuntimeError("injected confirmation failure")
+            return super().confirm_alert_delivery(idempotency_key, workspace_id)
+
+    repository = seed_repository(FlakyConfirmationRepository())
+    repository.add_alert(
+        AlertRuleRequest(name="strong AI events", minimumAttention=70, minimumEvidenceStrength=65),
+        "workspace-a", "analyst-a",
+    )
+    dispatcher = AlertDispatcher(repository, signing_secret="test-secret")
+    with pytest.raises(RuntimeError, match="injected confirmation failure"):
+        await dispatcher.dispatch_event(
+            "evt-open-model", ["workspace-a"], NOW, delivery_key="outbox-cycle-one",
+        )
+    assert len(repository.alert_deliveries) == 1
+    assert repository.alert_deliveries[0]["status"] == "reserved"
+
+    original = repository.get_event("evt-open-model")
+    assert original is not None
+    repository.upsert_event(original.model_copy(update={
+        "score_version": "score-after-confirmation-failure",
+        "updated_at": original.updated_at + timedelta(minutes=1),
+    }))
+    retried = await dispatcher.dispatch_event(
+        "evt-open-model", ["workspace-a"], NOW, delivery_key="outbox-cycle-one",
+    )
+    duplicate = await dispatcher.dispatch_event(
+        "evt-open-model", ["workspace-a"], NOW, delivery_key="outbox-cycle-one",
+    )
+    assert retried.delivered == 1
+    assert duplicate.delivered == 0
+    assert len(repository.alert_deliveries) == 1
+    assert repository.alert_deliveries[0]["status"] == "delivered"
+
+    deleted_repository = seed_repository(FlakyConfirmationRepository())
+    deleted_repository.add_alert(
+        AlertRuleRequest(name="strong AI events", minimumAttention=70, minimumEvidenceStrength=65),
+        "workspace-a", "analyst-a",
+    )
+    deleted_dispatcher = AlertDispatcher(deleted_repository, signing_secret="test-secret")
+    with pytest.raises(RuntimeError, match="injected confirmation failure"):
+        await deleted_dispatcher.dispatch_event(
+            "evt-open-model", ["workspace-a"], NOW, delivery_key="outbox-before-delete",
+        )
+    deleted_repository.events.pop("evt-open-model")
+    recovered_after_delete = await deleted_dispatcher.dispatch_event(
+        "evt-open-model", ["workspace-a"], NOW, delivery_key="outbox-before-delete",
+    )
+    assert recovered_after_delete.delivered == 1
+    assert deleted_repository.alert_deliveries[0]["status"] == "delivered"
+
+    missing_rule_repository = seed_repository(InMemoryRepository())
+    delivery_key = "webhook-before-rule-delete"
+    message_token = hashlib.sha256(delivery_key.encode()).hexdigest()
+    assert missing_rule_repository.reserve_alert_delivery({
+        "ruleId": "deleted-rule", "workspaceId": "workspace-a", "eventId": "evt-open-model",
+        "domain": "model_release", "lifecycleState": "accelerating", "evidenceStrength": "high",
+        "evidenceCount": 4, "channel": "webhook", "deliveredAt": NOW,
+        "idempotencyKey": f"workspace-a:deleted-rule:evt-open-model:{message_token}",
+    })
+    aborted = await AlertDispatcher(
+        missing_rule_repository, signing_secret="test-secret",
+    ).dispatch_event("evt-open-model", ["workspace-a"], NOW, delivery_key=delivery_key)
+    assert aborted.skipped == 1
+    assert missing_rule_repository.alert_deliveries[0]["status"] == "aborted"
+    assert "rule unavailable" in str(missing_rule_repository.alert_deliveries[0]["terminalReason"])
+    missing_rule_repository.alerts["deleted-rule"] = (
+        "workspace-a", "analyst-a",
+        AlertRuleRequest(name="restored rule", minimumAttention=70, minimumEvidenceStrength=65),
+    )
+    repeated_aborted = await AlertDispatcher(
+        missing_rule_repository, signing_secret="test-secret",
+    ).dispatch_event("evt-open-model", ["workspace-a"], NOW, delivery_key=delivery_key)
+    assert repeated_aborted.delivered == 0
+    assert repeated_aborted.skipped == 1
+    assert len(missing_rule_repository.alert_deliveries) == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_closes_redis_and_preserves_primary_error_when_unlock_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenRedis:
+        eval_calls = 0
+        closed = False
+
+        async def eval(self, *_args: object) -> int:
+            self.eval_calls += 1
+            if self.eval_calls == 1:
+                return 1
+            raise RuntimeError("injected unlock failure")
+
+        async def exists(self, _key: str) -> int:
+            raise RuntimeError("primary replay failure")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    broken = BrokenRedis()
+    monkeypatch.setattr(
+        "tools.replay_outbox_to_redis.Redis.from_url",
+        lambda *_args, **_kwargs: broken,
+    )
+    with pytest.raises(RuntimeError, match="primary replay failure"):
+        await execute_replay(
+            "postgresql://unused", "redis://unused", "test:stream",
+            NOW - timedelta(minutes=1), NOW, 1,
+        )
+    assert broken.closed is True
+
+
+@pytest.mark.asyncio
+async def test_prefix_verification_cancellation_preserves_cancel_and_cleans_temp_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    checkpoint_outbox_id = "00000000-0000-0000-0000-000000000001"
+
+    class PrefixRedis:
+        async def xrange(self, *_args: object, **_kwargs: object):
+            return [("1-0", {"outbox_id": checkpoint_outbox_id})]
+
+    def slow_comparison(_dsn: str, path: Path, *_args: object) -> tuple[int, int, bool]:
+        connection = sqlite3.connect(path)
+        try:
+            started.set()
+            time.sleep(0.2)
+        finally:
+            connection.close()
+        return 1, 1, True
+
+    original_named_temporary_file = replay_tool.tempfile.NamedTemporaryFile
+
+    def temporary_file_in_test_directory(*args: object, **kwargs: object):
+        kwargs["dir"] = tmp_path
+        return original_named_temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(replay_tool, "compare_replayed_prefix", slow_comparison)
+    monkeypatch.setattr(replay_tool.tempfile, "NamedTemporaryFile", temporary_file_in_test_directory)
+    task = asyncio.create_task(replay_tool.verify_replayed_prefix(
+        PrefixRedis(), "unused", "test:stream", NOW - timedelta(minutes=1), NOW,
+        NOW, checkpoint_outbox_id, "1-0", 1,
+    ))
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert list(tmp_path.glob("radar-replay-prefix-*.sqlite3")) == []
 
 
 @pytest.mark.asyncio

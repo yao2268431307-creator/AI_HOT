@@ -44,7 +44,7 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         production_ready = (
             attestation.get("storageBackend") == "postgresql"
             and attestation.get("rlsVerified") is True
-            and attestation.get("migrationVersion") == "001_init_rc2.4"
+            and attestation.get("migrationVersion") == "001_init_rc2.6"
             and attestation.get("auditTriggersVerified") is True
             and attestation.get("migrationMarkerReadOnly") is True
             and attestation.get("databaseUser") == "radar_app"

@@ -354,13 +354,19 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
   evidence_count integer NOT NULL,
   channel text NOT NULL CHECK (channel IN ('in_app','webhook')),
   idempotency_key text NOT NULL DEFAULT gen_random_uuid()::text UNIQUE,
-  status text NOT NULL DEFAULT 'delivered' CHECK (status IN ('reserved','delivered')),
+  status text NOT NULL DEFAULT 'delivered' CHECK (status IN ('reserved','delivered','aborted')),
+  terminal_reason text,
   delivered_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_rule_id_fkey;
 ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_event_id_fkey;
 ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS idempotency_key text NOT NULL DEFAULT gen_random_uuid()::text;
 ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'delivered';
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS terminal_reason text;
+ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_status_check;
+ALTER TABLE alert_deliveries ADD CONSTRAINT alert_deliveries_status_check CHECK (status IN ('reserved','delivered','aborted'));
+ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_terminal_reason_check;
+ALTER TABLE alert_deliveries ADD CONSTRAINT alert_deliveries_terminal_reason_check CHECK (status<>'aborted' OR length(terminal_reason)>0);
 CREATE UNIQUE INDEX IF NOT EXISTS alert_deliveries_idempotency_uidx ON alert_deliveries (idempotency_key);
 
 CREATE TABLE IF NOT EXISTS metric_incidents (
@@ -437,10 +443,13 @@ INSERT INTO review_queue_entries
   (event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
 SELECT e.id,'qe-backfill-'||gen_random_uuid()::text,clock_timestamp(),e.lifecycle_state,e.cluster_version,
        COALESCE(NULLIF(e.current_score->>'scoreVersion',''),'unknown'),
-       'product-metrics-2026-07-rc2.8','deployment_backfill'
+       'product-metrics-2026-07-rc2.9','deployment_backfill'
 FROM events e
 WHERE e.lifecycle_state IN ('detected','emerging','accelerating','established','cooling')
-  AND NOT EXISTS (SELECT 1 FROM review_queue_entries q WHERE q.event_id=e.id);
+  AND NOT EXISTS (
+    SELECT 1 FROM review_queue_entries q
+    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc2.9'
+  );
 
 CREATE TABLE IF NOT EXISTS cluster_edit_requests (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -548,6 +557,11 @@ BEGIN
      AND (to_jsonb(NEW)-'status')=(to_jsonb(OLD)-'status') THEN
     RETURN NEW;
   END IF;
+  IF TG_OP='UPDATE' AND OLD.status='reserved' AND NEW.status='aborted'
+     AND length(NEW.terminal_reason)>0
+     AND (to_jsonb(NEW)-'status'-'terminal_reason')=(to_jsonb(OLD)-'status'-'terminal_reason') THEN
+    RETURN NEW;
+  END IF;
   RAISE EXCEPTION 'delivered alert facts are immutable';
 END
 $$;
@@ -610,5 +624,5 @@ GRANT SELECT ON schema_attestations TO radar_app;
 
 -- Written last: an interrupted migration must never attest the target schema.
 INSERT INTO schema_attestations (key,value,updated_at)
-VALUES ('migration_version','001_init_rc2.4',clock_timestamp())
+VALUES ('migration_version','001_init_rc2.6',clock_timestamp())
 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at;

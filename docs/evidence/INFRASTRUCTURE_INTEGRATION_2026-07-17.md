@@ -4,7 +4,7 @@
 
 本仓库的本地 Docker 基础设施已经完成真实运行态验证，不再只是配置解析或 Mock：
 
-- PostgreSQL/pgvector 实际应用迁移 `001_init_rc2.4`；受限 `radar_app` 角色通过 RLS、审计 trigger、只读迁移标记和时钟证明。
+- PostgreSQL/pgvector 实际应用迁移 `001_init_rc2.6`；受限 `radar_app` 角色通过 RLS、审计 trigger、只读迁移标记和时钟证明。
 - 两个并发 PostgreSQL 事务写入同一 `source_id + content_fingerprint` 时保留两条审计 Observation，但有效信源观测只增加一次。
 - PostgreSQL Outbox 实际发布到 Redis Stream，随后在数据库事务中记录 `published_at`、`attempts=1`，payload 可从流中还原；交付语义是 at-least-once，不宣称跨系统 exactly-once。
 - Redis consumer group 的读取、确认和 pending 清零通过。
@@ -23,7 +23,7 @@
 | Redis 镜像 | `redis:7.4-alpine`，健康检查通过 |
 | 对象存储镜像 | `minio/minio:RELEASE.2025-04-22T22-12-26Z` |
 | 数据库应用角色 | `radar_app`，非 superuser，`BYPASSRLS=false` |
-| 迁移标记 | `001_init_rc2.4` |
+| 迁移标记 | `001_init_rc2.6` |
 
 ## 可复跑命令
 
@@ -64,7 +64,7 @@ $env:S3_INTEGRATION_SECRET_KEY="<local integration secret>"
 {
   "storageBackend": "postgresql",
   "rlsVerified": true,
-  "migrationVersion": "001_init_rc2.4",
+  "migrationVersion": "001_init_rc2.6",
   "auditTriggersVerified": true,
   "migrationMarkerReadOnly": true,
   "databaseUser": "radar_app",

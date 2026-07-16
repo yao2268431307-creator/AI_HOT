@@ -1,7 +1,7 @@
 {
-  "version": "product-metrics-2026-07-rc2.8",
+  "version": "product-metrics-2026-07-rc2.9",
   "status": "frozen_for_beta_collection",
-  "frozenAt": "2026-07-17T03:50:00+08:00",
+  "frozenAt": "2026-07-17T05:50:00+08:00",
   "timezone": "Asia/Shanghai",
   "dutyWindows": [
     {
@@ -63,7 +63,7 @@
   },
   "acceptanceMonitoring": {
     "monitorVersion": "acceptance-monitor-v1.1",
-    "monitorDigest": "sha256:52673952b6419e4c32789e9cd951d18e0418154e643f5be3ce2b008d30854292",
+    "monitorDigest": "sha256:e9821011ad0dd7ffbca3ff209121dd46c5a3b3f705e8758846074c9933947fd5",
     "keyringVersion": "acceptance-keys-2026-07-rc2.3",
     "keyringDigest": "sha256:17fe0368defef907375ac86dfb9a721ece1eef7a8acb5cf27b920d7109d5826a",
     "keyringFrozenAt": "2026-07-17T03:23:00+08:00",
@@ -78,6 +78,7 @@
     "out_of_scope"
   ],
   "notes": [
+    "Policy rc2.9 was re-frozen after the acceptance monitor and migration attestation advanced to rc2.6; no earlier sample may enter this evidence window.",
     "Frozen before collection of a real Beta outcome set; demo and synthetic test rows are not acceptance evidence.",
     "System-fault duplicate exclusions require an immutable Owner-authored exclusion record and are always reported separately.",
     "Active review time is counted from authenticated, server-received heartbeat states only when a durable feedbackId is linked; client duration totals are ignored.",

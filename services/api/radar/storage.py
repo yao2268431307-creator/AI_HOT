@@ -804,12 +804,35 @@ class InMemoryRepository:
 
     def list_alert_deliveries(self, workspace_id: str, since: datetime) -> list[dict[str, object]]:
         cutoff = utcnow() - timedelta(minutes=15)
-        return [item.copy() for item in self.alert_deliveries if item["workspaceId"] == workspace_id and item["deliveredAt"] >= since and (item.get("status", "delivered") == "delivered" or item["deliveredAt"] >= cutoff)]
+        return [
+            item.copy()
+            for item in self.alert_deliveries
+            if item["workspaceId"] == workspace_id
+            and item["deliveredAt"] >= since
+            and (
+                item.get("status", "delivered") in {"delivered", "aborted"}
+                or (item.get("status") == "reserved" and item["deliveredAt"] >= cutoff)
+            )
+        ]
 
     def last_alert_delivery(self, workspace_id: str, event_id: str) -> dict[str, object] | None:
-        cutoff = utcnow() - timedelta(minutes=15)
-        rows = [item for item in self.alert_deliveries if item["workspaceId"] == workspace_id and item["eventId"] == event_id and (item.get("status", "delivered") == "delivered" or item["deliveredAt"] >= cutoff)]
+        rows = [item for item in self.alert_deliveries if item["workspaceId"] == workspace_id and item["eventId"] == event_id and item.get("status", "delivered") == "delivered"]
         return max(rows, key=lambda item: item["deliveredAt"]).copy() if rows else None
+
+    def get_alert_delivery_by_idempotency(self, workspace_id: str, idempotency_key: str) -> dict[str, object] | None:
+        with self._lock:
+            row = next((item for item in self.alert_deliveries if item["workspaceId"] == workspace_id and item.get("idempotencyKey") == idempotency_key), None)
+            return row.copy() if row else None
+
+    def list_alert_reservations_for_message(self, workspace_id: str, event_id: str, message_token: str) -> list[dict[str, object]]:
+        suffix = f":{message_token}"
+        with self._lock:
+            return [item.copy() for item in self.alert_deliveries if (
+                item["workspaceId"] == workspace_id
+                and item["eventId"] == event_id
+                and item.get("status") == "reserved"
+                and str(item.get("idempotencyKey", "")).endswith(suffix)
+            )]
 
     def record_alert_delivery(self, item: dict[str, object]) -> None:
         with self._lock:
@@ -819,13 +842,22 @@ class InMemoryRepository:
         with self._lock:
             now = item["deliveredAt"]
             key = str(item["idempotencyKey"])
-            self.alert_deliveries = [row for row in self.alert_deliveries if row.get("status") != "reserved" or row["deliveredAt"] >= now - timedelta(minutes=15)]
             if any(row.get("idempotencyKey") == key for row in self.alert_deliveries):
                 return False
-            today = [row for row in self.alert_deliveries if row["workspaceId"] == item["workspaceId"] and row["deliveredAt"].date() == now.date()]
+            active_cutoff = now - timedelta(minutes=15)
+            today = [row for row in self.alert_deliveries if (
+                row["workspaceId"] == item["workspaceId"]
+                and row["deliveredAt"].date() == now.date()
+                and (row.get("status", "delivered") == "delivered" or (row.get("status") == "reserved" and row["deliveredAt"] >= active_cutoff))
+            )]
             if len(today) >= workspace_limit or sum(row["domain"] == item["domain"] for row in today) >= domain_limit:
                 return False
-            recent = [row for row in self.alert_deliveries if row["workspaceId"] == item["workspaceId"] and row["eventId"] == item["eventId"] and row["deliveredAt"] >= now - cooldown]
+            recent = [row for row in self.alert_deliveries if (
+                row["workspaceId"] == item["workspaceId"]
+                and row["eventId"] == item["eventId"]
+                and row["deliveredAt"] >= now - cooldown
+                and (row.get("status", "delivered") == "delivered" or (row.get("status") == "reserved" and row["deliveredAt"] >= active_cutoff))
+            )]
             if recent and not allow_cooldown_bypass:
                 return False
             reserved = item.copy()
@@ -833,12 +865,28 @@ class InMemoryRepository:
             self.alert_deliveries.append(reserved)
             return True
 
-    def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> None:
+    def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> bool:
         with self._lock:
             for item in self.alert_deliveries:
-                if item.get("idempotencyKey") == idempotency_key:
-                    item["status"] = "delivered"
-                    return
+                if item.get("idempotencyKey") == idempotency_key and (workspace_id is None or item["workspaceId"] == workspace_id):
+                    if item.get("status") == "reserved":
+                        item["status"] = "delivered"
+                    if item.get("status") == "delivered":
+                        return True
+            raise RuntimeError(f"alert reservation {idempotency_key} is not confirmable")
+
+    def abort_alert_reservation(self, idempotency_key: str, reason: str, workspace_id: str | None = None) -> bool:
+        if not reason.strip():
+            raise ValueError("alert reservation terminal reason is required")
+        with self._lock:
+            for item in self.alert_deliveries:
+                if item.get("idempotencyKey") == idempotency_key and (workspace_id is None or item["workspaceId"] == workspace_id):
+                    if item.get("status") == "reserved":
+                        item["status"] = "aborted"
+                        item["terminalReason"] = reason[:1000]
+                    if item.get("status") == "aborted":
+                        return True
+            raise RuntimeError(f"alert reservation {idempotency_key} is not abortable")
 
     def release_alert_reservation(self, idempotency_key: str, workspace_id: str | None = None) -> None:
         with self._lock:
@@ -2365,9 +2413,9 @@ class PostgresRepository:
                 self._set_workspace(cursor, workspace_id)
                 cursor.execute(
                     """
-                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status
+                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status,terminal_reason
                     FROM alert_deliveries WHERE workspace_id=%s AND delivered_at >= %s
-                      AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
+                      AND (status IN ('delivered','aborted') OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
                     ORDER BY delivered_at
                     """,
                     (workspace_id, since),
@@ -2377,7 +2425,7 @@ class PostgresRepository:
             "deliveryId": str(row[0]), "ruleId": str(row[1]), "workspaceId": workspace_id,
             "eventId": row[2], "domain": row[3], "lifecycleState": row[4], "evidenceStrength": row[5],
             "evidenceCount": row[6], "deliveredAt": row[7], "channel": row[8],
-            "idempotencyKey": row[9], "status": row[10],
+            "idempotencyKey": row[9], "status": row[10], "terminalReason": row[11],
         } for row in rows]
 
     def last_alert_delivery(self, workspace_id: str, event_id: str) -> dict[str, object] | None:
@@ -2386,9 +2434,9 @@ class PostgresRepository:
                 self._set_workspace(cursor, workspace_id)
                 cursor.execute(
                     """
-                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status
+                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status,terminal_reason
                     FROM alert_deliveries WHERE workspace_id=%s AND event_id=%s
-                      AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))
+                      AND status='delivered'
                     ORDER BY delivered_at DESC LIMIT 1
                     """,
                     (workspace_id, event_id),
@@ -2400,8 +2448,50 @@ class PostgresRepository:
             "deliveryId": str(row[0]), "ruleId": str(row[1]), "workspaceId": workspace_id,
             "eventId": row[2], "domain": row[3], "lifecycleState": row[4], "evidenceStrength": row[5],
             "evidenceCount": row[6], "deliveredAt": row[7], "channel": row[8],
-            "idempotencyKey": row[9], "status": row[10],
+            "idempotencyKey": row[9], "status": row[10], "terminalReason": row[11],
         }
+
+    def get_alert_delivery_by_idempotency(self, workspace_id: str, idempotency_key: str) -> dict[str, object] | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """
+                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status,terminal_reason
+                    FROM alert_deliveries WHERE workspace_id=%s AND idempotency_key=%s
+                    """,
+                    (workspace_id, idempotency_key),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "deliveryId": str(row[0]), "ruleId": str(row[1]), "workspaceId": workspace_id,
+            "eventId": row[2], "domain": row[3], "lifecycleState": row[4], "evidenceStrength": row[5],
+            "evidenceCount": row[6], "deliveredAt": row[7], "channel": row[8],
+            "idempotencyKey": row[9], "status": row[10], "terminalReason": row[11],
+        }
+
+    def list_alert_reservations_for_message(self, workspace_id: str, event_id: str, message_token: str) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """
+                    SELECT id,rule_id,event_id,domain,lifecycle_state,evidence_strength,evidence_count,delivered_at,channel,idempotency_key,status,terminal_reason
+                    FROM alert_deliveries
+                    WHERE workspace_id=%s AND event_id=%s AND status='reserved' AND idempotency_key LIKE %s
+                    ORDER BY delivered_at
+                    """,
+                    (workspace_id, event_id, f"%:{message_token}"),
+                )
+                rows = cursor.fetchall()
+        return [{
+            "deliveryId": str(row[0]), "ruleId": str(row[1]), "workspaceId": workspace_id,
+            "eventId": row[2], "domain": row[3], "lifecycleState": row[4], "evidenceStrength": row[5],
+            "evidenceCount": row[6], "deliveredAt": row[7], "channel": row[8],
+            "idempotencyKey": row[9], "status": row[10], "terminalReason": row[11],
+        } for row in rows]
 
     def record_alert_delivery(self, item: dict[str, object]) -> None:
         workspace_id = str(item["workspaceId"])
@@ -2426,13 +2516,15 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 self._set_workspace(cursor, workspace_id)
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (workspace_id,))
-                cursor.execute("DELETE FROM alert_deliveries WHERE workspace_id=%s AND status='reserved' AND delivered_at < now()-interval '15 minutes'", (workspace_id,))
                 cursor.execute("SELECT 1 FROM alert_deliveries WHERE idempotency_key=%s", (item["idempotencyKey"],))
                 if cursor.fetchone():
                     connection.commit()
                     return False
                 cursor.execute(
-                    "SELECT count(*),count(*) FILTER (WHERE domain=%s) FROM alert_deliveries WHERE workspace_id=%s AND (delivered_at AT TIME ZONE 'UTC')::date=(%s::timestamptz AT TIME ZONE 'UTC')::date",
+                    """SELECT count(*),count(*) FILTER (WHERE domain=%s) FROM alert_deliveries
+                    WHERE workspace_id=%s
+                      AND (delivered_at AT TIME ZONE 'UTC')::date=(%s::timestamptz AT TIME ZONE 'UTC')::date
+                      AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes'))""",
                     (item["domain"], workspace_id, item["deliveredAt"]),
                 )
                 budget_row = cursor.fetchone()
@@ -2441,7 +2533,9 @@ class PostgresRepository:
                     return False
                 if not allow_cooldown_bypass:
                     cursor.execute(
-                        "SELECT 1 FROM alert_deliveries WHERE workspace_id=%s AND event_id=%s AND delivered_at >= %s LIMIT 1",
+                        """SELECT 1 FROM alert_deliveries
+                        WHERE workspace_id=%s AND event_id=%s AND delivered_at >= %s
+                          AND (status='delivered' OR (status='reserved' AND delivered_at >= now()-interval '15 minutes')) LIMIT 1""",
                         (workspace_id, item["eventId"], item["deliveredAt"] - cooldown),
                     )
                     if cursor.fetchone():
@@ -2459,14 +2553,63 @@ class PostgresRepository:
             connection.commit()
         return True
 
-    def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> None:
+    def confirm_alert_delivery(self, idempotency_key: str, workspace_id: str | None = None) -> bool:
         if not workspace_id:
             raise ValueError("workspace_id is required for an RLS-scoped alert confirmation")
+        status: str | None = None
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 self._set_workspace(cursor, workspace_id)
-                cursor.execute("UPDATE alert_deliveries SET status='delivered' WHERE workspace_id=%s AND idempotency_key=%s AND status='reserved'", (workspace_id, idempotency_key))
+                cursor.execute(
+                    """UPDATE alert_deliveries SET status='delivered'
+                    WHERE workspace_id=%s AND idempotency_key=%s AND status='reserved'
+                    RETURNING status""",
+                    (workspace_id, idempotency_key),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        "SELECT status FROM alert_deliveries WHERE workspace_id=%s AND idempotency_key=%s",
+                        (workspace_id, idempotency_key),
+                    )
+                    existing = cursor.fetchone()
+                    status = str(existing[0]) if existing else None
+                else:
+                    status = str(row[0])
             connection.commit()
+        if status != "delivered":
+            raise RuntimeError(f"alert reservation {idempotency_key} is not confirmable")
+        return True
+
+    def abort_alert_reservation(self, idempotency_key: str, reason: str, workspace_id: str | None = None) -> bool:
+        if not workspace_id:
+            raise ValueError("workspace_id is required for an RLS-scoped alert abort")
+        if not reason.strip():
+            raise ValueError("alert reservation terminal reason is required")
+        status: str | None = None
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """UPDATE alert_deliveries SET status='aborted',terminal_reason=%s
+                    WHERE workspace_id=%s AND idempotency_key=%s AND status='reserved'
+                    RETURNING status""",
+                    (reason[:1000], workspace_id, idempotency_key),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        "SELECT status FROM alert_deliveries WHERE workspace_id=%s AND idempotency_key=%s",
+                        (workspace_id, idempotency_key),
+                    )
+                    existing = cursor.fetchone()
+                    status = str(existing[0]) if existing else None
+                else:
+                    status = str(row[0])
+            connection.commit()
+        if status != "aborted":
+            raise RuntimeError(f"alert reservation {idempotency_key} is not abortable")
+        return True
 
     def release_alert_reservation(self, idempotency_key: str, workspace_id: str | None = None) -> None:
         if not workspace_id:
