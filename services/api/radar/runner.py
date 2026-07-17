@@ -10,7 +10,8 @@ from pathlib import Path
 
 from redis.asyncio import Redis
 
-from .connectors import ArxivConnector, BaseConnector, GitHubConnector, HackerNewsConnector, HuggingFaceConnector, OpenAlexConnector, RSSConnector, YouTubeConnector
+from .connectors import ArxivConnector, BaseConnector, BlueskyJetstreamConnector, GitHubConnector, HackerNewsConnector, HuggingFaceConnector, OpenAlexConnector, RSSConnector, YouTubeConnector
+from .connectors.bluesky import DEFAULT_AI_KEYWORDS
 from .outbox import RedisOutboxPublisher
 from .processor import EventProcessor
 from .evidence_store import LocalEvidenceStore, RawEvidenceStore, S3EvidenceStore
@@ -43,6 +44,18 @@ def build_connectors(evidence_store: RawEvidenceStore | None = None) -> list[Bas
         connectors.insert(0, RSSConnector(feeds, evidence_store=evidence_store))
     if os.getenv("YOUTUBE_API_KEY"):
         connectors.append(YouTubeConnector(os.environ["YOUTUBE_API_KEY"], query=os.getenv("YOUTUBE_QUERY", "AI model"), evidence_store=evidence_store))
+    if os.getenv("BLUESKY_JETSTREAM_ENABLED", "false").lower() == "true":
+        keywords = tuple(
+            value.strip() for value in os.getenv("BLUESKY_AI_KEYWORDS", "").split(",") if value.strip()
+        )
+        connectors.append(BlueskyJetstreamConnector(
+            endpoint=os.getenv("BLUESKY_JETSTREAM_ENDPOINT", "wss://jetstream2.us-east.bsky.network/subscribe"),
+            appview_endpoint=os.getenv("BLUESKY_APPVIEW_ENDPOINT", "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts"),
+            keywords=keywords or DEFAULT_AI_KEYWORDS,
+            max_messages=int(os.getenv("BLUESKY_MAX_MESSAGES", "500")),
+            idle_timeout_seconds=float(os.getenv("BLUESKY_IDLE_TIMEOUT_SECONDS", "3")),
+            evidence_store=evidence_store,
+        ))
     return connectors
 
 

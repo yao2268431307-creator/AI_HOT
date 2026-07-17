@@ -2,19 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+import json
 from pathlib import Path
 
 import httpx
 import pytest
 
 from radar import alerts as alert_module
+from radar import runner as runner_module
 from radar import storage as storage_module
 from radar.assessment import event_assessment
 from radar.alerts import sign_payload, verify_payload
 from radar.clustering import ClusterCandidate, choose_cluster, entities
 from radar.connectors import base as connector_base
 from radar.connectors.arxiv import ArxivConnector
-from radar.connectors.base import BaseConnector, ConnectorError, ensure_safe_public_url, ensure_safe_public_url_resolved
+from radar.connectors.base import BaseConnector, ConnectorError, ensure_safe_public_url, ensure_safe_public_url_resolved, ensure_safe_public_websocket_url
+from radar.connectors.bluesky import BlueskyJetstreamConnector, JETSTREAM_CURSOR_VERSION
 from radar.connectors.github import GitHubConnector
 from radar.connectors.huggingface import HuggingFaceConnector
 from radar.connectors.research import OpenAlexConnector
@@ -137,8 +140,8 @@ def test_governed_source_promotion_is_audited_and_cannot_repeat_same_day(monkeyp
 
 def test_postgres_source_validity_claim_is_locked_before_duplicate_probe() -> None:
     source = (Path(__file__).parents[1] / "radar" / "storage.py").read_text(encoding="utf-8")
-    start = source.index("source-valid-observation:")
-    probe = source.index("WHERE NOT EXISTS (", start)
+    start = source.index("source-valid-observation:", source.index("class PostgresRepository"))
+    probe = source.index("NOT EXISTS (", start)
     assert "pg_advisory_xact_lock" in source[start - 300:start]
     assert start < probe
 
@@ -168,6 +171,79 @@ def test_content_fact_and_metric_snapshots_are_separate_append_only_contracts() 
     assert repository.save_observation_with_outbox(item) is True
     assert len(repository.metric_facts) == 2
     assert {entry["kind"] for entry in repository.outbox} == {"observation.created", "metric_snapshots.created"}
+
+
+def test_rights_policy_excerpt_limit_is_enforced_during_fact_split() -> None:
+    item = observation("rights-excerpt").model_copy(update={
+        "rights_policy_id": "youtube-api-review-required-v1",
+        "text": "x" * 800,
+    })
+    content, _ = split_observation(item)
+    assert len(content.text_excerpt) == 500
+
+
+def test_provenance_upgrade_is_durable_and_schedules_a_new_revision() -> None:
+    repository = InMemoryRepository()
+    candidate = observation("provenance-upgrade").model_copy(update={
+        "provenance_level": "unverified_discovery", "metrics": {},
+    })
+    verified = candidate.model_copy(update={
+        "provenance_level": "provider_verified", "metrics": {"comments": 8},
+        "collected_at": candidate.collected_at + timedelta(minutes=1),
+        "raw_evidence_ref": "r2://raw/provenance-upgrade-verified.json",
+    })
+    assert repository.save_observation_with_outbox(candidate) is True
+    assert repository.list_source_profiles()[0]["validObservations"] == 0
+    assert repository.save_observation_with_outbox(verified) is True
+    assert repository.observations[candidate.id].provenance_level == "provider_verified"
+    assert repository.observation_processing[candidate.id]["revision"] == 2
+    assert repository.list_source_profiles()[0]["validObservations"] == 1
+    assert {row["kind"] for row in repository.outbox} == {"observation.created", "metric_snapshots.created"}
+    assert candidate.raw_evidence_ref in repository.raw_evidence_deletions
+    ignored_ref = "r2://raw/provenance-upgrade-ignored-unverified.json"
+    ignored = verified.model_copy(update={
+        "provenance_level": "unverified_discovery", "metrics": {"score": 1_000_000_000},
+        "raw_evidence_ref": ignored_ref,
+    })
+    assert repository.save_observation_with_outbox(ignored) is False
+    assert repository.observations[candidate.id].provenance_level == "provider_verified"
+    assert repository.raw_evidence_deletions[ignored_ref]["status"] == "pending"
+    repository.raw_evidence_deletions[verified.raw_evidence_ref] = {
+        "rightsPolicyId": verified.rights_policy_id, "status": "pending", "attempts": 0,
+        "nextAttemptAt": datetime.now(timezone.utc), "leaseUntil": None, "lastError": None,
+    }
+    assert verified.raw_evidence_ref not in repository.expire_raw_evidence({}, datetime.now(timezone.utc))
+
+
+def test_unverified_metrics_are_rejected_and_storage_drops_model_copy_bypass() -> None:
+    with pytest.raises(ValueError, match="cannot carry metric"):
+        observation("untrusted-metrics").model_validate({
+            **observation("untrusted-metrics").model_dump(mode="python", by_alias=True),
+            "provenanceLevel": "unverified_discovery",
+            "metrics": {"score": 1_000_000_000},
+        })
+    bypassed = observation("untrusted-metrics-bypass").model_copy(update={
+        "provenance_level": "unverified_discovery", "metrics": {"score": 1_000_000_000},
+    })
+    repository = InMemoryRepository()
+    assert repository.save_observation_with_outbox(bypassed) is True
+    assert repository.metric_facts == {}
+
+
+def test_unverified_evidence_cannot_raise_feature_weight_or_cluster_confidence() -> None:
+    repository = InMemoryRepository()
+    seed_repository(repository)
+    baseline = repository.list_events()[0]
+    event = baseline.model_copy(update={
+        "signal_families": [], "diversity": 0, "evidence_count": 0,
+        "discussion_evidence_state": "missing", "behavior_evidence_state": "missing",
+        "evidence": [baseline.evidence[0].model_copy(update={
+            "kind": "official", "provenance_level": "unverified_discovery",
+        })],
+    })
+    assessment = event_assessment(event)
+    assert assessment.evidence_mask["official"] == "missing"
+    assert assessment.cluster_confidence == 0
 
 
 def test_metric_history_is_reconstructed_for_delta_scoring_instead_of_latest_only() -> None:
@@ -354,6 +430,301 @@ def test_cluster_assignment_uses_shared_url_entity_and_time() -> None:
     assert decision.create_new is False
     assert decision.event_id == "evt-qwen"
     assert "共享规范化 URL" in decision.reasons
+
+
+class FakeJetstreamSocket:
+    def __init__(self, messages: list[str]) -> None:
+        self.messages = list(messages)
+
+    async def recv(self) -> str:
+        if not self.messages:
+            raise TimeoutError
+        return self.messages.pop(0)
+
+
+class FakeJetstreamContext:
+    def __init__(self, messages: list[str]) -> None:
+        self.socket = FakeJetstreamSocket(messages)
+
+    async def __aenter__(self) -> FakeJetstreamSocket:
+        return self.socket
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+def jetstream_event(*, text: str, time_us: int, cid: str = "bafyreiaitestcid", rkey: str = "post-one") -> dict[str, object]:
+    return {
+        "did": "did:plc:testauthor", "time_us": time_us, "kind": "commit",
+        "commit": {
+            "operation": "create", "collection": "app.bsky.feed.post", "rkey": rkey,
+            "cid": cid, "record": {"text": text, "createdAt": "2026-07-17T00:00:00Z"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_bluesky_jetstream_hydrates_exact_appview_identity_and_persists_cursor(tmp_path) -> None:
+    event_time = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1_000_000)
+    messages = [
+        json.dumps(jetstream_event(text="ordinary gardening note", time_us=event_time - 1)),
+        json.dumps(jetstream_event(text="New AI model release", time_us=event_time)),
+    ]
+    captured: dict[str, object] = {}
+    verified_text = "AI model release " + ("x" * 700)
+
+    def connect_factory(url: str, **kwargs: object) -> FakeJetstreamContext:
+        captured.update({"url": url, "kwargs": kwargs})
+        return FakeJetstreamContext(messages)
+
+    uri = "at://did:plc:testauthor/app.bsky.feed.post/post-one"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get_list("uris") == [uri]
+        return httpx.Response(200, json={"posts": [{
+            "uri": uri, "cid": "bafyreiaitestcid", "author": {"did": "did:plc:testauthor"},
+            "record": {"text": verified_text, "createdAt": "2026-07-17T00:00:00Z"},
+            "likeCount": 12, "repostCount": 3, "quoteCount": 2, "replyCount": 4,
+        }]})
+
+    store = LocalEvidenceStore(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = BlueskyJetstreamConnector(
+            client=client, evidence_store=store, connect_factory=connect_factory,
+            max_messages=2, idle_timeout_seconds=.1, max_attempts=1,
+        )
+        connector.restore_checkpoint({
+            "cursorVersion": JETSTREAM_CURSOR_VERSION,
+            "cursorTimeUs": event_time - 10_000_000,
+        })
+        items = await connector.collect()
+        checkpoint = connector.next_checkpoint(items)
+    assert len(items) == 1
+    assert items[0].provenance_level == "unverified_discovery"
+    assert items[0].metrics == {}
+    assert len(items[0].text) == 500
+    assert checkpoint["cursorTimeUs"] == event_time
+    assert "wantedCollections=app.bsky.feed.post" in str(captured["url"])
+    assert f"cursor={event_time - 15_000_000}" in str(captured["url"])
+    archived = json.loads((tmp_path / evidence_key(items[0].raw_evidence_ref)).read_text(encoding="utf-8"))
+    assert archived["provenanceLevel"] == "unverified_discovery"
+    assert archived["identityVerified"] is True
+    assert archived["appView"]["cid"] == "bafyreiaitestcid"
+    assert len(archived["appView"]["record"]["text"]) > 500
+
+
+@pytest.mark.asyncio
+async def test_unverified_bluesky_discovery_cannot_score_or_emit_score_outbox(tmp_path) -> None:
+    event_time = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1_000_000)
+    messages = [json.dumps(jetstream_event(text="AI agent launch", time_us=event_time))]
+
+    def connect_factory(*_args: object, **_kwargs: object) -> FakeJetstreamContext:
+        return FakeJetstreamContext(messages)
+
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json={"posts": [{
+        "uri": "at://did:plc:testauthor/app.bsky.feed.post/post-one",
+        "cid": "wrong-cid", "author": {"did": "did:plc:testauthor"}, "record": {"text": "AI agent launch"},
+    }]}))
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = BlueskyJetstreamConnector(
+            client=client, evidence_store=LocalEvidenceStore(tmp_path),
+            connect_factory=connect_factory, max_messages=1, idle_timeout_seconds=.1, max_attempts=1,
+        )
+        items = await connector.collect()
+    assert len(items) == 1 and items[0].provenance_level == "unverified_discovery"
+    assert items[0].metrics == {}
+    assert "/bluesky/discovery/" in items[0].raw_evidence_ref
+    repository = InMemoryRepository()
+    repository.save_observation_with_outbox(items[0])
+    event = await EventProcessor(repository).process(items[0])
+    assert event.attention == event.behavior == event.evidence_score == 0
+    assert event.independent_sources == event.evidence_count == 0
+    assert event.discussion_evidence_state == "untrusted"
+    assert event.evidence[0].provenance_level == "unverified_discovery"
+    assessment = event_assessment(event)
+    assert assessment.attention_estimate is None
+    assert assessment.evidence_mask["discussion"] == "untrusted"
+    assert assessment.cluster_confidence == 0
+    assert any(gap.feature == "discussion" and gap.state == "untrusted" for gap in assessment.missing_evidence)
+    assert repository.score_runs == []
+    assert not any(row["kind"] == "score.created" for row in repository.outbox)
+    verified = items[0].model_copy(update={
+        "provenance_level": "provider_verified", "metrics": {"comments": 6},
+        "collected_at": items[0].collected_at + timedelta(minutes=15),
+        "raw_evidence_ref": "r2://raw/bluesky/verified-upgrade.json",
+    })
+    assert repository.save_observation_with_outbox(verified) is True
+    upgraded = await EventProcessor(repository).process(verified)
+    assert upgraded.discussion_evidence_state == "observed"
+    assert upgraded.evidence_count == upgraded.independent_sources == 1
+    assert upgraded.evidence[0].provenance_level == "provider_verified"
+    assert len(repository.score_runs) == 1
+
+
+@pytest.mark.asyncio
+async def test_verified_revision_resets_discovery_only_type_and_first_seen() -> None:
+    repository = InMemoryRepository()
+    now = datetime.now(timezone.utc)
+    candidate = observation("discovery-scoring-state").model_copy(update={
+        "provenance_level": "unverified_discovery", "metrics": {},
+        "published_at": now - timedelta(days=30), "collected_at": now - timedelta(days=30),
+        "title": "AI model weights", "text": "AI model weights",
+    })
+    assert repository.save_observation_with_outbox(candidate) is True
+    await EventProcessor(repository).process(candidate)
+    verified = candidate.model_copy(update={
+        "provenance_level": "provider_verified", "published_at": now,
+        "collected_at": now, "title": "CVE security advisory",
+        "text": "CVE security advisory for an AI service",
+        "content_fingerprint": "verified-security-fingerprint",
+        "raw_evidence_ref": "r2://raw/discovery-scoring-state-verified.json",
+    })
+    assert repository.save_observation_with_outbox(verified) is True
+    upgraded = await EventProcessor(repository).process(verified)
+    assert upgraded.event_type == "security_incident"
+    assert upgraded.first_seen == now
+
+
+@pytest.mark.asyncio
+async def test_bluesky_scope_is_rechecked_against_verified_appview_text(tmp_path) -> None:
+    event_time = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1_000_000)
+    uri = "at://did:plc:testauthor/app.bsky.feed.post/post-one"
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json={"posts": [{
+        "uri": uri, "cid": "bafyreiaitestcid", "author": {"did": "did:plc:testauthor"},
+        "record": {"text": "ordinary gardening notes"}, "likeCount": 10_000,
+    }]}))
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = BlueskyJetstreamConnector(
+            client=client, evidence_store=LocalEvidenceStore(tmp_path),
+            connect_factory=lambda *_args, **_kwargs: FakeJetstreamContext([
+                json.dumps(jetstream_event(text="AI launch", time_us=event_time)),
+            ]), max_messages=1, idle_timeout_seconds=.1, max_attempts=1,
+        )
+        items = await connector.collect()
+    assert len(items) == 1
+    assert items[0].provenance_level == "unverified_discovery"
+    assert items[0].metrics == {}
+
+
+@pytest.mark.asyncio
+async def test_bluesky_appview_failure_degrades_run_without_advancing_checkpoint(tmp_path) -> None:
+    event_time = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1_000_000)
+    transport = httpx.MockTransport(lambda _: httpx.Response(503, text="temporarily unavailable"))
+    repository = InMemoryRepository()
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = BlueskyJetstreamConnector(
+            client=client, evidence_store=LocalEvidenceStore(tmp_path),
+            connect_factory=lambda *_args, **_kwargs: FakeJetstreamContext([
+                json.dumps(jetstream_event(text="AI launch", time_us=event_time)),
+            ]), max_messages=1, idle_timeout_seconds=.1, max_attempts=1,
+        )
+        result = await CollectorWorker(repository, [connector]).run_connector(connector)
+    assert result.failed is True
+    assert repository.get_connector_checkpoint(connector.id) == {}
+    assert repository.observations == {}
+    assert repository.get_connector(connector.id).status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_bluesky_checkpoint_stops_at_appview_batch_boundary(tmp_path) -> None:
+    event_time = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1_000_000)
+    messages = [
+        json.dumps(jetstream_event(
+            text=f"AI launch {index}", time_us=event_time + index,
+            cid=f"cid-{index}", rkey=f"post-{index}",
+        ))
+        for index in range(30)
+    ]
+
+    def connect_factory(*_args: object, **_kwargs: object) -> FakeJetstreamContext:
+        return FakeJetstreamContext(messages)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"posts": [
+            {
+                "uri": uri, "cid": f"cid-{uri.rsplit('-', 1)[1]}",
+                "author": {"did": "did:plc:testauthor"},
+                "record": {"text": f"AI launch {uri.rsplit('-', 1)[1]}"},
+            }
+            for uri in request.url.params.get_list("uris")
+        ]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        connector = BlueskyJetstreamConnector(
+            client=client, evidence_store=LocalEvidenceStore(tmp_path),
+            connect_factory=connect_factory, max_messages=30, idle_timeout_seconds=.1, max_attempts=1,
+        )
+        first = await connector.collect()
+        checkpoint = connector.next_checkpoint(first)
+        assert len(first) == 25
+        assert checkpoint["cursorTimeUs"] == event_time + 24
+        connector.restore_checkpoint(checkpoint)
+        second = await connector.collect()
+    assert len(second) == 5
+    assert connector.next_checkpoint(second)["cursorTimeUs"] == event_time + 29
+
+
+@pytest.mark.asyncio
+async def test_bluesky_same_uri_different_cids_are_verified_per_revision(tmp_path) -> None:
+    event_time = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1_000_000)
+    uri = "at://did:plc:testauthor/app.bsky.feed.post/post-one"
+    messages = [
+        json.dumps(jetstream_event(text="AI old", time_us=event_time, cid="cid-old")),
+        json.dumps(jetstream_event(text="AI current", time_us=event_time + 1, cid="cid-current")),
+    ]
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json={"posts": [{
+        "uri": uri, "cid": "cid-current", "author": {"did": "did:plc:testauthor"},
+        "record": {"text": "AI current"},
+    }]}))
+    async with httpx.AsyncClient(transport=transport) as client:
+        connector = BlueskyJetstreamConnector(
+            client=client, evidence_store=LocalEvidenceStore(tmp_path),
+            connect_factory=lambda *_args, **_kwargs: FakeJetstreamContext(messages),
+            max_messages=2, idle_timeout_seconds=.1, max_attempts=1,
+        )
+        items = await connector.collect()
+    assert [item.provenance_level for item in items] == ["unverified_discovery", "unverified_discovery"]
+    assert items[1].text == "AI current"
+
+
+def test_bluesky_configuration_and_checkpoint_fail_closed() -> None:
+    with pytest.raises(ConnectorError):
+        ensure_safe_public_websocket_url("ws://127.0.0.1/private")
+    with pytest.raises(ConnectorError, match="keywords"):
+        BlueskyJetstreamConnector(keywords=(), connect_factory=lambda: FakeJetstreamContext([]))
+    with pytest.raises(ConnectorError, match="wss"):
+        BlueskyJetstreamConnector(
+            endpoint="ws://example.com/subscribe",
+            connect_factory=lambda: FakeJetstreamContext([]),
+        )
+    with pytest.raises(ConnectorError, match="https"):
+        BlueskyJetstreamConnector(
+            appview_endpoint="http://example.com/xrpc/app.bsky.feed.getPosts",
+            connect_factory=lambda: FakeJetstreamContext([]),
+        )
+    connector = BlueskyJetstreamConnector(connect_factory=lambda: FakeJetstreamContext([]))
+    with pytest.raises(ConnectorError, match="checkpoint"):
+        connector.restore_checkpoint({"cursorVersion": "unknown", "cursorTimeUs": 1})
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_bluesky_disabled_by_default(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("BLUESKY_JETSTREAM_ENABLED", raising=False)
+    default_connectors = runner_module.build_connectors(LocalEvidenceStore(tmp_path / "default"))
+    try:
+        assert all(connector.id != "bluesky" for connector in default_connectors)
+    finally:
+        for connector in default_connectors:
+            await connector.close()
+    monkeypatch.setenv("BLUESKY_JETSTREAM_ENABLED", "true")
+    enabled_connectors = runner_module.build_connectors(LocalEvidenceStore(tmp_path / "enabled"))
+    try:
+        bluesky = [connector for connector in enabled_connectors if connector.id == "bluesky"]
+        assert len(bluesky) == 1
+        assert isinstance(bluesky[0], BlueskyJetstreamConnector)
+    finally:
+        for connector in enabled_connectors:
+            await connector.close()
 
 
 @pytest.mark.asyncio

@@ -421,6 +421,7 @@ def test_cluster_merge_executes_with_lineage_watch_inheritance_and_revert() -> N
         assert executed.status_code == 200
         child_id = executed.json()["resultEventIds"][0]
         assert repository.event_observations[child_id] == {"obs-a": .91, "obs-b": .84}
+        assert repository.get_event(child_id).evidence_count == 0
         assert {event.id for event in repository.list_events()}.isdisjoint({"evt-open-model", "evt-benchmark"})
         assert repository.score_runs == []
         lineage = http.get("/api/v1/events/evt-open-model/lineage").json()

@@ -1,6 +1,6 @@
 {
-  "policyVersion": "rights-2026-07-rc2",
-  "reviewedAt": "2026-07-16",
+  "policyVersion": "rights-2026-07-rc2.1",
+  "reviewedAt": "2026-07-17",
   "defaultPolicy": "metadata-and-excerpt",
   "policies": {
     "metadata-and-excerpt": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
@@ -10,6 +10,7 @@
     "hf-hub-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
     "arxiv-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
     "openalex-metadata-v1": {"rawRetentionDays": 30, "excerptMaxCharacters": 1000, "legalApproval": "pending"},
-    "youtube-api-review-required-v1": {"rawRetentionDays": 7, "excerptMaxCharacters": 500, "legalApproval": "blocked-without-approved-key"}
+    "youtube-api-review-required-v1": {"rawRetentionDays": 7, "excerptMaxCharacters": 500, "legalApproval": "blocked-without-approved-key"},
+    "bluesky-appview-jetstream-experimental-v1": {"rawRetentionDays": 7, "excerptMaxCharacters": 500, "legalApproval": "experimental-pending"}
   }
 }

@@ -38,6 +38,7 @@ export interface Evidence {
   publishedAt: string;
   kind: "discussion" | "behavior" | "official" | "research";
   excerpt: string;
+  provenanceLevel?: "self_authenticating" | "provider_verified" | "unverified_discovery";
 }
 
 export interface MetricPoint {

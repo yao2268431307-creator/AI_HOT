@@ -980,7 +980,7 @@ def evaluate_samples(
             and row.get("rlsVerified") is True
             and row.get("authRequired") is True
             and row.get("productionReady") is True
-            and row.get("migrationVersion") == "001_init_rc2.6"
+            and row.get("migrationVersion") == "001_init_rc2.9"
             and row.get("auditTriggersVerified") is True
             and row.get("migrationMarkerReadOnly") is True
             and row.get("databaseUser") == "radar_app"

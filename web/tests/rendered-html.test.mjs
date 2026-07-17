@@ -51,6 +51,8 @@ test("ships the required product views and responsive safety", async () => {
   assert.match(shell, /source-pagination/);
   assert.match(shell, /mobileDetail[\s\S]*Dialog\.Content/);
   assert.match(shell, /discussionEvidenceState === undefined/);
+  assert.match(shell, /未复核候选，不参与评分/);
+  assert.match(shell, /provenanceLevel !== "unverified_discovery"/);
   assert.match(table, /behaviorEvidenceState === undefined/);
   assert.doesNotMatch(shell, /¥1,184|2 个状态刚切换/);
   assert.match(shell, /prefers-reduced-motion|detail-panel/);

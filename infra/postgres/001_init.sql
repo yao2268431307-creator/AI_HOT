@@ -123,12 +123,18 @@ CREATE TABLE IF NOT EXISTS observations (
   raw_evidence_ref text NOT NULL,
   parser_version text NOT NULL DEFAULT 'parser-1',
   rights_policy_id text NOT NULL DEFAULT 'metadata-and-excerpt',
+  provenance_level text NOT NULL DEFAULT 'provider_verified'
+    CHECK (provenance_level IN ('self_authenticating','provider_verified','unverified_discovery')),
   deletion_state text NOT NULL DEFAULT 'active' CHECK (deletion_state IN ('active','tombstoned','deleted')),
   signal_family text NOT NULL CHECK (signal_family IN ('discussion','behavior','official','research')),
   embedding vector(1024),
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (platform, external_id, collected_at)
 );
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS provenance_level text NOT NULL DEFAULT 'provider_verified';
+ALTER TABLE observations DROP CONSTRAINT IF EXISTS observations_provenance_level_check;
+ALTER TABLE observations ADD CONSTRAINT observations_provenance_level_check
+  CHECK (provenance_level IN ('self_authenticating','provider_verified','unverified_discovery'));
 CREATE INDEX IF NOT EXISTS observations_collected_idx ON observations (collected_at DESC);
 CREATE INDEX IF NOT EXISTS observations_source_idx ON observations (source_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS observations_entity_idx ON observations (entity_id, published_at DESC);
@@ -443,12 +449,12 @@ INSERT INTO review_queue_entries
   (event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
 SELECT e.id,'qe-backfill-'||gen_random_uuid()::text,clock_timestamp(),e.lifecycle_state,e.cluster_version,
        COALESCE(NULLIF(e.current_score->>'scoreVersion',''),'unknown'),
-       'product-metrics-2026-07-rc2.9','deployment_backfill'
+       'product-metrics-2026-07-rc2.12','deployment_backfill'
 FROM events e
 WHERE e.lifecycle_state IN ('detected','emerging','accelerating','established','cooling')
   AND NOT EXISTS (
     SELECT 1 FROM review_queue_entries q
-    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc2.9'
+    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc2.12'
   );
 
 CREATE TABLE IF NOT EXISTS cluster_edit_requests (
@@ -624,5 +630,5 @@ GRANT SELECT ON schema_attestations TO radar_app;
 
 -- Written last: an interrupted migration must never attest the target schema.
 INSERT INTO schema_attestations (key,value,updated_at)
-VALUES ('migration_version','001_init_rc2.6',clock_timestamp())
+VALUES ('migration_version','001_init_rc2.9',clock_timestamp())
 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at;

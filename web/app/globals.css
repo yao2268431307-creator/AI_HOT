@@ -167,6 +167,7 @@ a { color: inherit; }
 .score i em { display: block; height: 100%; }
 .tone-bg-blue { background: var(--blue); }.tone-bg-green { background: var(--green); }.tone-bg-amber { background: var(--amber); }.tone-bg-red { background: var(--red); }
 .trajectory-card, .propagation-card, .evidence-section { margin-top: 13px; padding: 14px; border: 1px solid var(--line); background: rgba(11,18,29,.76); }
+.evidence-provenance-unverified { color: var(--warning, #f6b95f); font-weight: 650; }
 .section-title { display: flex; align-items: center; justify-content: space-between; color: #b4c2d4; font-size: 11px; }
 .section-title span:last-child { color: var(--faint); font: 9px var(--mono); }
 .mono { font-family: var(--mono) !important; }

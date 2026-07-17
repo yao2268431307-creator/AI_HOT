@@ -1,6 +1,6 @@
 {
-  "registryVersion": "connectors-2026-07-rc2",
-  "reviewedAt": "2026-07-16",
+  "registryVersion": "connectors-2026-07-rc2.1",
+  "reviewedAt": "2026-07-17",
   "defaults": {
     "acceptanceWindowHours": 72,
     "requiredRecovery": "automatic retry without irreversible loss",
@@ -126,6 +126,23 @@
       "deletion": "source/video purge and policy-driven cache expiry",
       "productionState": "disabled-without-approved-key",
       "acceptanceState": "blocked-on-credential-and-rights"
+    },
+    {
+      "id": "bluesky",
+      "priority": "experimental",
+      "signalFamilies": ["discussion"],
+      "discovery": "legacy Jetstream filtered public post stream; AppView rechecks exact AT URI, CID and author DID for analyst context, but V1 keeps every Bluesky item discovery-only",
+      "incrementalKey": "Jetstream Unix-microsecond cursor with a bounded replay overlap",
+      "refresh": "bounded live tail; disabled by default",
+      "backfill": "disabled; replay overlap is for idempotent gap recovery only",
+      "quotaModel": "public best-effort endpoints with no assumed SLA or contractual numeric quota",
+      "worstCaseCostRmbPerRun": 0,
+      "rightsPolicyId": "bluesky-appview-jetstream-experimental-v1",
+      "rightsStatus": "experimental",
+      "storedFields": ["DID", "AT URI", "post text excerpt", "AppView identity-verification flag", "provenance level"],
+      "deletion": "delete raw discovery envelope, observation, metric snapshots and derived membership; retain only policy-approved tombstone hashes",
+      "productionState": "disabled-by-default",
+      "acceptanceState": "blocked-on-rights-and-72h-soak"
     },
     {
       "id": "x",

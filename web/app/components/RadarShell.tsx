@@ -136,6 +136,9 @@ type DecisionContext = { queueEligibilityKey: string | null; alertDeliveryKey: s
 
 function DetailPanel({ event, peers, assessment, decisionContext, lineage, windowSize, watched, onWatchChange, onLineageRefresh, onInteraction, onClose }: { event: RadarEvent; peers: RadarEvent[]; assessment: EventAssessment | null; decisionContext: DecisionContext | null; lineage: EventLineage | null; windowSize: string; watched: boolean; onWatchChange: (eventId: string, watched: boolean) => void; onLineageRefresh: () => void; onInteraction: (kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled", eventId: string, metadata?: Record<string, string | number | boolean>) => Promise<void>; onClose: () => void }) {
   const latest = event.timeline[event.timeline.length - 1] ?? { attention: event.attention, behavior: event.behavior };
+  const visibleVerifiedEvidence = event.evidence.filter((item) => item.provenanceLevel !== "unverified_discovery");
+  const unverifiedEvidenceCount = event.evidence.length - visibleVerifiedEvidence.length;
+  const totalVerifiedEvidence = Math.max(event.evidenceCount ?? 0, visibleVerifiedEvidence.length);
   const hasDiscussion = assessment ? assessment.evidenceMask.discussion === "observed" : discussionObserved(event);
   const hasBehavior = assessment ? assessment.evidenceMask.behavior === "observed" : behaviorObserved(event);
   const counterSignals = [
@@ -342,7 +345,7 @@ function DetailPanel({ event, peers, assessment, decisionContext, lineage, windo
       {assessment && <section className="verdict-card assessment-card">
         <div className="section-kicker"><ShieldCheck size={14} /> 证据完整性</div>
         <p>已观测权重 {Math.round(assessment.observedFeatureWeight * 100)}% · 基线成熟度 {Math.round(assessment.baselineMaturity * 100)}% · 聚类置信度 {Math.round(assessment.clusterConfidence * 100)}% · 不确定性 {Math.round(assessment.uncertainty)}%</p>
-        <div className="label-row">{Object.entries(assessment.evidenceMask).map(([feature, state]) => <span className="structure-label" key={feature}>{feature}: {state === "observed" ? "已观测" : state === "not_applicable" ? "不适用" : "缺失"}</span>)}</div>
+        <div className="label-row">{Object.entries(assessment.evidenceMask).map(([feature, state]) => <span className="structure-label" key={feature}>{feature}: {state === "observed" ? "已观测" : state === "not_applicable" ? "不适用" : state === "untrusted" ? "未复核" : "缺失"}</span>)}</div>
         {assessment.missingEvidence.length > 0 && <ul>{assessment.missingEvidence.map((gap) => <li key={gap.feature}>{gap.reason}；{gap.impact}</li>)}</ul>}
       </section>}
       <section className="counter-card">
@@ -384,11 +387,11 @@ function DetailPanel({ event, peers, assessment, decisionContext, lineage, windo
         <div className="propagation-flow">{event.platforms.map((platform, index) => <div className="propagation-step" key={platform}><i>{String(index + 1).padStart(2, "0")}</i><b>{platform}</b>{index < event.platforms.length - 1 && <ChevronRight size={13} />}</div>)}</div>
       </section>
       <section className="evidence-section">
-        <div className="section-title"><span>证据链</span><span>显示 {event.evidence.length} / {Math.max(event.evidenceCount ?? 0, event.evidence.length)} 项可核验</span></div>
+        <div className="section-title"><span>证据链</span><span>已复核 {visibleVerifiedEvidence.length} / {totalVerifiedEvidence} 项{unverifiedEvidenceCount > 0 ? ` · 未复核候选 ${unverifiedEvidenceCount}` : ""}</span></div>
         <div className="evidence-list">{event.evidence.map((item, index) => (
           <a className="evidence-item" href={item.url} target="_blank" rel="noreferrer" key={item.id} onClick={() => { void onInteraction("evidence_opened", event.id, { evidenceId: item.id, platform: item.platform }); }}>
             <span className={`evidence-index evidence-${item.kind}`}>{String(index + 1).padStart(2, "0")}</span>
-            <div><b>{item.title}</b><p>{item.excerpt}</p><small>{item.platform} · {item.source} · {timeAgo(item.publishedAt)}</small></div>
+            <div><b>{item.title}</b><p>{item.excerpt}</p><small>{item.platform} · {item.source} · {timeAgo(item.publishedAt)}{item.provenanceLevel === "unverified_discovery" && <span className="evidence-provenance-unverified"> · 未复核候选，不参与评分</span>}</small></div>
             <ChevronRight size={15} />
           </a>
         ))}</div>

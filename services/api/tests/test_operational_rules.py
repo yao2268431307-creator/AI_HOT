@@ -14,7 +14,8 @@ import pytest
 from redis.crc import key_slot
 
 from radar import stream_retention as retention_module
-from radar.alerts import AlertCandidate, AlertPolicyEngine
+from radar import alert_worker as alert_worker_module
+from radar.alerts import AlertCandidate, AlertPolicyEngine, WebhookResult
 from radar.alert_worker import AlertDispatcher
 from radar.budget import budget_guard
 from radar.contracts import AlertRuleRequest, EventType, EvidenceStrength, Observation
@@ -475,6 +476,67 @@ async def test_low_evidence_event_never_becomes_a_strong_alert_even_with_a_permi
 
 
 @pytest.mark.asyncio
+async def test_unverified_discovery_cannot_satisfy_three_evidence_alert_gate() -> None:
+    repository = seed_repository(InMemoryRepository())
+    event = repository.get_event("evt-open-model")
+    assert event is not None and len(event.evidence) >= 3
+    evidence = [
+        item.model_copy(update={
+            "provenance_level": "provider_verified" if index < 2 else "unverified_discovery",
+        })
+        for index, item in enumerate(event.evidence)
+    ]
+    repository.upsert_event(event.model_copy(update={"evidence": evidence, "evidence_count": 2}))
+    repository.add_alert(
+        AlertRuleRequest(name="strong", minimumAttention=0, minimumEvidenceStrength=0),
+        "workspace-a", "analyst-a",
+    )
+    summary = await AlertDispatcher(repository, signing_secret="test-secret").dispatch_event(
+        event.id, ["workspace-a"], NOW,
+    )
+    assert summary.evaluated == 1
+    assert summary.delivered == 0
+    assert repository.alert_deliveries == []
+
+
+@pytest.mark.asyncio
+async def test_webhook_payload_excludes_unverified_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    repository = seed_repository(InMemoryRepository())
+    event = repository.get_event("evt-open-model")
+    assert event is not None and len(event.evidence) >= 4
+    evidence = [
+        item.model_copy(update={
+            "provenance_level": "provider_verified" if index < 3 else "unverified_discovery",
+        })
+        for index, item in enumerate(event.evidence)
+    ]
+    repository.upsert_event(event.model_copy(update={"evidence": evidence, "evidence_count": 3}))
+    repository.add_alert(
+        AlertRuleRequest(
+            name="verified only", minimumAttention=0, minimumEvidenceStrength=0,
+            webhookUrl="https://hooks.example/radar",
+        ),
+        "workspace-a", "analyst-a",
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_delivery(
+        _url: str, payload: dict[str, object], *_args: object, **_kwargs: object,
+    ) -> WebhookResult:
+        captured.update(payload)
+        return WebhookResult(204, True)
+
+    monkeypatch.setattr(alert_worker_module, "deliver_webhook", fake_delivery)
+    summary = await AlertDispatcher(repository, signing_secret="test-secret").dispatch_event(
+        event.id, ["workspace-a"], NOW,
+    )
+    assert summary.delivered == 1
+    delivered_evidence = captured["evidence"]
+    assert isinstance(delivered_evidence, list) and len(delivered_evidence) == 3
+    assert all(item["provenanceLevel"] == "provider_verified" for item in delivered_evidence)
+
+
+@pytest.mark.asyncio
 async def test_unchanged_alert_does_not_reappear_after_midnight_and_cooldown() -> None:
     repository = seed_repository(InMemoryRepository())
     repository.add_alert(AlertRuleRequest(name="strong", minimumAttention=70, minimumEvidenceStrength=65), "workspace-a", "analyst-a")
@@ -550,6 +612,10 @@ def test_connector_registry_has_required_rights_cost_backfill_and_acceptance_fie
     assert len(payload["connectors"]) >= 8
     assert all(required.issubset(connector) for connector in payload["connectors"])
     assert all(connector["productionState"] == "disabled" for connector in payload["connectors"] if connector["id"] == "x")
+    bluesky = next(connector for connector in payload["connectors"] if connector["id"] == "bluesky")
+    assert bluesky["rightsStatus"] == "experimental"
+    assert bluesky["productionState"] == "disabled-by-default"
+    assert bluesky["acceptanceState"] == "blocked-on-rights-and-72h-soak"
     assert all(connector["rightsStatus"] != "active" for connector in payload["connectors"])
 
 

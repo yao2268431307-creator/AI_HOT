@@ -39,6 +39,21 @@ def ensure_safe_public_url(url: str) -> None:
         raise ConnectorError("private network destinations are blocked")
 
 
+def ensure_safe_public_websocket_url(url: str) -> None:
+    parts = urlsplit(url)
+    if parts.scheme not in {"ws", "wss"} or not parts.hostname or parts.username or parts.password:
+        raise ConnectorError("only credential-free absolute ws(s) URLs are allowed")
+    host = parts.hostname.lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise ConnectorError("local network destinations are blocked")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return
+    if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
+        raise ConnectorError("private network destinations are blocked")
+
+
 def _resolve_public_host(host: str) -> None:
     try:
         addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
@@ -52,6 +67,13 @@ def _resolve_public_host(host: str) -> None:
 
 async def ensure_safe_public_url_resolved(url: str) -> None:
     ensure_safe_public_url(url)
+    host = urlsplit(url).hostname
+    if host:
+        await asyncio.to_thread(_resolve_public_host, host)
+
+
+async def ensure_safe_public_websocket_url_resolved(url: str) -> None:
+    ensure_safe_public_websocket_url(url)
     host = urlsplit(url).hostname
     if host:
         await asyncio.to_thread(_resolve_public_host, host)

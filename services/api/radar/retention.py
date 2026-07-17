@@ -32,6 +32,12 @@ class RawEvidenceRetentionWorker:
         # Confirm independently. A poison object is retried with backoff and
         # cannot block unrelated deletions or be mistaken for a success.
         for reference in references:
+            # Re-check after claiming the durable row and immediately before
+            # the external mutation. Connector raw refs are immutable revision
+            # keys, so a newly archived revision never reuses this object name.
+            if self.repository.raw_evidence_is_referenced(reference):
+                self.repository.release_raw_evidence_deletion(reference)
+                continue
             try:
                 await self.objects.delete_many([reference])
             except Exception as exc:  # noqa: BLE001 - durable queue owns retries

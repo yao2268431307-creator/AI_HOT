@@ -70,6 +70,9 @@ class EvidenceStrength(StrEnum):
     HIGH = "high"
 
 
+ProvenanceLevel = Literal["self_authenticating", "provider_verified", "unverified_discovery"]
+
+
 class Estimate(BaseModel):
     point: float = Field(ge=0, le=100)
     low: float = Field(ge=0, le=100)
@@ -111,6 +114,7 @@ class Observation(BaseModel):
     relation: Literal["original", "repost", "quote", "unknown"] = "unknown"
     content_fingerprint: str | None = Field(default=None, alias="contentFingerprint")
     signal_family: Literal["discussion", "behavior", "official", "research"] = Field(alias="signalFamily")
+    provenance_level: ProvenanceLevel = Field(default="provider_verified", alias="provenanceLevel")
 
     model_config = {"populate_by_name": True}
 
@@ -134,6 +138,12 @@ class Observation(BaseModel):
             raise ValueError("raw evidence references must use r2://bucket/key without traversal")
         return value
 
+    @model_validator(mode="after")
+    def unverified_discovery_has_no_metrics(self) -> Observation:
+        if self.provenance_level == "unverified_discovery" and self.metrics:
+            raise ValueError("unverified discovery observations cannot carry metric snapshots")
+        return self
+
 
 class ContentObservation(BaseModel):
     id: str
@@ -154,6 +164,7 @@ class ContentObservation(BaseModel):
     raw_ref: str | None = Field(default=None, alias="rawRef")
     parser_version: str = Field(alias="parserVersion")
     rights_policy_id: str = Field(alias="rightsPolicyId")
+    provenance_level: ProvenanceLevel = Field(default="provider_verified", alias="provenanceLevel")
     deletion_state: Literal["active", "tombstoned", "deleted"] = Field(default="active", alias="deletionState")
 
     model_config = {"populate_by_name": True}
@@ -188,6 +199,7 @@ class Evidence(BaseModel):
     published_at: datetime = Field(alias="publishedAt")
     kind: Literal["discussion", "behavior", "official", "research"]
     excerpt: str = Field(max_length=2000)
+    provenance_level: ProvenanceLevel = Field(default="provider_verified", alias="provenanceLevel")
 
     model_config = {"populate_by_name": True}
 

@@ -14,7 +14,7 @@ import httpx
 from redis.asyncio import Redis
 
 from .alerts import AlertCandidate, AlertDecision, AlertPolicyEngine, deliver_webhook
-from .contracts import AlertRuleRequest, RadarEvent
+from .contracts import AlertRuleRequest, Evidence, RadarEvent
 from .deletion import SourceDeletionConsumer
 from .evidence_store import LocalEvidenceStore, S3EvidenceStore
 from .outbox import register_stream_participant, release_stream_participant, renew_stream_participant
@@ -51,10 +51,18 @@ class AlertDispatcher:
         self.client = client
 
     @staticmethod
+    def _verified_evidence(event: RadarEvent) -> list[Evidence]:
+        return [item for item in event.evidence if item.provenance_level != "unverified_discovery"]
+
+    @classmethod
+    def _verified_evidence_count(cls, event: RadarEvent) -> int:
+        return max(event.evidence_count, len(cls._verified_evidence(event)))
+
+    @staticmethod
     def _candidate(event: RadarEvent, workspace_id: str, previous: dict[str, object] | None, now: datetime) -> AlertCandidate:
         previous_count = int(previous["evidenceCount"]) if previous else 0
         previous_state = str(previous["lifecycleState"]) if previous else "insufficient_data"
-        evidence_count = event.evidence_count or len(event.evidence)
+        evidence_count = AlertDispatcher._verified_evidence_count(event)
         return AlertCandidate(
             workspace_id=workspace_id, event_id=event.id, domain=event.event_type.value,
             lifecycle_state=event.state.value, evidence_strength=event.evidence_strength.value,
@@ -78,7 +86,10 @@ class AlertDispatcher:
             "structureLabels": [label.value for label in event.labels],
             "attention": event.attention, "behavior": event.behavior,
             "evidenceStrength": event.evidence_strength.value, "coverageNote": event.coverage_note,
-            "evidence": [item.model_dump(mode="json", by_alias=True) for item in event.evidence[:3]],
+            "evidence": [
+                item.model_dump(mode="json", by_alias=True)
+                for item in self._verified_evidence(event)[:3]
+            ],
             "scoreVersion": event.score_version, "clusterVersion": event.cluster_version,
         }
         result = await deliver_webhook(
@@ -179,7 +190,8 @@ class AlertDispatcher:
                 # Strong alerts must be independently auditable from the message.
                 # Low-evidence events stay in the review queue even when a
                 # workspace rule was configured too permissively.
-                if event.evidence_strength.value == "low" or len(event.evidence) < 3:
+                verified_evidence = self._verified_evidence(event)
+                if event.evidence_strength.value == "low" or len(verified_evidence) < 3:
                     skipped += 1
                     continue
                 decision: AlertDecision = policy.evaluate(candidate)
@@ -190,7 +202,8 @@ class AlertDispatcher:
                 delivery = {
                     "ruleId": rule_id, "workspaceId": workspace_id, "eventId": event.id,
                     "domain": event.event_type.value, "lifecycleState": event.state.value,
-                    "evidenceStrength": event.evidence_strength.value, "evidenceCount": event.evidence_count or len(event.evidence),
+                    "evidenceStrength": event.evidence_strength.value,
+                    "evidenceCount": self._verified_evidence_count(event),
                     "channel": channel, "deliveredAt": now, "idempotencyKey": idempotency_key,
                 }
                 if not self.repository.reserve_alert_delivery(delivery, allow_cooldown_bypass=candidate.state_upgraded):

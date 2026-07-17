@@ -50,6 +50,8 @@
 | C-10 | 选择性物理删除 | 搜索响应同时含两个不同来源的 item，删除其中一个来源 | 原始对象逐 item 分片；目标对象物理删除，保留对象中不含目标来源正文 |
 | C-11 | Checkpoint | 成功采集后重启；失败采集后重启 | 仅成功轮推进持久化 checkpoint；失败轮保留旧游标并安全重试 |
 | C-12 | 真实公共 smoke | HN/GitHub/HF/arXiv/OpenAlex 执行一次有界公开元数据读取 | 五源返回 Observation；空作者 ID 不使整批失败；异常未来日期回落到首次采集时间；结果不得冒充 72H soak |
+| C-13 | Bluesky 快照核验与生命周期围栏 | Jetstream AI 命中分别收到精确 AppView 匹配、CID 不匹配、AppView 5xx 和超过 25 个候选 | 精确 URI/CID/DID 匹配只在 raw envelope 记录 `identityVerified=true`，Observation 仍为无指标 `unverified_discovery`；5xx 使整轮 degraded 且 checkpoint 不动；每轮在 AppView 边界停止，不越过未处理候选 |
+| C-14 | 未复核候选围栏 | 仅有高表面热度的 `unverified_discovery`，或两项已复核证据加一项未复核候选 | 候选不创建 score run、不抬高 D/T/O/C/独立信源，不满足三证据告警门槛，Webhook 不含未复核候选 |
 | A-01 | 安全 | Webhook 指向 loopback/private IP | SSRF 校验拒绝 |
 | A-02 | 安全 | 相同 JSON 不同字段顺序 | HMAC 签名保持一致 |
 | A-03 | Webhook | 出站消息与重放校验 | 签名覆盖时间戳，带幂等键与 key ID；超过五分钟或超体积拒绝 |
@@ -115,7 +117,7 @@
 
 | 编号 | 场景 | 预期 |
 |---|---|---|
-| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc2.6`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过，health 返回 production-ready |
+| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc2.9`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过，health 返回 production-ready |
 | I-02 | 跨 workspace 查询告警规则，尝试修改 append-only 晋级事实和迁移 marker | workspace-b 看不到 workspace-a 行；晋级事实 UPDATE 被 trigger 拒绝；应用角色不能改迁移 marker |
 | I-03 | 两线程并发写同一 source+fingerprint | 两条 Observation 均可审计，信源有效观测只增加一次，并记录重复发现原因 |
 | I-04 | 插入真实 PG Outbox 后发布到真实 Redis Stream | 流中字段和 payload 一致；Outbox 标记已发布、尝试次数为 1、无错误 |
@@ -128,6 +130,7 @@
 | I-11 | 重放命令续跑和目标保护 | 完成状态、最后 `(created_at,id)`、Redis Stream ID、累计数与围栏协议版本写入检查点；Stream 与恢复键处于同一 Redis Cluster slot；续跑以磁盘临时账本精确对账 PG 期望前缀和 Redis 去重后的完整 ID 顺序，两条 PG 仅保留末条 Stream 的伪检查点必须拒绝；取消发生在后台线程持有临时 SQLite 时仍保留原 `CancelledError` 并零残留；丢失/篡改/旧协议检查点、锁被替换、活跃 publisher/consumer、已完成窗口或无检查点既有 Stream 也均 fail closed，锁丢失时不得 XADD 或前移检查点 |
 | I-12 | 告警 reservation 后 confirm 失败，随后事件/规则更新或删除 | 身份绑定稳定 `outbox_id`；in-app 恢复为唯一 delivered；Webhook 无快照/规则或重试耗尽时变为可查询的 `aborted + terminalReason`，重复消息视为终态跳过 |
 | I-13 | 两个不同进度的 Redis consumer group 执行安全保留 | 活跃 publisher 租约阻断维护；过期 participant 与被替换的 exclusive token 均不能 XADD；PEL 为全局最早水位并保留较慢组尚未读取消息；最终 Lua 原子校验排他 token、续租、复核完整组状态并裁剪，新增组或锁替换均拒绝；execute 绑定 dry-run ID；只精确删除当前恢复工具支持且已发布的 Outbox 前缀；并发 PG 删除被行锁阻断；错误 kind/缺失事实时 fail closed 且 Stream 不变 |
+| I-14 | PostgreSQL 通用来源可信级别升级 | 构造一个支持后续 provider 复核的通用稳定 Observation ID，先写 `unverified_discovery`，后写已复核 revision | 未复核阶段有效信源观测为 0 且任何伪指标不落库；单向升级原子覆盖已复核正文/指纹，只增加一次去重有效观测，旧候选对象进入删除队列，并调度新的 processing revision；不得从已复核降级。当前 Bluesky 不走此升级路径 |
 
 ## 必须在真实环境执行的验收
 

@@ -141,31 +141,84 @@ class InMemoryRepository:
         """Observation and outbox record share the same lock/commit boundary."""
         with self._lock:
             content, snapshots = split_observation(observation)
+            if observation.provenance_level == "unverified_discovery":
+                snapshots = []
             content_inserted = observation.id not in self.observations
-            if content_inserted:
-                source_content_key = (observation.source_id, content.content_hash)
-                source_content_duplicate = source_content_key in self.source_content_fingerprints
-                self.source_content_fingerprints.add(source_content_key)
-                self.observations[observation.id] = observation
-                if not source_content_duplicate:
+            provenance_upgraded = False
+            if not content_inserted:
+                existing = self.observations[observation.id]
+                provenance_upgraded = (
+                    existing.provenance_level == "unverified_discovery"
+                    and observation.provenance_level != "unverified_discovery"
+                )
+                if provenance_upgraded:
+                    previous_raw_ref = existing.raw_evidence_ref
+                    self.observations[observation.id] = observation
+                    source_content_key = (observation.source_id, content.content_hash)
+                    source_content_duplicate = source_content_key in self.source_content_fingerprints
+                    self.source_content_fingerprints.add(source_content_key)
                     self.register_source_candidate(
                         source_id=observation.source_id,
                         display_name=observation.source_id,
                         platform=observation.platform,
                         language=observation.language,
                         observed_at=observation.collected_at,
-                        reason=f"connector_observation:{content.connector}",
+                        reason=(
+                            "provider_verified_upgrade"
+                            if not source_content_duplicate else "duplicate_content_observation"
+                        ),
                         account_id=observation.account_id,
                         entity_id=observation.entity_id,
+                        counts_as_valid=not source_content_duplicate,
                     )
-                elif observation.source_id in self.source_profiles:
-                    profile = self.source_profiles[observation.source_id]
-                    profile["lastObservedAt"] = max(profile["lastObservedAt"], observation.collected_at)
-                    profile["discoveryReasons"].add("duplicate_content_observation")
-                    if observation.account_id:
-                        profile["accountIds"].add(observation.account_id)
-                    if observation.entity_id:
-                        profile["entityIds"].add(observation.entity_id)
+                    remaining_raw_refs = {
+                        item.raw_evidence_ref for item in self.observations.values() if item.raw_evidence_ref
+                    } | {
+                        item.source_revision for item in self.metric_facts.values() if item.source_revision
+                    }
+                    if previous_raw_ref and previous_raw_ref != observation.raw_evidence_ref and previous_raw_ref not in remaining_raw_refs:
+                        self.raw_evidence_deletions[previous_raw_ref] = {
+                            "rightsPolicyId": existing.rights_policy_id, "status": "pending", "attempts": 0,
+                            "nextAttemptAt": utcnow(), "leaseUntil": None, "lastError": None,
+                        }
+                elif observation.provenance_level == "unverified_discovery":
+                    # A trusted row must never be downgraded by a transient
+                    # hydration failure. The connector has already archived this
+                    # ignored revision, so queue its unique object for deletion
+                    # instead of leaving an untracked orphan.
+                    remaining_raw_refs = {
+                        item.raw_evidence_ref for item in self.observations.values() if item.raw_evidence_ref
+                    } | {
+                        item.source_revision for item in self.metric_facts.values() if item.source_revision
+                    }
+                    if observation.raw_evidence_ref and observation.raw_evidence_ref not in remaining_raw_refs:
+                        self.raw_evidence_deletions[observation.raw_evidence_ref] = {
+                            "rightsPolicyId": observation.rights_policy_id, "status": "pending", "attempts": 0,
+                            "nextAttemptAt": utcnow(), "leaseUntil": None, "lastError": None,
+                        }
+            if content_inserted:
+                source_content_key = (observation.source_id, content.content_hash)
+                source_content_duplicate = source_content_key in self.source_content_fingerprints
+                trusted = observation.provenance_level != "unverified_discovery"
+                if trusted:
+                    self.source_content_fingerprints.add(source_content_key)
+                self.observations[observation.id] = observation
+                reason = (
+                    "unverified_discovery" if not trusted
+                    else "duplicate_content_observation" if source_content_duplicate
+                    else f"connector_observation:{content.connector}"
+                )
+                self.register_source_candidate(
+                    source_id=observation.source_id,
+                    display_name=observation.source_id,
+                    platform=observation.platform,
+                    language=observation.language,
+                    observed_at=observation.collected_at,
+                    reason=reason,
+                    account_id=observation.account_id,
+                    entity_id=observation.entity_id,
+                    counts_as_valid=trusted and not source_content_duplicate,
+                )
                 self.content_ingest_history.append({
                     "observationId": observation.id, "connectorId": content.connector,
                     "contentFingerprint": observation.content_fingerprint or content.content_hash,
@@ -177,7 +230,7 @@ class InMemoryRepository:
                 self.metric_facts[snapshot.id] = snapshot
             if new_snapshots:
                 self.outbox.append({"id": str(uuid.uuid4()), "kind": "metric_snapshots.created", "aggregate_id": observation.id, "created_at": utcnow(), "snapshot_ids": [item.id for item in new_snapshots]})
-            changed = content_inserted or bool(new_snapshots)
+            changed = content_inserted or provenance_upgraded or bool(new_snapshots)
             if changed:
                 state = self.observation_processing.setdefault(observation.id, {"revision": 0, "processedRevision": 0, "attempts": 0, "leaseUntil": None, "lastError": None})
                 state["revision"] = int(state["revision"]) + 1
@@ -196,6 +249,7 @@ class InMemoryRepository:
     def register_source_candidate(
         self, *, source_id: str, display_name: str, platform: str, language: str,
         observed_at: datetime, reason: str, account_id: str | None = None, entity_id: str | None = None,
+        counts_as_valid: bool = True,
     ) -> None:
         with self._lock:
             profile = self.source_profiles.setdefault(source_id, {
@@ -207,7 +261,8 @@ class InMemoryRepository:
                 "entityIds": set(), "createdAt": observed_at, "firstObservedAt": observed_at,
                 "lastObservedAt": observed_at, "activatedAt": None,
             })
-            profile["validObservations"] = int(profile["validObservations"]) + 1
+            if counts_as_valid:
+                profile["validObservations"] = int(profile["validObservations"]) + 1
             profile["lastObservedAt"] = max(profile["lastObservedAt"], observed_at)
             profile["firstObservedAt"] = min(profile["firstObservedAt"], observed_at)
             profile["discoveryReasons"].add(reason)
@@ -509,12 +564,26 @@ class InMemoryRepository:
             for reference, item in self.raw_evidence_deletions.items():
                 if item["status"] != "pending" or item["nextAttemptAt"] > at or (item["leaseUntil"] and item["leaseUntil"] > at):
                     continue
+                if reference in remaining:
+                    continue
                 item["attempts"] = int(item["attempts"]) + 1
                 item["leaseUntil"] = at + timedelta(minutes=5)
                 pending.append(reference)
                 if len(pending) >= 1000:
                     break
             return pending
+
+    def raw_evidence_is_referenced(self, reference: str) -> bool:
+        with self._lock:
+            return any(item.raw_evidence_ref == reference for item in self.observations.values()) or any(
+                item.source_revision == reference for item in self.metric_facts.values()
+            )
+
+    def release_raw_evidence_deletion(self, reference: str) -> None:
+        with self._lock:
+            item = self.raw_evidence_deletions.get(reference)
+            if item and item["status"] == "pending":
+                item["leaseUntil"] = None
 
     def confirm_raw_evidence_deletions(self, references: list[str]) -> None:
         with self._lock:
@@ -646,7 +715,7 @@ class InMemoryRepository:
         return receipt
 
     @staticmethod
-    def _successor_event(template: RadarEvent, event_id: str, version: int, operation_id: str, operation: str, member_count: int, parent_cluster_id: str) -> RadarEvent:
+    def _successor_event(template: RadarEvent, event_id: str, version: int, operation_id: str, operation: str, _member_count: int, parent_cluster_id: str) -> RadarEvent:
         now = utcnow()
         return template.model_copy(update={
             "id": event_id, "cluster_version": version, "parent_cluster_id": parent_cluster_id,
@@ -657,7 +726,11 @@ class InMemoryRepository:
             "evidence_strength": EvidenceStrength.LOW, "discussion_evidence_state": EvidenceState.MISSING,
             "behavior_evidence_state": EvidenceState.MISSING, "evidence_score": 0, "velocity": 0, "gap_residual": 0,
             "updated_at": now, "independent_sources": 0, "platforms": [], "signal_families": [],
-            "evidence_count": member_count, "driver": "聚类成员已修订，等待新版本重新评分。",
+            # Membership is not evidence strength. In particular, discovery-only
+            # members must never inflate this public/alert-facing field. A fresh
+            # trusted scoring pass rebuilds the count from provenance-filtered
+            # observations.
+            "evidence_count": 0, "driver": "聚类成员已修订，等待新版本重新评分。",
             "coverage_note": "合并/拆分后的新事件尚未完成评分，不输出强结论。", "timeline": [], "evidence": [],
         })
 
@@ -1200,24 +1273,122 @@ class PostgresRepository:
 
     def save_observation_with_outbox(self, observation: Observation) -> bool:
         content, snapshots = split_observation(observation)
+        if observation.provenance_level == "unverified_discovery":
+            snapshots = []
         digest = content.content_hash
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO observations (id,schema_version,connector,platform,external_id,source_id,account_id,entity_id,published_at,collected_at,
-                      language,title,body,url,normalized_url,content_fingerprint,metrics,raw_evidence_ref,parser_version,rights_policy_id,deletion_state,signal_family)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb,%s,%s,%s,%s,%s)
+                      language,title,body,url,normalized_url,content_fingerprint,metrics,raw_evidence_ref,parser_version,rights_policy_id,provenance_level,deletion_state,signal_family)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (id) DO NOTHING RETURNING id
                     """,
                     (content.id, content.schema_version, content.connector, content.platform, content.external_id, observation.source_id,
                      content.account_id, content.entity_id, content.published_at, content.collected_at, content.language, content.title,
                      content.text_excerpt, observation.url, content.canonical_url, digest, content.raw_ref or "", content.parser_version,
-                     content.rights_policy_id, content.deletion_state, observation.signal_family),
+                     content.rights_policy_id, content.provenance_level, content.deletion_state, observation.signal_family),
                 )
                 content_inserted = cursor.fetchone() is not None
+                provenance_upgraded = False
+                previous_raw_ref: str | None = None
+                if not content_inserted and observation.provenance_level != "unverified_discovery":
+                    cursor.execute(
+                        """SELECT raw_evidence_ref FROM observations
+                        WHERE id=%s AND provenance_level='unverified_discovery' FOR UPDATE""",
+                        (observation.id,),
+                    )
+                    previous_row = cursor.fetchone()
+                    if previous_row is not None:
+                        previous_raw_ref = str(previous_row[0])
+                        cursor.execute(
+                            """UPDATE observations SET
+                              schema_version=%s,connector=%s,platform=%s,external_id=%s,source_id=%s,
+                              account_id=%s,entity_id=%s,published_at=%s,collected_at=%s,language=%s,
+                              title=%s,body=%s,url=%s,normalized_url=%s,content_fingerprint=%s,
+                              raw_evidence_ref=%s,parser_version=%s,rights_policy_id=%s,
+                              provenance_level=%s,deletion_state=%s,signal_family=%s
+                            WHERE id=%s AND provenance_level='unverified_discovery'""",
+                            (
+                                content.schema_version, content.connector, content.platform, content.external_id,
+                                observation.source_id, content.account_id, content.entity_id, content.published_at,
+                                content.collected_at, content.language, content.title, content.text_excerpt,
+                                observation.url, content.canonical_url, digest, content.raw_ref or "",
+                                content.parser_version, content.rights_policy_id, content.provenance_level,
+                                content.deletion_state, observation.signal_family, observation.id,
+                            ),
+                        )
+                        provenance_upgraded = cursor.rowcount == 1
+                    if provenance_upgraded:
+                        cursor.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                            (f"source-valid-observation:{observation.source_id}:{digest}",),
+                        )
+                        cursor.execute(
+                            """UPDATE sources SET valid_observations=valid_observations+1,
+                            last_observed_at=GREATEST(last_observed_at,%s),
+                            discovery_reasons=ARRAY(
+                              SELECT DISTINCT reason FROM unnest(discovery_reasons||ARRAY['provider_verified_upgrade']) reason
+                            ),updated_at=clock_timestamp()
+                            WHERE id=%s AND NOT EXISTS (
+                              SELECT 1 FROM observations
+                              WHERE source_id=%s AND content_fingerprint=%s AND id<>%s
+                                AND provenance_level<>'unverified_discovery'
+                            )""",
+                            (
+                                observation.collected_at, observation.source_id, observation.source_id,
+                                digest, observation.id,
+                            ),
+                        )
+                        if cursor.rowcount == 0:
+                            cursor.execute(
+                                """UPDATE sources SET last_observed_at=GREATEST(last_observed_at,%s),
+                                discovery_reasons=ARRAY(
+                                  SELECT DISTINCT reason FROM unnest(discovery_reasons||ARRAY['duplicate_content_observation']) reason
+                                ),updated_at=clock_timestamp() WHERE id=%s""",
+                                (observation.collected_at, observation.source_id),
+                            )
+                        if previous_raw_ref and previous_raw_ref != observation.raw_evidence_ref:
+                            cursor.execute(
+                                """INSERT INTO raw_evidence_deletions (reference,rights_policy_id)
+                                SELECT %s,%s WHERE NOT EXISTS (
+                                  SELECT 1 FROM observations WHERE raw_evidence_ref=%s
+                                ) AND NOT EXISTS (
+                                  SELECT 1 FROM metric_snapshots WHERE source_revision=%s
+                                ) ON CONFLICT (reference) DO NOTHING""",
+                                (
+                                    previous_raw_ref, observation.rights_policy_id,
+                                    previous_raw_ref, previous_raw_ref,
+                                ),
+                            )
+                        cursor.execute(
+                            """INSERT INTO content_ingest_history
+                            (observation_id,connector_id,content_fingerprint,persisted_at)
+                            VALUES (%s,%s,%s,clock_timestamp())""",
+                            (observation.id, content.connector, digest),
+                        )
+                elif not content_inserted and observation.provenance_level == "unverified_discovery":
+                    cursor.execute(
+                        """INSERT INTO raw_evidence_deletions
+                        (reference,rights_policy_id,status,attempts,next_attempt_at,lease_until,last_error,deleted_at)
+                        SELECT %s,%s,'pending',0,clock_timestamp(),NULL,NULL,NULL
+                        WHERE %s<>''
+                          AND NOT EXISTS (SELECT 1 FROM observations WHERE raw_evidence_ref=%s)
+                          AND NOT EXISTS (SELECT 1 FROM metric_snapshots WHERE source_revision=%s)
+                        ON CONFLICT (reference) DO UPDATE SET
+                          rights_policy_id=excluded.rights_policy_id,status='pending',attempts=0,
+                          next_attempt_at=clock_timestamp(),lease_until=NULL,last_error=NULL,deleted_at=NULL""",
+                        (
+                            observation.raw_evidence_ref, observation.rights_policy_id,
+                            observation.raw_evidence_ref, observation.raw_evidence_ref,
+                            observation.raw_evidence_ref,
+                        ),
+                    )
                 if content_inserted:
-                    discovery_reason = f"connector_observation:{content.connector}"
+                    trusted = observation.provenance_level != "unverified_discovery"
+                    valid_increment = 1 if trusted else 0
+                    discovery_reason = f"connector_observation:{content.connector}" if trusted else "unverified_discovery"
                     # The observation rows themselves intentionally allow duplicate
                     # fingerprints so data-quality leakage remains measurable. This
                     # lock serializes only the source-validity claim: after waiting,
@@ -1230,13 +1401,14 @@ class PostgresRepository:
                         """INSERT INTO sources
                         (id,platform,display_name,status,language,valid_observations,
                          discovered_reason,discovery_reasons,first_observed_at,last_observed_at)
-                        SELECT %s,%s,%s,'candidate',%s,1,%s,ARRAY[%s]::text[],%s,%s
-                        WHERE NOT EXISTS (
+                        SELECT %s,%s,%s,'candidate',%s,%s,%s,ARRAY[%s]::text[],%s,%s
+                        WHERE %s=0 OR NOT EXISTS (
                           SELECT 1 FROM observations
                           WHERE source_id=%s AND content_fingerprint=%s AND id<>%s
+                            AND provenance_level<>'unverified_discovery'
                         )
                         ON CONFLICT (id) DO UPDATE SET
-                          valid_observations=sources.valid_observations+1,
+                          valid_observations=sources.valid_observations+excluded.valid_observations,
                           last_observed_at=GREATEST(sources.last_observed_at,excluded.last_observed_at),
                           first_observed_at=LEAST(sources.first_observed_at,excluded.first_observed_at),
                           discovery_reasons=ARRAY(
@@ -1245,8 +1417,9 @@ class PostgresRepository:
                           updated_at=clock_timestamp()""",
                         (
                             observation.source_id, observation.platform, observation.source_id,
-                            observation.language, discovery_reason, discovery_reason,
+                            observation.language, valid_increment, discovery_reason, discovery_reason,
                             observation.collected_at, observation.collected_at,
+                            valid_increment,
                             observation.source_id, digest, observation.id,
                         ),
                     )
@@ -1279,7 +1452,7 @@ class PostgresRepository:
                         snapshot_ids.append(snapshot.id)
                 if snapshot_ids:
                     cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('metric_snapshots.created',%s,%s::jsonb)", (observation.id, json.dumps({"snapshotIds": snapshot_ids})))
-                if content_inserted or snapshot_ids:
+                if content_inserted or provenance_upgraded or snapshot_ids:
                     cursor.execute(
                         """
                         INSERT INTO observation_processing (observation_id,revision,processed_revision)
@@ -1297,7 +1470,7 @@ class PostgresRepository:
                         (observation.id, revision, observation.collected_at),
                     )
             connection.commit()
-        return content_inserted or bool(snapshot_ids)
+        return content_inserted or provenance_upgraded or bool(snapshot_ids)
 
     def list_source_profiles(self) -> list[dict[str, object]]:
         with self.connection() as connection:
@@ -1477,7 +1650,7 @@ class PostgresRepository:
                 cursor.execute(
                     """
                     SELECT id,platform,external_id,source_id,account_id,entity_id,published_at,collected_at,
-                           language,title,body,url,raw_evidence_ref,content_fingerprint,signal_family,rights_policy_id
+                           language,title,body,url,raw_evidence_ref,content_fingerprint,signal_family,rights_policy_id,provenance_level
                     FROM observations WHERE id=%s
                     """,
                     (observation_id,),
@@ -1504,7 +1677,8 @@ class PostgresRepository:
         return Observation(
             id=row[0], platform=row[1], externalId=row[2], sourceId=row[3], accountId=row[4], entityId=row[5],
             publishedAt=row[6], collectedAt=collected_at, language=row[8], title=row[9], text=row[10], url=row[11],
-            metrics=metrics, rawEvidenceRef=raw_ref, contentFingerprint=row[13], signalFamily=row[14], rightsPolicyId=row[15], relation="unknown",
+            metrics=metrics, rawEvidenceRef=raw_ref, contentFingerprint=row[13], signalFamily=row[14], rightsPolicyId=row[15],
+            provenanceLevel=row[16], relation="unknown",
         )
 
     def upsert_event(self, event: RadarEvent) -> None:
@@ -1710,13 +1884,13 @@ class PostgresRepository:
                     SELECT o.id,o.platform,o.external_id,o.source_id,o.account_id,o.entity_id,o.published_at,
                       COALESCE(ms.collected_at,o.collected_at),o.language,o.title,o.body,o.url,
                       COALESCE(jsonb_object_agg(ms.metric_name,ms.value) FILTER (WHERE ms.metric_name IS NOT NULL),'{}'::jsonb),
-                      o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id
+                      o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id,o.provenance_level
                     FROM observations o
                     JOIN event_observations eo ON eo.observation_id=o.id
                     LEFT JOIN metric_snapshots ms ON ms.subject_id=o.id
                     WHERE eo.event_id=%s
                     GROUP BY o.id,o.platform,o.external_id,o.source_id,o.account_id,o.entity_id,o.published_at,
-                      o.collected_at,ms.collected_at,o.language,o.title,o.body,o.url,o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id
+                      o.collected_at,ms.collected_at,o.language,o.title,o.body,o.url,o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id,o.provenance_level
                     ORDER BY o.published_at,COALESCE(ms.collected_at,o.collected_at)
                     """,
                     (event_id,),
@@ -1725,7 +1899,8 @@ class PostgresRepository:
         return [Observation(
             id=row[0], platform=row[1], externalId=row[2], sourceId=row[3], accountId=row[4], entityId=row[5],
             publishedAt=row[6], collectedAt=row[7], language=row[8], title=row[9], text=row[10], url=row[11],
-            metrics=row[12], rawEvidenceRef=row[13], contentFingerprint=row[14], signalFamily=row[15], rightsPolicyId=row[16], relation="unknown",
+            metrics=row[12], rawEvidenceRef=row[13], contentFingerprint=row[14], signalFamily=row[15], rightsPolicyId=row[16],
+            provenanceLevel=row[17], relation="unknown",
         ) for row in rows]
 
     def get_event(self, event_id: str) -> RadarEvent | None:
@@ -1916,6 +2091,12 @@ class PostgresRepository:
                 cursor.execute(
                     """SELECT reference FROM raw_evidence_deletions
                     WHERE status='pending' AND next_attempt_at<=%s AND (lease_until IS NULL OR lease_until<=%s)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM observations WHERE raw_evidence_ref=raw_evidence_deletions.reference
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM metric_snapshots WHERE source_revision=raw_evidence_deletions.reference
+                      )
                     ORDER BY queued_at FOR UPDATE SKIP LOCKED LIMIT 1000""",
                     (at, at),
                 )
@@ -1928,6 +2109,25 @@ class PostgresRepository:
                     )
             connection.commit()
         return pending
+
+    def raw_evidence_is_referenced(self, reference: str) -> bool:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT EXISTS(SELECT 1 FROM observations WHERE raw_evidence_ref=%s)
+                    OR EXISTS(SELECT 1 FROM metric_snapshots WHERE source_revision=%s)""",
+                    (reference, reference),
+                )
+                return bool(cursor.fetchone()[0])
+
+    def release_raw_evidence_deletion(self, reference: str) -> None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE raw_evidence_deletions SET lease_until=NULL WHERE reference=%s AND status='pending'",
+                    (reference,),
+                )
+            connection.commit()
 
     def confirm_raw_evidence_deletions(self, references: list[str]) -> None:
         if not references:

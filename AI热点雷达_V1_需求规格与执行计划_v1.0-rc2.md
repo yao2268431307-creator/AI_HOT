@@ -646,8 +646,10 @@ stateDiagram-v2
 #### Bluesky
 
 - Jetstream 只用于候选发现。
-- 高置信证据通过 Firehose、AppView API 或原始页面复核。
-- Evidence 保存 provenanceLevel。
+- AppView 对 AT URI、CID 和作者 DID 三项精确一致只证明当前快照身份，不证明 Jetstream 的 update/delete 生命周期已被完整跟踪。
+- Observation 与 Evidence 保存 `provenanceLevel`：`self_authenticating`、`provider_verified`、`unverified_discovery`。
+- `unverified_discovery` 可进入候选聚类和分析师证据面板，但不得进入 D/T/O/C、独立信源数、有效信源观测数、强证据计数或告警 payload。当前 Bluesky V1 不会产生可评分的 `provider_verified`；须先实现 durable update/delete supersession、撤回后重评分与回归用例。
+- 连接器默认关闭；只有数据权利审批和独立 72H soak 通过后才可改变验收状态。
 
 #### arXiv/OpenAlex
 
@@ -666,7 +668,7 @@ stateDiagram-v2
 | GitHub REST API | 官方建议 Webhook 优先，并支持合适场景下的条件请求 | Webhook + ETag/Last-Modified + 分层刷新 |
 | Hugging Face Hub | API、Resolver 和 Page 使用不同限额桶，按短窗口计算 | 连接器分别记账并按响应头自适应 |
 | Google Trends API | 仍需申请 Alpha 访问 | 不进入 Beta 关键路径 |
-| Bluesky Jetstream | 事件不自带密码学认证且不是正式协议稳定接口 | 仅做候选发现，高置信证据回源复核 |
+| Bluesky Jetstream | 事件不自带密码学认证且不是正式协议稳定接口；截至 2026-07-17，原客户端协议实现已移至 `jetstream-legacy`，当前同名仓库正在开发新的 archive/server 且 1.0 前允许破坏性格式变更 | 固定为 disabled-by-default 的实验候选发现；AppView 快照身份核验只进证据 envelope，未实现 update/delete supersession 前不进评分；端点或 AppView 失败时整轮 fail closed 且不推进 checkpoint |
 
 ---
 

@@ -43,6 +43,8 @@ def _authority(observation: Observation) -> float:
 def _snapshots(observations: list[Observation]) -> list[SignalSnapshot]:
     grouped: dict[tuple[str, str], list[Observation]] = defaultdict(list)
     for observation in observations:
+        if observation.provenance_level == "unverified_discovery":
+            continue
         grouped[(observation.platform, observation.external_id)].append(observation)
     rows: list[SignalSnapshot] = []
     for items in grouped.values():
@@ -62,6 +64,27 @@ def _snapshots(observations: list[Observation]) -> list[SignalSnapshot]:
             content_fingerprint=current.content_fingerprint or "",
         ))
     return rows
+
+
+def _evidence_items(event_id: str, observations: list[Observation]) -> list[Evidence]:
+    evidence_items: list[Evidence] = []
+    seen_urls: set[str] = set()
+    ordered = sorted(
+        observations,
+        key=lambda item: (item.provenance_level == "unverified_discovery", item.published_at),
+    )
+    for item in ordered:
+        normalized = normalize_url(item.url)
+        if normalized in seen_urls:
+            continue
+        seen_urls.add(normalized)
+        evidence_items.append(Evidence(
+            id=f"{event_id}:{item.id}", source=item.source_id, platform=item.platform,
+            title=sanitize_external_text(item.title or item.text[:100]), url=item.url,
+            publishedAt=item.published_at, kind=item.signal_family,
+            excerpt=canonical_text(item.text)[:240], provenanceLevel=item.provenance_level,
+        ))
+    return evidence_items
 
 
 def _growth_streak(points: list[MetricPoint], current_attention: float, current_behavior: float) -> int:
@@ -162,15 +185,27 @@ class EventProcessor:
             id=f"{event_id}:{observation.id}", source=observation.source_id, platform=observation.platform,
             title=title, url=observation.url, publishedAt=observation.published_at,
             kind=observation.signal_family, excerpt=canonical_text(observation.text)[:240],
+            provenanceLevel=observation.provenance_level,
         )
+        trusted = observation.provenance_level != "unverified_discovery"
         return RadarEvent(
             id=event_id, title=title, titleEn=title, eventType=infer_event_type(observation),
             state=LifecycleState.INSUFFICIENT_DATA, labels=[], attention=0, behavior=0,
-            diversity=0, authority=_authority(observation), coordinationRisk=0, coverage=25,
+            diversity=0, authority=_authority(observation) if trusted else 0, coordinationRisk=0, coverage=25 if trusted else 0,
             uncertainty=100, evidenceStrength="low", evidenceScore=0, velocity=0, gapResidual=0,
             firstSeen=observation.published_at, updatedAt=observation.collected_at,
-            independentSources=1, platforms=[observation.platform],
-            driver="首条观测已入簇，等待独立信号家族确认。", coverageNote="仅有一个信号家族。",
+            independentSources=1 if trusted else 0, platforms=[observation.platform],
+            signalFamilies=[observation.signal_family] if trusted else [], evidenceCount=1 if trusted else 0,
+            discussionEvidenceState=(
+                EvidenceState.OBSERVED if trusted and observation.signal_family == "discussion"
+                else EvidenceState.UNTRUSTED if observation.signal_family == "discussion"
+                else EvidenceState.MISSING
+            ),
+            driver=(
+                "首条观测已入簇，等待独立信号家族确认。" if trusted
+                else "发现候选尚未由提供方复核，不参与评分或告警。"
+            ),
+            coverageNote=("仅有一个信号家族。" if trusted else "仅有未复核发现候选；覆盖度为 0，不输出强结论。"),
             timeline=[], evidence=[evidence],
         )
 
@@ -219,8 +254,42 @@ class EventProcessor:
 
         new_assignment = self.repository.assign_observation(event_id, observation.id, cluster_score, CLUSTER_VERSION)
         observations = self.repository.list_event_observations(event_id)
+        trusted_observations = [
+            item for item in observations if item.provenance_level != "unverified_discovery"
+        ]
+        unverified_count = len(observations) - len(trusted_observations)
+        if observation.provenance_level == "unverified_discovery":
+            # Discovery-only facts may enrich the analyst's evidence panel, but
+            # must not create a score run, move lifecycle state, or emit an
+            # alert outbox record. Provider verification of this same stable ID
+            # schedules a later full scoring revision.
+            candidate_evidence = _evidence_items(event_id, observations)[:30]
+            suffix = f"；另有 {unverified_count} 条未复核发现候选，不参与评分或告警。"
+            coverage_note = current.coverage_note
+            if "条未复核发现候选" not in coverage_note:
+                coverage_note += suffix
+            updated_candidate = current.model_copy(update={
+                "cluster_version": current.cluster_version if not new_assignment else current.cluster_version + 1,
+                "evidence": candidate_evidence,
+                "discussion_evidence_state": (
+                    current.discussion_evidence_state
+                    if current.discussion_evidence_state == EvidenceState.OBSERVED
+                    else EvidenceState.UNTRUSTED
+                ),
+                "coverage_note": coverage_note,
+            })
+            self.repository.upsert_event(updated_candidate)
+            return updated_candidate
+        if not trusted_observations:
+            raise RuntimeError("verified observation revision was not persisted as trusted provenance")
         digest_material = {
-            "observations": [{"id": item.id, "collectedAt": item.collected_at.isoformat(), "metrics": item.metrics} for item in observations],
+            "observations": [
+                {
+                    "id": item.id, "collectedAt": item.collected_at.isoformat(),
+                    "metrics": item.metrics, "provenanceLevel": item.provenance_level,
+                }
+                for item in trusted_observations
+            ],
             "behaviorApplicability": current.behavior_evidence_state.value,
             "scoreVersion": SCORE_VERSION,
             "thresholdVersion": THRESHOLD_VERSION,
@@ -236,32 +305,41 @@ class EventProcessor:
             if committed is None:
                 raise RuntimeError(f"score digest exists without event state: {event_id}")
             return committed
-        signal_snapshots = _snapshots(observations)
-        evaluation_at = max(observation.collected_at, current.updated_at)
+        signal_snapshots = _snapshots(trusted_observations)
+        evaluation_at = max(item.collected_at for item in trusted_observations)
         bucket_at = _score_bucket(evaluation_at)
+        earliest = min(trusted_observations, key=lambda item: item.published_at)
+        initializing_from_discovery = current.evidence_count == 0 and not current.timeline
+        effective_event_type = infer_event_type(earliest) if initializing_from_discovery else current.event_type
+        effective_first_seen = (
+            earliest.published_at
+            if initializing_from_discovery
+            else min(current.first_seen, earliest.published_at)
+        )
         pending_baseline = self._pending_baselines.get(event_id)
         if pending_baseline and pending_baseline[0] < bucket_at:
             self._record_baseline(pending_baseline[1], pending_baseline[2])
-        baseline_history = self._baseline_history[current.event_type]
-        metrics = aggregate_metrics(current.event_type, signal_snapshots, Baseline(dict(baseline_history)))
+        baseline_history = self._baseline_history[effective_event_type]
+        metrics = aggregate_metrics(effective_event_type, signal_snapshots, Baseline(dict(baseline_history)))
         baseline_samples = max((len(values) for values in baseline_history.values()), default=0)
         # Do not let an event calibrate itself while its 15-minute scoring bucket
         # is still being assembled. The latest bucket becomes historical only
         # when a later bucket arrives.
-        self._pending_baselines[event_id] = (bucket_at, current.event_type, signal_snapshots)
+        self._pending_baselines[event_id] = (bucket_at, effective_event_type, signal_snapshots)
         prior_timeline = [point for point in current.timeline if point.at < bucket_at]
         previous_point = prior_timeline[-1] if prior_timeline else None
         velocity = 0.0 if previous_point is None else round(((metrics.attention - previous_point.attention) + (metrics.behavior - previous_point.behavior)) / 2, 2)
         joint_growth = _growth_streak(prior_timeline[-3:], metrics.attention, metrics.behavior)
-        gap_growth = _gap_streak(current.event_type, prior_timeline[-2:], metrics.attention, metrics.behavior)
+        gap_growth = _gap_streak(effective_event_type, prior_timeline[-2:], metrics.attention, metrics.behavior)
         decline_streak = _decline_streak(prior_timeline[-3:], metrics.attention, metrics.behavior)
-        inactive_hours = _inactive_hours(prior_timeline, bucket_at, metrics.attention, metrics.behavior, current.first_seen)
-        earliest = min(observations, key=lambda item: item.published_at)
+        inactive_hours = _inactive_hours(
+            prior_timeline, bucket_at, metrics.attention, metrics.behavior, effective_first_seen,
+        )
         # A newly observed, type-valid behavior metric immediately supersedes a
         # previous manual N/A mark for this scoring cycle.
         behavior_applicable = metrics.behavior_observed or current.behavior_evidence_state != EvidenceState.NOT_APPLICABLE
         score_input = to_score_input(
-            current.event_type, metrics, velocity=velocity, consecutive_joint_growth=joint_growth,
+            effective_event_type, metrics, velocity=velocity, consecutive_joint_growth=joint_growth,
             consecutive_gap_growth=gap_growth, consecutive_decline=decline_streak,
             inactive_hours=inactive_hours, official_source_led=earliest.signal_family == "official",
             baseline_maturity=min(100, max(10, baseline_samples / 28 * 100)),
@@ -269,20 +347,15 @@ class EventProcessor:
             previous_state=current.state,
             behavior_applicable=behavior_applicable,
         )
-        result = score_event(score_input, hours_since_first_seen=max(0, (evaluation_at - current.first_seen).total_seconds() / 3600))
+        result = score_event(
+            score_input,
+            hours_since_first_seen=max(0, (evaluation_at - effective_first_seen).total_seconds() / 3600),
+        )
 
-        evidence_items: list[Evidence] = []
-        seen_urls: set[str] = set()
-        for item in sorted(observations, key=lambda value: value.published_at):
-            normalized = normalize_url(item.url)
-            if normalized in seen_urls:
-                continue
-            seen_urls.add(normalized)
-            evidence_items.append(Evidence(
-                id=f"{event_id}:{item.id}", source=item.source_id, platform=item.platform,
-                title=sanitize_external_text(item.title or item.text[:100]), url=item.url, publishedAt=item.published_at,
-                kind=item.signal_family, excerpt=canonical_text(item.text)[:240],
-            ))
+        evidence_items = _evidence_items(event_id, observations)
+        verified_evidence_count = sum(
+            item.provenance_level != "unverified_discovery" for item in evidence_items
+        )
         point = MetricPoint(at=bucket_at, attention=metrics.attention, behavior=metrics.behavior)
         timeline = sorted([item for item in current.timeline if item.at != bucket_at] + [point], key=lambda item: item.at)[-672:]
         drivers = result.drivers + metrics.drivers
@@ -292,6 +365,8 @@ class EventProcessor:
             "cluster_version": current.cluster_version if created_new or not new_assignment else current.cluster_version + 1,
             "title": earliest.title or earliest.text[:120] or "未命名 AI 事件",
             "title_en": earliest.title or earliest.text[:120] or "Untitled AI event",
+            "event_type": effective_event_type,
+            "first_seen": effective_first_seen,
             "state": result.state, "labels": result.labels, "attention": metrics.attention,
             "behavior": metrics.behavior, "diversity": metrics.diversity, "authority": metrics.authority,
             "coordination_risk": metrics.coordination_risk, "coverage": score_input.coverage,
@@ -301,22 +376,29 @@ class EventProcessor:
                 else EvidenceState.NOT_APPLICABLE if current.behavior_evidence_state == EvidenceState.NOT_APPLICABLE
                 else EvidenceState.MISSING
             ),
-            "discussion_evidence_state": EvidenceState.OBSERVED if any(item.signal_family == "discussion" for item in observations) else EvidenceState.MISSING,
+            "discussion_evidence_state": (
+                EvidenceState.OBSERVED if any(item.signal_family == "discussion" for item in trusted_observations)
+                else EvidenceState.UNTRUSTED if any(item.signal_family == "discussion" for item in observations)
+                else EvidenceState.MISSING
+            ),
             "evidence_score": result.evidence_strength,
             "velocity": velocity, "gap_residual": result.gap_residual, "updated_at": evaluation_at,
-            "independent_sources": len({item.entity_id or item.source_id for item in observations}),
-            "platforms": list(dict.fromkeys(item.platform for item in observations)),
-            "signal_families": list(dict.fromkeys(item.signal_family for item in observations)),
-            "evidence_count": len(evidence_items),
+            "independent_sources": len({item.entity_id or item.source_id for item in trusted_observations}),
+            "platforms": list(dict.fromkeys(item.platform for item in trusted_observations)),
+            "signal_families": list(dict.fromkeys(item.signal_family for item in trusted_observations)),
+            "evidence_count": verified_evidence_count,
             "driver": "；".join(drivers[:4]),
-            "coverage_note": f"覆盖 {metrics.independent_signal_families}/{expected_families} 个适用的独立信号家族；{coverage_suffix}",
+            "coverage_note": (
+                f"覆盖 {metrics.independent_signal_families}/{expected_families} 个适用的独立信号家族；{coverage_suffix}"
+                + (f"；另有 {unverified_count} 条未复核发现候选，不参与评分或告警。" if unverified_count else "")
+            ),
             "timeline": timeline, "evidence": evidence_items[:30],
             "score_version": SCORE_VERSION, "threshold_version": THRESHOLD_VERSION,
         })
         score_record = StoredScore(
             event_id=event_id, score_version=SCORE_VERSION, threshold_version=THRESHOLD_VERSION,
-            input_from=min(item.collected_at for item in observations),
-            input_to=max(item.collected_at for item in observations), input_digest=input_digest,
+            input_from=min(item.collected_at for item in trusted_observations),
+            input_to=max(item.collected_at for item in trusted_observations), input_digest=input_digest,
             drivers=drivers, payload=updated.model_dump(mode="json", by_alias=True),
             created_at=datetime.now(timezone.utc),
         )

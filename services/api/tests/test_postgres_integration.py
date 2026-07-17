@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import sys
+import threading
 import uuid
 
 import psycopg
@@ -59,6 +60,7 @@ def _cleanup_source(prefix: str) -> None:
             cursor.execute("DELETE FROM observation_processing_history WHERE observation_id=ANY(%s)", (observation_ids,))
             cursor.execute("DELETE FROM content_ingest_history WHERE observation_id=ANY(%s)", (observation_ids,))
             cursor.execute("DELETE FROM observations WHERE id=ANY(%s)", (observation_ids,))
+        cursor.execute("DELETE FROM raw_evidence_deletions WHERE reference LIKE %s", (f"%{prefix}%",))
         cursor.execute("DELETE FROM outbox WHERE aggregate_id LIKE %s", (f"{prefix}%",))
         cursor.execute("DELETE FROM sources WHERE id LIKE %s", (f"{prefix}%",))
         cursor.execute("SET session_replication_role='origin'")
@@ -93,7 +95,7 @@ def test_postgres_runtime_attestation_and_production_health(monkeypatch: pytest.
     expected = {
         "storageBackend": "postgresql",
         "rlsVerified": True,
-        "migrationVersion": "001_init_rc2.6",
+        "migrationVersion": "001_init_rc2.9",
         "auditTriggersVerified": True,
         "migrationMarkerReadOnly": True,
         "instanceId": "postgres-integration-rc24",
@@ -206,6 +208,150 @@ def test_postgres_concurrent_duplicate_content_counts_one_valid_source_observati
         assert persisted_observations == 2
         assert valid_observations == 1
         assert "duplicate_content_observation" in discovery_reasons
+    finally:
+        _cleanup_source(prefix)
+
+
+def test_postgres_provenance_upgrade_is_persisted_and_reloaded() -> None:
+    assert APP_DSN is not None
+    prefix = f"it-provenance-{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    candidate = Observation(
+        id=f"{prefix}-observation", platform="Bluesky", externalId=f"at://{prefix}",
+        sourceId=f"{prefix}-source", publishedAt=now, collectedAt=now, language="en",
+        title="AI model", text="AI model", url=f"https://example.com/{prefix}", metrics={},
+        rawEvidenceRef=f"r2://raw/{prefix}-candidate.json", relation="original",
+        contentFingerprint=prefix, signalFamily="discussion", provenanceLevel="unverified_discovery",
+    )
+    verified = candidate.model_copy(update={
+        "provenance_level": "provider_verified", "metrics": {"comments": 3},
+        "title": "Verified security advisory", "text": "Verified CVE security advisory",
+        "url": f"https://example.com/{prefix}/verified",
+        "content_fingerprint": f"{prefix}-verified-fingerprint",
+        "collected_at": now + timedelta(minutes=1),
+        "raw_evidence_ref": f"r2://raw/{prefix}-verified.json",
+    })
+    repository = PostgresRepository(APP_DSN)
+    try:
+        assert repository.save_observation_with_outbox(candidate) is True
+        assert repository.save_observation_with_outbox(verified) is True
+        loaded = repository.get_latest_observation(candidate.id)
+        assert loaded is not None
+        assert loaded.provenance_level == "provider_verified"
+        assert loaded.raw_evidence_ref == verified.raw_evidence_ref
+        assert loaded.title == verified.title
+        assert loaded.text == verified.text
+        assert loaded.url == verified.url
+        assert loaded.content_fingerprint == verified.content_fingerprint
+        assert loaded.metrics == {"comments": 3.0}
+        profiles = repository.list_source_profiles()
+        profile = next(item for item in profiles if item["id"] == candidate.source_id)
+        assert profile["validObservations"] == 1
+        assert "provider_verified_upgrade" in profile["discoveryReasons"]
+        ignored_ref = f"r2://raw/{prefix}-ignored-unverified.json"
+        ignored = verified.model_copy(update={
+            "provenance_level": "unverified_discovery", "metrics": {"score": 1_000_000_000},
+            "raw_evidence_ref": ignored_ref,
+        })
+        assert repository.save_observation_with_outbox(ignored) is False
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status FROM raw_evidence_deletions WHERE reference=%s",
+                (candidate.raw_evidence_ref,),
+            )
+            assert cursor.fetchone() == ("pending",)
+            cursor.execute(
+                "SELECT status FROM raw_evidence_deletions WHERE reference=%s",
+                (ignored_ref,),
+            )
+            assert cursor.fetchone() == ("pending",)
+    finally:
+        _cleanup_source(prefix)
+
+
+def test_postgres_concurrent_same_id_provenance_upgrade_is_exactly_once() -> None:
+    assert APP_DSN is not None
+    prefix = f"it-provenance-race-{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    candidate = Observation(
+        id=f"{prefix}-observation", platform="Generic", externalId=f"external:{prefix}",
+        sourceId=f"{prefix}-source", publishedAt=now, collectedAt=now, language="en",
+        title="AI candidate", text="AI candidate", url=f"https://example.com/{prefix}", metrics={},
+        rawEvidenceRef=f"r2://raw/{prefix}-candidate.json", relation="original",
+        contentFingerprint=f"{prefix}-candidate", signalFamily="discussion",
+        provenanceLevel="unverified_discovery",
+    )
+    verified = candidate.model_copy(update={
+        "provenance_level": "provider_verified", "title": "Verified AI release",
+        "text": "Verified AI release", "content_fingerprint": f"{prefix}-verified",
+        "collected_at": now + timedelta(minutes=1), "metrics": {"comments": 4},
+        "raw_evidence_ref": f"r2://raw/{prefix}-verified.json",
+    })
+    repository = PostgresRepository(APP_DSN)
+    barrier = threading.Barrier(2)
+
+    def upgrade() -> bool:
+        barrier.wait(timeout=10)
+        return PostgresRepository(APP_DSN).save_observation_with_outbox(verified)
+
+    try:
+        assert repository.save_observation_with_outbox(candidate) is True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: upgrade(), range(2)))
+        assert sorted(results) == [False, True]
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT valid_observations FROM sources WHERE id=%s",
+                (candidate.source_id,),
+            )
+            assert cursor.fetchone() == (1,)
+            cursor.execute(
+                "SELECT revision FROM observation_processing WHERE observation_id=%s",
+                (candidate.id,),
+            )
+            assert cursor.fetchone() == (2,)
+            cursor.execute(
+                "SELECT count(*) FROM content_ingest_history WHERE observation_id=%s",
+                (candidate.id,),
+            )
+            assert cursor.fetchone() == (2,)
+            cursor.execute(
+                "SELECT count(*) FROM raw_evidence_deletions WHERE reference=%s AND status='pending'",
+                (candidate.raw_evidence_ref,),
+            )
+            assert cursor.fetchone() == (1,)
+    finally:
+        _cleanup_source(prefix)
+
+
+def test_postgres_unverified_observations_never_advance_source_validity() -> None:
+    assert APP_DSN is not None
+    prefix = f"it-unverified-{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    repository = PostgresRepository(APP_DSN)
+    try:
+        for index in range(2):
+            item = Observation(
+                id=f"{prefix}-observation-{index}", platform="Bluesky",
+                externalId=f"at://{prefix}/{index}", sourceId=f"{prefix}-source",
+                publishedAt=now, collectedAt=now + timedelta(seconds=index), language="en",
+                title=f"AI discovery {index}", text=f"AI discovery candidate {index}",
+                url=f"https://example.com/{prefix}/{index}", metrics={},
+                rawEvidenceRef=f"r2://raw/{prefix}-{index}.json", relation="original",
+                contentFingerprint=f"{prefix}-fingerprint-{index}", signalFamily="discussion",
+                provenanceLevel="unverified_discovery",
+            )
+            if index == 0:
+                item = item.model_copy(update={"metrics": {"score": 1_000_000_000}})
+            assert repository.save_observation_with_outbox(item) is True
+        profile = next(item for item in repository.list_source_profiles() if item["id"] == f"{prefix}-source")
+        assert profile["validObservations"] == 0
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT count(*) FROM metric_snapshots WHERE subject_id LIKE %s",
+                (f"{prefix}%",),
+            )
+            assert cursor.fetchone()[0] == 0
     finally:
         _cleanup_source(prefix)
 

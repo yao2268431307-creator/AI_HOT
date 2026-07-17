@@ -28,7 +28,10 @@ def _estimate(value: float, uncertainty: float) -> Estimate:
 
 
 def event_assessment(event: RadarEvent) -> EventAssessment:
-    observed_kinds = set(event.signal_families) | {item.kind for item in event.evidence}
+    trusted_evidence = [
+        item for item in event.evidence if item.provenance_level != "unverified_discovery"
+    ]
+    observed_kinds = set(event.signal_families) | {item.kind for item in trusted_evidence}
     mask: dict[str, EvidenceState] = {}
     gaps: list[CoverageGap] = []
     for feature in FEATURE_WEIGHTS:
@@ -51,11 +54,18 @@ def event_assessment(event: RadarEvent) -> EventAssessment:
                 feature=feature, state=state, reason=f"当前事件没有可信的 {feature} 信号",
                 impact="降低证据强度；该特征不会被其他特征重新加权替代",
             ))
+        elif state == EvidenceState.UNTRUSTED:
+            gaps.append(CoverageGap(
+                feature=feature,
+                state=state,
+                reason=f"当前 {feature} 信号仅来自未复核发现候选",
+                impact="不计入评分、置信区间、独立信源或告警门槛",
+            ))
 
     observed_weight = sum(weight for feature, weight in FEATURE_WEIGHTS.items() if mask[feature] == EvidenceState.OBSERVED)
     expected_weight = sum(weight for feature, weight in FEATURE_WEIGHTS.items() if mask[feature] != EvidenceState.NOT_APPLICABLE)
     baseline_maturity = min(1.0, max(0.0, (len(event.timeline) - 1) / 12))
-    cluster_confidence = min(1.0, event.diversity / 100 * .65 + min(1, len(event.evidence) / 5) * .35)
+    cluster_confidence = min(1.0, event.diversity / 100 * .65 + min(1, len(trusted_evidence) / 5) * .35)
     cautions = [gap.reason for gap in gaps]
     behavior_estimate = None if mask["behavior"] != EvidenceState.OBSERVED else _estimate(event.behavior, event.uncertainty)
     return EventAssessment(

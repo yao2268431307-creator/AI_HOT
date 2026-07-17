@@ -4,14 +4,15 @@
 
 本仓库的本地 Docker 基础设施已经完成真实运行态验证，不再只是配置解析或 Mock：
 
-- PostgreSQL/pgvector 实际应用迁移 `001_init_rc2.6`；受限 `radar_app` 角色通过 RLS、审计 trigger、只读迁移标记和时钟证明。
+- PostgreSQL/pgvector 实际应用迁移 `001_init_rc2.9` 两次且保持幂等；受限 `radar_app` 角色通过 RLS、审计 trigger、只读迁移标记和时钟证明。
+- 通用稳定 Observation ID 的来源可信级别从 `unverified_discovery` 单向升级为 `provider_verified` 后，已复核正文/指纹、原始证据引用、指标快照与新 processing revision 可从 PostgreSQL 重载；两个线程并发升级同一 ID 时只有一次有效信源增量、一次处理 revision 和一条旧 raw ref 删除任务。当前 Bluesky 仍为 discovery-only，不宣称已走该升级路径。
 - 两个并发 PostgreSQL 事务写入同一 `source_id + content_fingerprint` 时保留两条审计 Observation，但有效信源观测只增加一次。
 - PostgreSQL Outbox 实际发布到 Redis Stream，随后在数据库事务中记录 `published_at`、`attempts=1`，payload 可从流中还原；交付语义是 at-least-once，不宣称跨系统 exactly-once。
 - Redis consumer group 的读取、确认和 pending 清零通过。
 - MinIO 的 S3 兼容 put/read/delete 与 Content-Type 校验通过。
 - PostgreSQL、Redis、MinIO 同时执行 `docker compose restart` 后，测试事实、Stream 消息和对象均保持可读。
 
-这份记录只证明 2026-07-17 的本地、单机、全新 Docker volume 集成链路。它不证明目标生产环境容量、跨节点故障、PITR、RPO/RTO、真实 R2、72 小时 soak 或 7 天影子运行。
+这份记录只证明 2026-07-17 的本地、单机 Docker volume 集成链路。它不证明目标生产环境容量、跨节点故障、PITR、RPO/RTO、真实 R2、72 小时 soak 或 7 天影子运行。
 
 ## 环境
 
@@ -23,7 +24,7 @@
 | Redis 镜像 | `redis:7.4-alpine`，健康检查通过 |
 | 对象存储镜像 | `minio/minio:RELEASE.2025-04-22T22-12-26Z` |
 | 数据库应用角色 | `radar_app`，非 superuser，`BYPASSRLS=false` |
-| 迁移标记 | `001_init_rc2.6` |
+| 迁移标记 | `001_init_rc2.9` |
 
 ## 可复跑命令
 
@@ -47,13 +48,13 @@ $env:S3_INTEGRATION_SECRET_KEY="<local integration secret>"
 带全部集成环境变量运行完整 API 套件：
 
 ```text
-152 passed, 7 warnings in 12.62s
+182 passed, 7 warnings in 21.83s
 ```
 
-其中新增的 6 个真实基础设施用例单独运行结果为：
+不提供集成环境变量的默认对照结果为：
 
 ```text
-6 passed, 7 warnings in 1.24s
+168 passed, 14 skipped in 19.42s
 ```
 
 7 条 warning 均来自已安装 botocore 内部对 `datetime.utcnow()` 的弃用提示；不影响断言或对象存储结果，后续依赖升级时消除。
@@ -64,7 +65,7 @@ $env:S3_INTEGRATION_SECRET_KEY="<local integration secret>"
 {
   "storageBackend": "postgresql",
   "rlsVerified": true,
-  "migrationVersion": "001_init_rc2.6",
+  "migrationVersion": "001_init_rc2.9",
   "auditTriggersVerified": true,
   "migrationMarkerReadOnly": true,
   "databaseUser": "radar_app",

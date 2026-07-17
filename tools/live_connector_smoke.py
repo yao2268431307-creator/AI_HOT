@@ -24,6 +24,7 @@ sys.path.insert(0, str(API_ROOT))
 from radar.connectors import (  # noqa: E402
     ArxivConnector,
     BaseConnector,
+    BlueskyJetstreamConnector,
     GitHubConnector,
     HackerNewsConnector,
     HuggingFaceConnector,
@@ -44,6 +45,16 @@ def bounded_hn_items(value: str) -> int:
     return count
 
 
+def bounded_bluesky_messages(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 1 to 2000") from exc
+    if not 1 <= count <= 2_000:
+        raise argparse.ArgumentTypeError("must be from 1 to 2000")
+    return count
+
+
 def connector_factories() -> dict[str, ConnectorFactory]:
     return {
         "hackernews": lambda args: HackerNewsConnector(max_items=args.hn_max_items, max_attempts=2),
@@ -51,6 +62,12 @@ def connector_factories() -> dict[str, ConnectorFactory]:
         "huggingface": lambda args: HuggingFaceConnector(search=args.hf_search, max_attempts=2),
         "arxiv": lambda args: ArxivConnector(query=args.arxiv_query, max_attempts=2),
         "openalex": lambda args: OpenAlexConnector(search=args.openalex_search, max_attempts=2),
+        "bluesky": lambda args: BlueskyJetstreamConnector(
+            endpoint=args.bluesky_endpoint,
+            max_messages=args.bluesky_max_messages,
+            idle_timeout_seconds=args.bluesky_idle_timeout_seconds,
+            max_attempts=2,
+        ),
     }
 
 
@@ -68,6 +85,10 @@ async def probe(connector: BaseConnector) -> dict[str, object]:
             "latencyMs": round((time.perf_counter() - started) * 1000),
             "sampleExternalId": rows[0].external_id if rows else None,
             "samplePublishedAt": rows[0].published_at.isoformat() if rows else None,
+            "provenanceCounts": {
+                level: sum(row.provenance_level == level for row in rows)
+                for level in ("self_authenticating", "provider_verified", "unverified_discovery")
+            },
         }
     except Exception as exc:  # noqa: BLE001 - a smoke must report provider/parser failures uniformly
         return {
@@ -95,6 +116,7 @@ async def run(args: argparse.Namespace) -> int:
             "single bounded read; not a 72-hour soak",
             "does not prove contractual rights or production credentials",
             "does not write the production repository or raw evidence store",
+            "Bluesky Jetstream remains discovery-only; only exact AppView matches are provider-verified",
         ],
         "results": results,
     }
@@ -114,6 +136,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-search", default="")
     parser.add_argument("--arxiv-query", default="cat:cs.AI")
     parser.add_argument("--openalex-search", default="artificial intelligence")
+    parser.add_argument("--bluesky-max-messages", type=bounded_bluesky_messages, default=500)
+    parser.add_argument("--bluesky-idle-timeout-seconds", type=float, default=3.0)
+    parser.add_argument("--bluesky-endpoint", default="wss://jetstream2.us-east.bsky.network/subscribe")
     return parser.parse_args()
 
 
