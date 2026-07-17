@@ -24,7 +24,7 @@
 
 - PostgreSQL 16：数据库名 `ai_hot`，启用 pgvector、pgcrypto、连续 WAL/PITR，保留 7–14 天；提供管理员 DSN Secret 文件。
 - Redis：提供 TLS `rediss://` 地址和生产凭据。
-- R2/S3：创建私有 bucket；Scheduler 身份具备目标 bucket 读/写/删，Alert 使用不同身份及带 session token 的短时 delete-only 凭据。
+- R2/S3：创建私有 bucket；Scheduler 身份具备目标 bucket 读/写/删。Alert 使用另一套带 session token 的短时、限定 bucket 凭据；Cloudflare R2 当前只有 Object Read & Write / Object Read 权限，因此“只删除”由独立身份、短有效期和应用代码共同约束，不得把它标成供应商原生 delete-only 权限。
 - 创建生产 Linux 主机/集群和 Secret Manager 注入；端口只在 loopback 暴露，由组织网关终止 TLS。
 
 ## 4. 数据权利与成本

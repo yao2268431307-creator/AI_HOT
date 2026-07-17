@@ -85,7 +85,7 @@ VALUES ('<workspace>','<idp-subject>','OWNER','active');
 
 ## 3. R2/S3 和正式来源文件
 
-创建非公开 bucket。Scheduler 凭据需要目标 bucket 的读、写、删；Alert 使用另一身份，代码只执行删除。若使用 action-scoped 临时凭据，把 session token 注入 `R2_SESSION_TOKEN`，并在凭据到期前由 Secret Manager 轮换和重启对应工作负载。
+创建非公开 bucket。Scheduler 凭据需要目标 bucket 的读、写、删；Alert 使用另一身份，代码只执行删除。Cloudflare R2 当前没有原生 delete-only grant，因此 Alert 应使用短时、限定到该 bucket 的 Object Read & Write 临时凭据，把 session token 注入 `R2_SESSION_TOKEN`，并在凭据到期前由 Secret Manager 轮换和重启对应工作负载。这里的“只删除”是独立身份、短有效期、运行时隔离和代码路径的组合边界，不是供应商权限名称。
 
 把经审批的文件放到部署机：
 

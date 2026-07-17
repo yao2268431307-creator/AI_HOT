@@ -331,9 +331,9 @@ def validate_services(
     findings.require(valid_database_dsn(alert.get("DATABASE_URL")), "alert.DATABASE_URL.tls", "must be a TLS PostgreSQL DSN")
     findings.require(valid_https(alert.get("R2_ENDPOINT_URL")), "alert.R2_ENDPOINT_URL.https", "must be HTTPS")
     findings.require(alert.get("REDIS_URL", "").startswith("rediss://"), "alert.REDIS_URL.tls", "must use rediss://")
-    findings.warn(bool(alert.get("R2_SESSION_TOKEN")), "alert.R2_SESSION_TOKEN", "permanent R2 credentials are broader than delete-only temporary credentials")
+    findings.warn(bool(alert.get("R2_SESSION_TOKEN")), "alert.R2_SESSION_TOKEN", "use a distinct short-lived bucket-scoped Alert identity; R2 does not expose a native delete-only grant")
     if phase == "formal":
-        findings.require(bool(alert.get("R2_SESSION_TOKEN")), "alert.R2_SESSION_TOKEN.formal", "formal collection requires short-lived delete-only Alert credentials")
+        findings.require(bool(alert.get("R2_SESSION_TOKEN")), "alert.R2_SESSION_TOKEN.formal", "formal collection requires short-lived bucket-scoped Alert credentials; the isolated code path is delete-only")
         findings.require(is_real(scheduler.get("GITHUB_TOKEN")), "scheduler.GITHUB_TOKEN.formal", "formal GitHub collection requires an approved token")
         findings.require(
             bool(re.fullmatch(r"[^@\s]+@[^@\s]+", scheduler.get("OPENALEX_MAILTO", ""))),

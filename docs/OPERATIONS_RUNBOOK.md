@@ -21,7 +21,7 @@
 
 生产 Compose 文件是 [compose.production.yml](../infra/compose.production.yml)。它强制使用 API、Scheduler、Alert 三份独立环境文件，并分别挂载已复核来源身份表和 RSS 清单；示例边界见 [API](../.env.api.example)、[Scheduler](../.env.scheduler.example) 与 [Alert](../.env.alert.example)。API 不持有 Redis、R2 或平台采集凭据；Scheduler 不持有删除角色、Webhook 或评分账本私钥；Alert 不持有平台令牌、删除数据库或评分账本私钥。正式密钥由部署平台 Secret Manager 按工作负载身份注入，不得提交生产环境文件。Compose 只绑定宿主机 loopback 端口，需要组织网关负责 TLS、访问控制和限流。运行服务需要出站访问各自获准的托管依赖、官方数据提供方和 Webhook；不能把网络标记为 Docker internal 后又声称连接器可用。完整配置和正式验收步骤见 [生产配置与验收手册](PRODUCTION_CONFIGURATION.md)。
 
-`GET /health` 仅公开版本和时钟；`GET /health/ready` 是最小化的编排 readiness。完整依赖、数据库角色和发布证明仅由 Owner 通过 `GET /api/v1/operations/runtime-health` 读取。生产任一证明缺失时 readiness 返回 503。15 分钟调度组件的心跳容忍窗口按声明周期计算，而不是错误地固定为 3 分钟。采集 Worker 在每轮采集前重新执行 Redis ping 与目标 R2 bucket 写/读/删探针；Alert 消费者每轮消费前以自身独立身份执行 Redis ping 和专用 canary 前缀的删除权限探针，代码不会主动执行写或读。任一探针失败时对应 Worker 不得继续处理，并写入失败心跳。readiness 同时要求两类 R2 权限证明，且不接受超过 30 分钟的旧探针结果。若对象存储供应商不能签发严格 delete-only 的长期凭据，应为 Alert 使用短时、受策略约束的会话凭据并注入 `R2_SESSION_TOKEN`；不得把供应商控制台的宽权限长期令牌描述为 delete-only。
+`GET /health` 仅公开版本和时钟；`GET /health/ready` 是最小化的编排 readiness。完整依赖、数据库角色和发布证明仅由 Owner 通过 `GET /api/v1/operations/runtime-health` 读取。生产任一证明缺失时 readiness 返回 503。15 分钟调度组件的心跳容忍窗口按声明周期计算，而不是错误地固定为 3 分钟。采集 Worker 在每轮采集前重新执行 Redis ping 与目标 R2 bucket 写/读/删探针；Alert 消费者每轮消费前以自身独立身份执行 Redis ping 和专用 canary 前缀的删除权限探针，代码不会主动执行写或读。任一探针失败时对应 Worker 不得继续处理，并写入失败心跳。readiness 同时要求两类 R2 权限证明，且不接受超过 30 分钟的旧探针结果。Cloudflare R2 当前不提供原生 delete-only grant：Alert 必须使用与 Scheduler 不同的短时、限定 bucket 的 Object Read & Write 会话凭据并注入 `R2_SESSION_TOKEN`，其“只删除”边界由独立身份、短有效期、运行时隔离和仅删除代码路径共同实现；不得把供应商的读写凭据描述为原生 delete-only。
 
 ## 监控与告警
 
