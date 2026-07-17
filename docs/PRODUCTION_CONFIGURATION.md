@@ -125,13 +125,13 @@ CONNECTOR_BUDGETS_RMB_JSON={"github":300,"huggingface":200,"openalex":300}
 SIGNAL_FAMILY_BUDGETS_RMB_JSON={"behavior":500,"research":300}
 CONNECTOR_COST_RMB_GITHUB=0
 CONNECTOR_COST_RMB_HUGGINGFACE=0
-CONNECTOR_COST_RMB_OPENALEX=0
+CONNECTOR_COST_RMB_OPENALEX=0.01
 ```
 
 只有合同确认零成本时才能把单次请求成本设为 `0`。
 API 环境中的三项预算上限必须与 Scheduler 完全一致，用于覆盖页和告警展示；只有 Scheduler 持有单次请求成本与平台凭据并执行扣费。
 
-正式六源采集还要求经批准的 `GITHUB_TOKEN` 与运维联系邮箱 `OPENALEX_MAILTO`。API、Scheduler、Alert 的 `DATABASE_URL` 必须都使用 `radar_app` 且指向同一数据库；删除 DSN 只能使用 `radar_deletion_worker`。Scheduler 与 Alert 必须使用同一个 bucket、不同的对象存储身份，Alert 正式运行必须使用带 `R2_SESSION_TOKEN` 的短时凭据。
+正式六源采集还要求经批准的 `GITHUB_TOKEN`、OpenAlex 账号生成的 `OPENALEX_API_KEY` 与运维联系邮箱 `OPENALEX_MAILTO`。OpenAlex 搜索在每日免费额度后按量计费，因此正式预算门禁要求正数的保守单次人民币成本，不能填 0。API、Scheduler、Alert 的 `DATABASE_URL` 必须都使用 `radar_app` 且指向同一数据库；删除 DSN 只能使用 `radar_deletion_worker`。Scheduler 与 Alert 必须使用同一个 bucket、不同的对象存储身份，Alert 正式运行必须使用带 `R2_SESSION_TOKEN` 的短时凭据。
 
 ## 5. Acceptance keyring
 

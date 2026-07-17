@@ -182,7 +182,12 @@ def build_connectors(evidence_store: RawEvidenceStore | None = None) -> list[Bas
         GitHubConnector(query=os.getenv("GITHUB_QUERY", "topic:artificial-intelligence"), token=os.getenv("GITHUB_TOKEN") or None, evidence_store=evidence_store),
         HuggingFaceConnector(search=os.getenv("HF_SEARCH", ""), evidence_store=evidence_store),
         ArxivConnector(query=os.getenv("ARXIV_QUERY", "cat:cs.AI OR cat:cs.CL OR cat:cs.LG"), evidence_store=evidence_store),
-        OpenAlexConnector(search=os.getenv("OPENALEX_SEARCH", "artificial intelligence"), mailto=os.getenv("OPENALEX_MAILTO") or None, evidence_store=evidence_store),
+        OpenAlexConnector(
+            search=os.getenv("OPENALEX_SEARCH", "artificial intelligence"),
+            api_key=os.getenv("OPENALEX_API_KEY") or None,
+            mailto=os.getenv("OPENALEX_MAILTO") or None,
+            evidence_store=evidence_store,
+        ),
     ]
     feeds_path = Path(os.getenv("RSS_FEEDS_FILE", "config/feeds.local.json"))
     if feeds_path.exists():

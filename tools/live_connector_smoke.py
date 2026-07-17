@@ -12,6 +12,7 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -61,7 +62,12 @@ def connector_factories() -> dict[str, ConnectorFactory]:
         "github": lambda args: GitHubConnector(query=args.github_query, max_attempts=2),
         "huggingface": lambda args: HuggingFaceConnector(search=args.hf_search, max_attempts=2),
         "arxiv": lambda args: ArxivConnector(query=args.arxiv_query, max_attempts=2),
-        "openalex": lambda args: OpenAlexConnector(search=args.openalex_search, max_attempts=2),
+        "openalex": lambda args: OpenAlexConnector(
+            search=args.openalex_search,
+            api_key=os.getenv("OPENALEX_API_KEY") or None,
+            mailto=os.getenv("OPENALEX_MAILTO") or None,
+            max_attempts=2,
+        ),
         "bluesky": lambda args: BlueskyJetstreamConnector(
             endpoint=args.bluesky_endpoint,
             max_messages=args.bluesky_max_messages,

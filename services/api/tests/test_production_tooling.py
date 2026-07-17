@@ -97,8 +97,9 @@ def create_bundle(tmp_path: Path) -> Path:
                 'SIGNAL_FAMILY_BUDGETS_RMB_JSON={"behavior":500,"research":300}',
                 "CONNECTOR_COST_RMB_GITHUB=0",
                 "CONNECTOR_COST_RMB_HUGGINGFACE=0",
-                "CONNECTOR_COST_RMB_OPENALEX=0",
+                "CONNECTOR_COST_RMB_OPENALEX=0.01",
                 "GITHUB_TOKEN=approved-github-token",
+                "OPENALEX_API_KEY=approved-openalex-key",
                 "OPENALEX_MAILTO=radar-ops@acme.test",
                 f"RADAR_RELEASE_IMAGE_DIGESTS={release_digest_json}",
             )

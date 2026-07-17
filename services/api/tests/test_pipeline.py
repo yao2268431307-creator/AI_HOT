@@ -905,13 +905,26 @@ async def test_openalex_connector_tolerates_null_author_identifier_and_future_da
         "cited_by_count": 0,
         "counts_by_year": [],
     }]}
-    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    requested_urls: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(request.url)
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        items = await OpenAlexConnector(client=client, max_attempts=1).collect()
+        items = await OpenAlexConnector(
+            api_key="openalex-test-key",
+            mailto="radar@example.test",
+            client=client,
+            max_attempts=1,
+        ).collect()
     assert len(items) == 1
     assert items[0].source_id == "openalex:unknown"
     assert items[0].external_id == "W123"
     assert items[0].published_at == collected
+    assert requested_urls[0].params["api_key"] == "openalex-test-key"
+    assert requested_urls[0].params["mailto"] == "radar@example.test"
 
 
 @pytest.mark.asyncio

@@ -16,13 +16,23 @@ class OpenAlexConnector(BaseConnector):
     signal_family = "research"
     metered = True
 
-    def __init__(self, search: str = "artificial intelligence", mailto: str | None = None, *args: object, **kwargs: object) -> None:
+    def __init__(
+        self,
+        search: str = "artificial intelligence",
+        api_key: str | None = None,
+        mailto: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.search = search
+        self.api_key = api_key
         self.mailto = mailto
 
     async def collect(self) -> list[Observation]:
         endpoint = f"https://api.openalex.org/works?search={quote(self.search)}&sort=publication_date:desc&per-page=50"
+        if self.api_key:
+            endpoint += f"&api_key={quote(self.api_key)}"
         if self.mailto:
             endpoint += f"&mailto={quote(self.mailto)}"
         response = await self.get(endpoint)

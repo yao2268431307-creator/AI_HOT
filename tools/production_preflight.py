@@ -335,6 +335,7 @@ def validate_services(
     if phase == "formal":
         findings.require(bool(alert.get("R2_SESSION_TOKEN")), "alert.R2_SESSION_TOKEN.formal", "formal collection requires short-lived bucket-scoped Alert credentials; the isolated code path is delete-only")
         findings.require(is_real(scheduler.get("GITHUB_TOKEN")), "scheduler.GITHUB_TOKEN.formal", "formal GitHub collection requires an approved token")
+        findings.require(is_real(scheduler.get("OPENALEX_API_KEY")), "scheduler.OPENALEX_API_KEY.formal", "formal OpenAlex collection requires an account API key")
         findings.require(
             bool(re.fullmatch(r"[^@\s]+@[^@\s]+", scheduler.get("OPENALEX_MAILTO", ""))),
             "scheduler.OPENALEX_MAILTO.formal",
@@ -424,9 +425,16 @@ def validate_services(
         try:
             cost = float(scheduler.get(cost_key, ""))
             cost_ok = 0 <= cost < float("inf")
+            if connector == "openalex":
+                cost_ok = 0 < cost < float("inf")
         except ValueError:
             cost_ok = False
-        findings.require(cost_ok, f"scheduler.{cost_key}", "contract cost per request must be explicit and non-negative")
+        cost_message = (
+            "OpenAlex search is metered after its daily allowance; use a positive conservative RMB/request cost"
+            if connector == "openalex"
+            else "contract cost per request must be explicit and non-negative"
+        )
+        findings.require(cost_ok, f"scheduler.{cost_key}", cost_message)
 
 
 def validate_registries(

@@ -32,7 +32,7 @@
 - 对 RSS、Hacker News、GitHub、Hugging Face、arXiv、OpenAlex 六类完成正式用途审批。
 - 每类登记审批工单、签字材料 SHA-256、带时区审批时间，以及互不相同的数据权利/安全/产品审批主体。
 - RSS 对每个 Feed 单独完成发布方审批；不能用连接器级审批代替。
-- 提供获批 GitHub Token、OpenAlex 运维邮箱，以及真实人民币/请求成本；只有合同确认零成本才填写 `0`。
+- 提供获批 GitHub Token、OpenAlex 免费账号生成的 API Key、OpenAlex 运维邮箱，以及真实人民币/请求成本。OpenAlex 搜索在每日免费额度后按量计费，不能填写 `0`；当前连接器建议先按 `0.01 RMB/请求` 做保守预算并根据真实账单校准。
 
 ## 5. 部署与验收主机
 
