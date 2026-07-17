@@ -60,11 +60,11 @@ export function QueueTable({ events, selectedId, windowSize, onSelect }: { event
       id: "event",
       header: "研判对象",
       cell: ({ row }) => (
-        <div className="event-cell">
+        <button type="button" className="event-cell event-select" aria-current={row.original.id === selectedId} onClick={() => onSelect(row.original.id)}>
           <div className="event-title">{row.original.title}</div>
           <div className="event-meta"><span>{typeName[row.original.eventType]}</span><span>{row.original.independentSources} 个独立信源</span><span>首见 {timeAgo(row.original.firstSeen)}</span><span>变化 {timeAgo(row.original.updatedAt)}</span></div>
-          <div className="row-labels">{row.original.labels.slice(0, 3).map((label) => <span key={label}>{labelName[label]}</span>)}</div>
-        </div>
+          <div className="row-labels">{row.original.classificationStatus === "unsupported" && <span>未支持分类</span>}{row.original.labels.slice(0, 3).map((label) => <span key={label}>{labelName[label]}</span>)}</div>
+        </button>
       ),
     },
     { accessorKey: "state", header: "阶段", cell: ({ row }) => <span className={`state-pill state-${row.original.state}`}>{stateName[row.original.state]}</span> },
@@ -78,8 +78,9 @@ export function QueueTable({ events, selectedId, windowSize, onSelect }: { event
       const missing = [row.original.discussionEvidenceState === "missing" ? "讨论" : "", row.original.behaviorEvidenceState === "missing" ? "行为" : ""].filter(Boolean);
       return <div className="confidence"><span>{({ low: "低", medium: "中", high: "高" })[row.original.evidenceStrength]} · {row.original.evidenceCount ?? row.original.evidence.length} 项</span><i><em style={{ width: `${row.original.evidenceScore}%` }} /></i><small>{missing.length ? `缺 ${missing.join("、")}` : "关键轴已覆盖"}</small></div>;
     } },
+    { id: "priority", header: "新增证据 / 优先理由", cell: ({ row }) => <div className="priority-reason"><b>+{row.original.newEvidenceCount ?? 0}</b><small>{row.original.queuePriorityReasons?.[0] ?? "常规复核"}</small></div> },
     { accessorKey: "velocity", header: "速度", cell: ({ row }) => <span className="velocity">{row.original.velocity > 0 ? "+" : ""}{row.original.velocity}</span> },
-  ], [windowSize]);
+  ], [onSelect, selectedId, windowSize]);
   // TanStack Table intentionally returns callable table state; it is safe here because
   // the instance remains local and no returned function crosses a memoized boundary.
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -90,10 +91,10 @@ export function QueueTable({ events, selectedId, windowSize, onSelect }: { event
       <table className="queue-table">
         <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
         <tbody>{table.getRowModel().rows.map((row) => (
-          <tr key={row.id} className={row.original.id === selectedId ? "selected" : ""} onClick={() => onSelect(row.original.id)} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onSelect(row.original.id); }}>
+          <tr key={row.id} className={row.original.id === selectedId ? "selected" : ""}>
             {row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}
           </tr>
-        ))}</tbody>
+        ))}{table.getRowModel().rows.length === 0 && <tr><td colSpan={columns.length} className="empty-directory">没有符合当前筛选条件的事件。</td></tr>}</tbody>
       </table>
     </div>
   );

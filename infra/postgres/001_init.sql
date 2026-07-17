@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS observations (
   account_id text,
   entity_id text,
   published_at timestamptz NOT NULL,
+  available_at timestamptz NOT NULL,
+  availability_basis text NOT NULL DEFAULT 'first_detected' CHECK (availability_basis IN ('provider_timestamp','first_detected')),
   collected_at timestamptz NOT NULL,
   language text NOT NULL,
   title text,
@@ -131,6 +133,12 @@ CREATE TABLE IF NOT EXISTS observations (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (platform, external_id, collected_at)
 );
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS available_at timestamptz;
+UPDATE observations SET available_at=collected_at WHERE available_at IS NULL;
+ALTER TABLE observations ALTER COLUMN available_at SET NOT NULL;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS availability_basis text NOT NULL DEFAULT 'first_detected';
+ALTER TABLE observations DROP CONSTRAINT IF EXISTS observations_availability_basis_check;
+ALTER TABLE observations ADD CONSTRAINT observations_availability_basis_check CHECK (availability_basis IN ('provider_timestamp','first_detected'));
 ALTER TABLE observations ADD COLUMN IF NOT EXISTS provenance_level text NOT NULL DEFAULT 'provider_verified';
 ALTER TABLE observations DROP CONSTRAINT IF EXISTS observations_provenance_level_check;
 ALTER TABLE observations ADD CONSTRAINT observations_provenance_level_check
@@ -238,9 +246,67 @@ CREATE TABLE IF NOT EXISTS score_runs (
   payload jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS scoring_revision integer NOT NULL DEFAULT 1;
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS baseline_version text NOT NULL DEFAULT 'baseline-empty';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS baseline_digest text NOT NULL DEFAULT 'sha256:empty';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS feature_registry_version text NOT NULL DEFAULT 'unknown';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS feature_registry_digest text NOT NULL DEFAULT 'sha256:unknown';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS evidence_policy_version text NOT NULL DEFAULT 'unknown';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS label_policy_version text NOT NULL DEFAULT 'unknown';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS cluster_version integer NOT NULL DEFAULT 1;
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS identity_version text NOT NULL DEFAULT 'identity-account-fallback-v1';
+ALTER TABLE score_runs ADD COLUMN IF NOT EXISTS input_observation_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
 CREATE INDEX IF NOT EXISTS score_runs_event_idx ON score_runs (event_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS score_runs_event_cycle_uidx ON score_runs (event_id, cycle_id);
+DROP INDEX IF EXISTS score_runs_event_cycle_uidx;
+CREATE UNIQUE INDEX IF NOT EXISTS score_runs_event_cycle_revision_uidx ON score_runs (event_id, cycle_id, scoring_revision);
 CREATE UNIQUE INDEX IF NOT EXISTS score_runs_event_digest_uidx ON score_runs (event_id, input_digest);
+
+CREATE TABLE IF NOT EXISTS baseline_samples (
+  fact_key text PRIMARY KEY,
+  source_event_id text NOT NULL,
+  event_type text NOT NULL,
+  baseline_key text NOT NULL,
+  observed_at timestamptz NOT NULL,
+  value numeric NOT NULL CHECK (value >= 0),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE baseline_samples ADD COLUMN IF NOT EXISTS source_event_id text NOT NULL DEFAULT 'legacy';
+CREATE INDEX IF NOT EXISTS baseline_samples_lookup_idx ON baseline_samples (event_type, baseline_key, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS score_history_erasure_audit (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_id text NOT NULL,
+  event_ids text[] NOT NULL,
+  reason text NOT NULL,
+  erased_score_runs integer NOT NULL CHECK (erased_score_runs >= 0),
+  erased_baseline_samples integer NOT NULL CHECK (erased_baseline_samples >= 0),
+  actor text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE score_history_erasure_audit ADD COLUMN IF NOT EXISTS source_id text;
+UPDATE score_history_erasure_audit SET source_id='legacy' WHERE source_id IS NULL;
+ALTER TABLE score_history_erasure_audit ALTER COLUMN source_id SET NOT NULL;
+
+CREATE TABLE IF NOT EXISTS runtime_component_heartbeats (
+  component_id text PRIMARY KEY,
+  instance_id text NOT NULL,
+  last_seen_at timestamptz NOT NULL,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS disaster_recovery_attestations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  performed_at timestamptz NOT NULL,
+  backup_reference text NOT NULL,
+  restored_instance_id text NOT NULL,
+  verification_digest text NOT NULL,
+  measured_rpo_seconds integer NOT NULL CHECK (measured_rpo_seconds >= 0),
+  measured_rto_seconds integer NOT NULL CHECK (measured_rto_seconds >= 0),
+  status text NOT NULL CHECK (status IN ('passed','failed')),
+  operator_subject text NOT NULL,
+  notes text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS event_metric_snapshots (
   event_id text NOT NULL REFERENCES events(id) ON DELETE CASCADE,
@@ -256,6 +322,31 @@ CREATE TABLE IF NOT EXISTS event_metric_snapshots (
   PRIMARY KEY (event_id, captured_at)
 ) PARTITION BY RANGE (captured_at);
 CREATE TABLE IF NOT EXISTS event_metric_snapshots_default PARTITION OF event_metric_snapshots DEFAULT;
+
+CREATE TABLE IF NOT EXISTS event_metric_daily_rollups (
+  event_id text NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  day date NOT NULL,
+  samples integer NOT NULL,
+  attention_avg numeric(5,2) NOT NULL,
+  attention_max numeric(5,2) NOT NULL,
+  behavior_avg numeric(5,2) NOT NULL,
+  behavior_max numeric(5,2) NOT NULL,
+  coverage_min numeric(5,2) NOT NULL,
+  evidence_strength_max numeric(5,2) NOT NULL,
+  PRIMARY KEY (event_id,day)
+);
+
+CREATE TABLE IF NOT EXISTS event_embeddings (
+  event_id text NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  model_version text NOT NULL,
+  dimensions integer NOT NULL CHECK (dimensions = 1024),
+  title_hash text NOT NULL,
+  embedding vector(1024) NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (event_id,model_version)
+);
+CREATE INDEX IF NOT EXISTS event_embeddings_hnsw_idx
+  ON event_embeddings USING hnsw (embedding vector_cosine_ops);
 
 CREATE TABLE IF NOT EXISTS metric_snapshots (
   id text NOT NULL,
@@ -300,7 +391,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   last_error text
 );
 CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox (created_at) WHERE published_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS outbox_score_cycle_uidx ON outbox (kind, aggregate_id, (payload->>'cycleId')) WHERE kind='score.created';
+DROP INDEX IF EXISTS outbox_score_cycle_uidx;
+CREATE UNIQUE INDEX IF NOT EXISTS outbox_score_revision_uidx
+  ON outbox (kind, aggregate_id, (payload->>'inputDigest')) WHERE kind='score.created';
 
 CREATE TABLE IF NOT EXISTS connector_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -314,6 +407,51 @@ CREATE TABLE IF NOT EXISTS connector_runs (
   estimated_cost_rmb numeric(12,4) NOT NULL DEFAULT 0 CHECK (estimated_cost_rmb >= 0),
   coverage numeric(5,2),
   error text
+);
+
+CREATE TABLE IF NOT EXISTS connector_budget_reservations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_token uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+  month_start date NOT NULL,
+  connector_id text NOT NULL,
+  signal_family text NOT NULL,
+  reserved_amount_rmb numeric(12,4) NOT NULL CHECK (reserved_amount_rmb >= 0),
+  actual_amount_rmb numeric(12,4) CHECK (actual_amount_rmb >= 0),
+  status text NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved','confirmed','reconciliation_required','reconciled_charged','released')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  lease_until timestamptz NOT NULL DEFAULT (now()+interval '1 hour'),
+  confirmed_at timestamptz,
+  reconciled_at timestamptz,
+  reconciliation_reason text
+);
+ALTER TABLE connector_budget_reservations ADD COLUMN IF NOT EXISTS owner_token uuid DEFAULT gen_random_uuid();
+UPDATE connector_budget_reservations SET owner_token=gen_random_uuid() WHERE owner_token IS NULL;
+ALTER TABLE connector_budget_reservations ALTER COLUMN owner_token SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS connector_budget_reservations_owner_token_uidx
+  ON connector_budget_reservations (owner_token);
+ALTER TABLE connector_budget_reservations ADD COLUMN IF NOT EXISTS lease_until timestamptz;
+UPDATE connector_budget_reservations SET lease_until=created_at+interval '1 hour' WHERE lease_until IS NULL;
+ALTER TABLE connector_budget_reservations ALTER COLUMN lease_until SET DEFAULT (now()+interval '1 hour');
+ALTER TABLE connector_budget_reservations ALTER COLUMN lease_until SET NOT NULL;
+ALTER TABLE connector_budget_reservations ADD COLUMN IF NOT EXISTS reconciled_at timestamptz;
+ALTER TABLE connector_budget_reservations ADD COLUMN IF NOT EXISTS reconciliation_reason text;
+ALTER TABLE connector_budget_reservations DROP CONSTRAINT IF EXISTS connector_budget_reservations_status_check;
+ALTER TABLE connector_budget_reservations ADD CONSTRAINT connector_budget_reservations_status_check
+  CHECK (status IN ('reserved','confirmed','reconciliation_required','reconciled_charged','released'));
+DROP INDEX IF EXISTS connector_budget_reservations_active_idx;
+CREATE INDEX connector_budget_reservations_active_idx
+  ON connector_budget_reservations (month_start,connector_id,signal_family)
+  WHERE status IN ('reserved','reconciliation_required','reconciled_charged');
+
+CREATE TABLE IF NOT EXISTS connector_budget_reconciliation_audit (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  reservation_id uuid NOT NULL,
+  connector_id text NOT NULL,
+  resolution text NOT NULL CHECK (resolution IN ('released','reconciled_charged')),
+  amount_rmb numeric(12,4) NOT NULL CHECK (amount_rmb >= 0),
+  reason text NOT NULL,
+  actor text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS connector_status (
@@ -340,6 +478,22 @@ CREATE TABLE IF NOT EXISTS raw_evidence_deletions (
 ALTER TABLE raw_evidence_deletions ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NOT NULL DEFAULT now();
 ALTER TABLE raw_evidence_deletions ADD COLUMN IF NOT EXISTS lease_until timestamptz;
 ALTER TABLE connector_runs ADD COLUMN IF NOT EXISTS estimated_cost_rmb numeric(12,4) NOT NULL DEFAULT 0 CHECK (estimated_cost_rmb >= 0);
+
+CREATE TABLE IF NOT EXISTS workspace_memberships (
+  workspace_id text NOT NULL,
+  subject text NOT NULL,
+  role text NOT NULL CHECK (role IN ('OWNER','ANALYST','VIEWER')),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked')),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workspace_id,subject)
+);
+
+CREATE TABLE IF NOT EXISTS jwt_revocations (
+  jti text PRIMARY KEY,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz NOT NULL DEFAULT now(),
+  reason text NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS alert_rules (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -445,16 +599,19 @@ ALTER TABLE lead_threshold_crossings DROP CONSTRAINT IF EXISTS lead_threshold_cr
 ALTER TABLE lead_threshold_crossings ADD PRIMARY KEY (event_id,threshold_version,policy_version);
 ALTER TABLE review_queue_entries DROP CONSTRAINT IF EXISTS review_queue_entries_event_id_fkey;
 ALTER TABLE review_queue_entries ADD COLUMN IF NOT EXISTS entry_kind text NOT NULL DEFAULT 'transition';
+ALTER TABLE review_queue_entries DROP CONSTRAINT IF EXISTS review_queue_entries_entry_kind_check;
+ALTER TABLE review_queue_entries ADD CONSTRAINT review_queue_entries_entry_kind_check
+  CHECK (entry_kind IN ('transition','deployment_backfill'));
 INSERT INTO review_queue_entries
   (event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
 SELECT e.id,'qe-backfill-'||gen_random_uuid()::text,clock_timestamp(),e.lifecycle_state,e.cluster_version,
        COALESCE(NULLIF(e.current_score->>'scoreVersion',''),'unknown'),
-       'product-metrics-2026-07-rc2.12','deployment_backfill'
+       'product-metrics-2026-07-rc3.2','deployment_backfill'
 FROM events e
 WHERE e.lifecycle_state IN ('detected','emerging','accelerating','established','cooling')
   AND NOT EXISTS (
     SELECT 1 FROM review_queue_entries q
-    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc2.12'
+    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc3.2'
   );
 
 CREATE TABLE IF NOT EXISTS cluster_edit_requests (
@@ -516,6 +673,8 @@ ALTER TABLE product_interactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE product_interactions FORCE ROW LEVEL SECURITY;
 ALTER TABLE cluster_edit_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cluster_edit_requests FORCE ROW LEVEL SECURITY;
+ALTER TABLE workspace_memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_memberships FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS feedback_workspace_isolation ON feedback;
 CREATE POLICY feedback_workspace_isolation ON feedback
@@ -545,11 +704,86 @@ DROP POLICY IF EXISTS cluster_edit_requests_workspace_isolation ON cluster_edit_
 CREATE POLICY cluster_edit_requests_workspace_isolation ON cluster_edit_requests
   USING (workspace_id = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
+DROP POLICY IF EXISTS workspace_memberships_workspace_isolation ON workspace_memberships;
+CREATE POLICY workspace_memberships_workspace_isolation ON workspace_memberships
+  USING (workspace_id = current_setting('app.workspace_id', true))
+  WITH CHECK (workspace_id = current_setting('app.workspace_id', true));
 
 CREATE OR REPLACE FUNCTION reject_audit_fact_mutation() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION '% is append-only; write a compensating audit fact instead', TG_TABLE_NAME;
+END
+$$;
+
+DROP FUNCTION IF EXISTS erase_event_score_history(text[],text);
+CREATE OR REPLACE FUNCTION erase_source_score_history(target_source_id text)
+RETURNS TABLE(event_ids text[],erased_score_runs integer,erased_baseline_samples integer)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE affected_event_ids text[];
+DECLARE score_count integer;
+DECLARE baseline_count integer;
+BEGIN
+  IF target_source_id IS NULL OR length(trim(target_source_id))=0 THEN
+    RAISE EXCEPTION 'source ID is required';
+  END IF;
+  SELECT COALESCE(array_agg(DISTINCT affected.event_id),'{}'::text[])
+  INTO affected_event_ids
+  FROM (
+    SELECT memberships.event_id
+    FROM public.event_observations memberships
+    JOIN public.observations observations ON observations.id=memberships.observation_id
+    WHERE observations.source_id=target_source_id
+    UNION
+    SELECT events.id FROM public.events events
+    WHERE events.current_score->'evidence' @> jsonb_build_array(jsonb_build_object('source',target_source_id))
+  ) affected;
+  IF cardinality(affected_event_ids)=0 THEN
+    RAISE EXCEPTION 'source has no score-bearing events eligible for erasure';
+  END IF;
+  UPDATE public.event_metric_snapshots SET score_run_id=NULL
+    WHERE event_id=ANY(affected_event_ids);
+  DELETE FROM public.score_runs WHERE event_id=ANY(affected_event_ids);
+  GET DIAGNOSTICS score_count = ROW_COUNT;
+  DELETE FROM public.baseline_samples WHERE source_event_id=ANY(affected_event_ids);
+  GET DIAGNOSTICS baseline_count = ROW_COUNT;
+  INSERT INTO public.score_history_erasure_audit
+    (source_id,event_ids,reason,erased_score_runs,erased_baseline_samples,actor)
+  VALUES (target_source_id,affected_event_ids,'source_erasure',score_count,baseline_count,session_user);
+  RETURN QUERY SELECT affected_event_ids,score_count,baseline_count;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION resolve_connector_budget_reservation(
+  target_owner_token uuid,resolution text,confirmed_cost_rmb numeric,operator_reason text
+) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE reservation_row public.connector_budget_reservations%ROWTYPE;
+DECLARE final_amount numeric;
+BEGIN
+  IF resolution NOT IN ('released','reconciled_charged') OR length(trim(operator_reason))<8 THEN
+    RAISE EXCEPTION 'a valid resolution and operator reason are required';
+  END IF;
+  SELECT * INTO reservation_row FROM public.connector_budget_reservations
+    WHERE owner_token=target_owner_token AND status='reconciliation_required' FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'reservation is not awaiting reconciliation';
+  END IF;
+  final_amount := CASE WHEN resolution='released' THEN 0 ELSE confirmed_cost_rmb END;
+  IF final_amount IS NULL OR final_amount<0 OR final_amount>reservation_row.reserved_amount_rmb THEN
+    RAISE EXCEPTION 'confirmed cost is outside the reserved amount';
+  END IF;
+  UPDATE public.connector_budget_reservations SET status=resolution,
+    actual_amount_rmb=final_amount,reconciled_at=clock_timestamp(),
+    reconciliation_reason=operator_reason WHERE id=reservation_row.id;
+  INSERT INTO public.connector_budget_reconciliation_audit
+    (reservation_id,connector_id,resolution,amount_rmb,reason,actor)
+  VALUES (reservation_row.id,reservation_row.connector_id,resolution,final_amount,operator_reason,session_user);
+  RETURN resolution;
 END
 $$;
 
@@ -594,7 +828,7 @@ $$;
 DO $$
 DECLARE audit_table text;
 BEGIN
-  FOREACH audit_table IN ARRAY ARRAY['feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents','source_promotion_facts']
+  FOREACH audit_table IN ARRAY ARRAY['feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents','source_promotion_facts','score_history_erasure_audit','connector_budget_reconciliation_audit']
   LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS %I_append_only ON %I',audit_table,audit_table);
     EXECUTE format('CREATE TRIGGER %I_append_only BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_audit_fact_mutation()',audit_table,audit_table);
@@ -608,27 +842,58 @@ DROP TRIGGER IF EXISTS observation_processing_history_monotonic ON observation_p
 CREATE TRIGGER observation_processing_history_monotonic BEFORE UPDATE OR DELETE ON observation_processing_history
   FOR EACH ROW EXECUTE FUNCTION protect_processing_history_fact();
 
--- The bootstrap POSTGRES_USER owns migrations and is intentionally not used by
--- the application. Superusers bypass RLS even when policies are otherwise
--- correct, so local/runtime traffic uses a constrained role.
+-- The application identity is provisioned outside this schema migration. The
+-- local-only Docker bootstrap creates it in 000_local_roles.sql; production
+-- must use the DBA/secret manager and a rotated secret or workload identity.
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'radar_app') THEN
-    CREATE ROLE radar_app LOGIN PASSWORD 'radar-app-local-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='radar_app') THEN
+    RAISE EXCEPTION 'radar_app must be provisioned before applying the schema migration';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='radar_deletion_worker') THEN
+    RAISE EXCEPTION 'radar_deletion_worker must be provisioned before applying the schema migration';
   END IF;
 END
 $$;
 GRANT CONNECT ON DATABASE ai_hot TO radar_app;
+GRANT CONNECT ON DATABASE ai_hot TO radar_deletion_worker;
 GRANT USAGE ON SCHEMA public TO radar_app;
+GRANT USAGE ON SCHEMA public TO radar_deletion_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO radar_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO radar_deletion_worker;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO radar_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO radar_deletion_worker;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO radar_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO radar_app;
 
 REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON schema_attestations FROM radar_app;
 GRANT SELECT ON schema_attestations TO radar_app;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON disaster_recovery_attestations FROM radar_app;
+GRANT SELECT ON disaster_recovery_attestations TO radar_app;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON workspace_memberships,jwt_revocations FROM radar_app;
+GRANT SELECT ON workspace_memberships,jwt_revocations TO radar_app;
+REVOKE UPDATE,DELETE,TRUNCATE ON score_runs,baseline_samples FROM radar_app;
+GRANT SELECT,INSERT ON score_runs,baseline_samples TO radar_app;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON score_history_erasure_audit FROM radar_app;
+GRANT SELECT ON score_history_erasure_audit TO radar_app;
+REVOKE DELETE ON events FROM radar_app;
+REVOKE ALL ON FUNCTION erase_source_score_history(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION erase_source_score_history(text) FROM radar_app;
+GRANT EXECUTE ON FUNCTION erase_source_score_history(text) TO radar_deletion_worker;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON schema_attestations,disaster_recovery_attestations,
+  workspace_memberships,jwt_revocations,score_runs,baseline_samples,score_history_erasure_audit
+  FROM radar_deletion_worker;
+GRANT SELECT ON schema_attestations,disaster_recovery_attestations,score_runs,baseline_samples,
+  score_history_erasure_audit TO radar_deletion_worker;
+REVOKE DELETE ON events FROM radar_deletion_worker;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON connector_budget_reconciliation_audit
+  FROM radar_app,radar_deletion_worker;
+GRANT SELECT ON connector_budget_reconciliation_audit TO radar_app,radar_deletion_worker;
+REVOKE ALL ON FUNCTION resolve_connector_budget_reservation(uuid,text,numeric,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION resolve_connector_budget_reservation(uuid,text,numeric,text)
+  FROM radar_app,radar_deletion_worker;
 
 -- Written last: an interrupted migration must never attest the target schema.
 INSERT INTO schema_attestations (key,value,updated_at)
-VALUES ('migration_version','001_init_rc2.9',clock_timestamp())
+VALUES ('migration_version','001_init_rc3.0',clock_timestamp())
 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at;

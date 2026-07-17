@@ -8,15 +8,25 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from .clustering import ClusterCandidate, choose_cluster, entities
-from .contracts import Evidence, EvidenceState, EventType, LifecycleState, MetricPoint, Observation, RadarEvent, StoredScore
+from .contracts import Evidence, EvidenceState, EventType, LifecycleState, MetricPoint, Observation, RadarEvent, StoredScore, StructureLabel
 from .embeddings import BgeM3Provider
+from .feature_registry import feature_registry_identity
 from .metrics import Baseline, SignalSnapshot, aggregate_metrics, to_score_input
 from .normalize import canonical_text, normalize_url, sanitize_external_text
-from .scoring import SCORE_VERSION, THRESHOLD_VERSION, expected_behavior, score_event, strength_tier
-from .storage import InMemoryRepository, PostgresRepository
+from .scoring import ACTIVE_WINDOW_HOURS, COOLING_START_HOURS, EVIDENCE_POLICY_VERSION, LABEL_POLICY_VERSION, SCORE_VERSION, THRESHOLD_VERSION, clamp, expected_behavior, score_event, score_input_record, strength_tier
+from .storage import ConcurrentScoreConflict, InMemoryRepository, PostgresRepository
 
 
 CLUSTER_VERSION = "cluster-0.2.0"
+
+UNSUPPORTED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("融资与资本事件不属于 V1 AI 产品/研究热点模型", re.compile(
+        r"\b(fundraising|funding round|series [a-f]|seed round|venture capital|valuation|acquisition|acquired)\b|融资|估值|收购|并购|资本市场",
+    )),
+    ("政策与监管事件不属于 V1 AI 产品/研究热点模型", re.compile(
+        r"\b(policy proposal|regulation|regulatory|legislation|executive order|antitrust)\b|政策|监管|立法|行政令|反垄断",
+    )),
+)
 
 
 def _score_bucket(value: datetime) -> datetime:
@@ -34,6 +44,11 @@ def infer_event_type(observation: Observation) -> EventType:
     if observation.platform.lower() == "github" or re.search(r"\b(sdk|library|framework|developer tool|agent)\b|开发工具|框架|智能体", text):
         return EventType.DEVELOPER_TOOL_RELEASE
     return EventType.OFFICIAL_PRODUCT_RELEASE
+
+
+def unsupported_reason(observation: Observation) -> str | None:
+    text = canonical_text(f"{observation.title or ''} {observation.text}")
+    return next((reason for reason, pattern in UNSUPPORTED_PATTERNS if pattern.search(text)), None)
 
 
 def _authority(observation: Observation) -> float:
@@ -56,7 +71,7 @@ def _snapshots(observations: list[Observation]) -> list[SignalSnapshot]:
             source_group=current.entity_id or current.source_id,
             platform=current.platform,
             signal_family=current.signal_family,
-            captured_at=current.published_at,
+            captured_at=current.collected_at,
             metrics=current.metrics,
             previous_metrics=previous,
             authority=_authority(current),
@@ -142,27 +157,53 @@ class EventProcessor:
         self._event_embeddings: dict[str, list[float]] = {}
         self._event_embedding_titles: dict[str, str] = {}
         self._process_lock = asyncio.Lock()
-        self._baseline_history: dict[EventType, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-        self._baseline_seen: set[tuple[str, str, datetime, str, float]] = set()
-        self._pending_baselines: dict[str, tuple[datetime, EventType, list[SignalSnapshot]]] = {}
 
-    def _record_baseline(self, event_type: EventType, snapshots: list[SignalSnapshot]) -> None:
-        history = self._baseline_history[event_type]
+    def _record_baseline(self, event_id: str, event_type: EventType, snapshots: list[SignalSnapshot]) -> None:
         for snapshot in snapshots:
             for metric, value in snapshot.metrics.items():
-                key = (snapshot.platform, snapshot.source_id, snapshot.captured_at, metric, value)
-                if key in self._baseline_seen:
+                if metric not in snapshot.previous_metrics:
                     continue
-                self._baseline_seen.add(key)
-                bucket = history[f"{snapshot.platform.lower()}:{metric}"]
-                bucket.append(max(0.0, value - snapshot.previous_metrics.get(metric, 0)))
-                del bucket[:-1000]
+                material = "|".join((
+                    event_id, event_type.value, snapshot.platform.lower(), snapshot.source_id,
+                    snapshot.captured_at.isoformat(), metric, str(snapshot.previous_metrics[metric]), str(value),
+                ))
+                self.repository.append_baseline_sample(
+                    "sha256:" + hashlib.sha256(material.encode()).hexdigest(), event_id, event_type,
+                    f"{snapshot.platform.lower()}:{metric}", snapshot.captured_at,
+                    max(0.0, value - snapshot.previous_metrics[metric]),
+                )
 
     def invalidate_events(self, event_ids: list[str]) -> None:
         """Drop embeddings derived from titles affected by deletion or edits."""
         for event_id in event_ids:
             self._event_embeddings.pop(event_id, None)
             self._event_embedding_titles.pop(event_id, None)
+        self.repository.delete_event_embeddings(event_ids)
+
+    def _stable_labels(
+        self, event_id: str, current: RadarEvent, raw_labels: list[StructureLabel], bucket_at: datetime,
+    ) -> list[StructureLabel]:
+        """Confirm label additions/removals across two distinct score cycles."""
+        previous_cycle_runs = [
+            score for score in self.repository.list_score_runs(event_id)
+            if _score_bucket(score.input_to) < bucket_at
+        ]
+        previous_raw: set[StructureLabel] | None = None
+        if previous_cycle_runs:
+            replay = previous_cycle_runs[-1].payload.get("_replay", {})
+            expected = replay.get("expected", {}) if isinstance(replay, dict) else {}
+            values = expected.get("labels", []) if isinstance(expected, dict) else []
+            previous_raw = {StructureLabel(value) for value in values}
+        active = set(current.labels)
+        raw = set(raw_labels)
+        stable: set[StructureLabel] = set()
+        for label in raw:
+            if label in active or label == StructureLabel.REACTIVATED or (previous_raw is not None and label in previous_raw):
+                stable.add(label)
+        for label in active - raw:
+            if previous_raw is None or label in previous_raw:
+                stable.add(label)
+        return [label for label in StructureLabel if label in stable]
 
     def _candidates(self) -> list[ClusterCandidate]:
         candidates: list[ClusterCandidate] = []
@@ -188,8 +229,11 @@ class EventProcessor:
             provenanceLevel=observation.provenance_level,
         )
         trusted = observation.provenance_level != "unverified_discovery"
+        not_supported = unsupported_reason(observation)
         return RadarEvent(
             id=event_id, title=title, titleEn=title, eventType=infer_event_type(observation),
+            classificationStatus="unsupported" if not_supported else "supported",
+            unsupportedReason=not_supported,
             state=LifecycleState.INSUFFICIENT_DATA, labels=[], attention=0, behavior=0,
             diversity=0, authority=_authority(observation) if trusted else 0, coordinationRisk=0, coverage=25 if trusted else 0,
             uncertainty=100, evidenceStrength="low", evidenceScore=0, velocity=0, gapResidual=0,
@@ -213,20 +257,184 @@ class EventProcessor:
         # Connector collection is concurrent, but cluster assignment and the
         # resulting score transition must be ordered to avoid duplicate events.
         async with self._process_lock:
-            return await self._process_one(observation)
+            for attempt in range(3):
+                try:
+                    return await self._process_one(observation)
+                except ConcurrentScoreConflict:
+                    if attempt == 2:
+                        raise
+            raise RuntimeError("unreachable scoring retry state")
+
+    async def refresh_time_driven(self, evaluation_at: datetime | None = None) -> int:
+        """Advance quiet events without inventing a new provider observation."""
+        now = evaluation_at or datetime.now(timezone.utc)
+        async with self._process_lock:
+            refreshed = 0
+            for event in self.repository.list_events():
+                if event.superseded_by or event.classification_status == "unsupported" or not event.timeline:
+                    continue
+                try:
+                    changed = await self._refresh_quiet_event(event, now)
+                except ConcurrentScoreConflict:
+                    latest = self.repository.get_event(event.id)
+                    changed = bool(latest and await self._refresh_quiet_event(latest, now))
+                refreshed += int(changed)
+            return refreshed
+
+    async def _refresh_quiet_event(self, current: RadarEvent, evaluation_at: datetime) -> bool:
+        bucket_at = _score_bucket(evaluation_at)
+        if current.timeline and current.timeline[-1].at >= bucket_at:
+            return False
+        observations = [
+            item for item in self.repository.list_event_observations(current.id)
+            if item.provenance_level != "unverified_discovery"
+        ]
+        if not observations:
+            return False
+        last_signal_at = max(item.collected_at for item in observations)
+        inactive_hours = max(0.0, (evaluation_at - last_signal_at).total_seconds() / 3600)
+        cooling_start = COOLING_START_HOURS[current.event_type]
+        if inactive_hours < cooling_start:
+            return False
+
+        active_window = ACTIVE_WINDOW_HOURS[current.event_type]
+        decay_span = max(0.25, active_window - cooling_start)
+        decay_factor = clamp((active_window - inactive_hours) / decay_span, 0, 1)
+        signal_bucket = _score_bucket(last_signal_at)
+        base_point = next(
+            (point for point in reversed(current.timeline) if point.at <= signal_bucket),
+            current.timeline[0],
+        )
+        attention = round(base_point.attention * decay_factor, 2)
+        behavior = round(base_point.behavior * decay_factor, 2)
+        prior_timeline = [point for point in current.timeline if point.at < bucket_at]
+        previous_point = prior_timeline[-1]
+        velocity = round(((attention - previous_point.attention) + (behavior - previous_point.behavior)) / 2, 2)
+        decline_streak = _decline_streak(prior_timeline[-3:], attention, behavior)
+
+        signal_snapshots = _snapshots(observations)
+        baseline_history, baseline_digest, baseline_fact_count = self.repository.load_baseline_history(current.event_type, current.id)
+        feature_registry_version, feature_registry_digest = feature_registry_identity()
+        metrics = aggregate_metrics(current.event_type, signal_snapshots, Baseline(baseline_history))
+        behavior_applicable = metrics.behavior_observed or current.behavior_evidence_state != EvidenceState.NOT_APPLICABLE
+        score_input = to_score_input(
+            current.event_type, metrics, velocity=velocity,
+            consecutive_joint_growth=0, consecutive_gap_growth=0,
+            consecutive_decline=decline_streak, inactive_hours=inactive_hours,
+            official_source_led=bool(current.labels and "official_source_led" in current.labels),
+            baseline_maturity=max(10, current.evidence_score),
+            temporal_stability=max(20, current.evidence_score),
+            previous_state=current.state, behavior_applicable=behavior_applicable,
+        )
+        score_input.attention = attention
+        score_input.behavior = behavior
+        score_input.coverage = current.coverage
+        score_input.cluster_confidence = current.diversity
+        score_input.anomaly_robust_z = 0
+        hours_since_first_seen = max(0, (evaluation_at - current.first_seen).total_seconds() / 3600)
+        result = score_event(score_input, hours_since_first_seen=hours_since_first_seen)
+        stable_labels = self._stable_labels(current.id, current, result.labels, bucket_at)
+        point = MetricPoint(at=bucket_at, attention=attention, behavior=behavior)
+        timeline = sorted(current.timeline + [point], key=lambda item: item.at)[-672:]
+        drivers = [*result.drivers, f"距最后可信采集已 {inactive_hours:.2f} 小时，执行时间驱动衰减"]
+        updated = current.model_copy(update={
+            "state": result.state, "labels": stable_labels,
+            "attention": attention, "behavior": behavior,
+            "coverage": score_input.coverage, "uncertainty": result.uncertainty,
+            "evidence_strength": strength_tier(result.evidence_strength),
+            "evidence_score": result.evidence_strength, "velocity": velocity,
+            "gap_residual": result.gap_residual, "updated_at": evaluation_at,
+            "driver": "；".join(drivers[:4]), "timeline": timeline,
+        })
+        digest_material = {
+            "mode": "time_driven", "eventId": current.id,
+            "evaluationBucket": bucket_at.isoformat(), "lastSignalAt": last_signal_at.isoformat(),
+            "previousState": current.state.value, "attention": attention, "behavior": behavior,
+            "scoreVersion": SCORE_VERSION, "thresholdVersion": THRESHOLD_VERSION,
+            "featureRegistryVersion": feature_registry_version, "featureRegistryDigest": feature_registry_digest,
+            "baselineDigest": baseline_digest, "evidencePolicyVersion": EVIDENCE_POLICY_VERSION,
+            "labelPolicyVersion": LABEL_POLICY_VERSION, "clusterVersion": current.cluster_version,
+            "activeWindowHours": active_window, "coolingStartHours": cooling_start,
+        }
+        input_digest = "sha256:" + hashlib.sha256(
+            json.dumps(digest_material, sort_keys=True).encode(),
+        ).hexdigest()
+        if self.repository.has_score_input_digest(current.id, input_digest):
+            return False
+        replay_payload = updated.model_dump(mode="json", by_alias=True)
+        replay_payload["_replay"] = {
+            "scoreInput": score_input_record(score_input), "hoursSinceFirstSeen": hours_since_first_seen,
+            "expected": {
+                "state": result.state.value, "labels": [label.value for label in result.labels],
+                "evidenceStrength": result.evidence_strength, "uncertainty": result.uncertainty,
+                "gapResidual": result.gap_residual,
+            },
+        }
+        self.repository.commit_scored_event(updated, StoredScore(
+            event_id=current.id, score_version=SCORE_VERSION, threshold_version=THRESHOLD_VERSION,
+            baseline_version=f"baseline-{current.event_type.value}-{baseline_fact_count}", baseline_digest=baseline_digest,
+            feature_registry_version=feature_registry_version, feature_registry_digest=feature_registry_digest,
+            evidence_policy_version=EVIDENCE_POLICY_VERSION, label_policy_version=LABEL_POLICY_VERSION,
+            cluster_version=current.cluster_version, identity_version="identity-account-fallback-v1",
+            input_observation_ids=sorted({item.id for item in observations}),
+            input_from=last_signal_at, input_to=evaluation_at, input_digest=input_digest,
+            drivers=drivers, payload=replay_payload,
+            created_at=datetime.now(timezone.utc),
+        ))
+        return True
 
     async def _process_one(self, observation: Observation) -> RadarEvent:
         candidates = self._candidates()
         observation_embedding: list[float] | None = None
         if self.embedding_provider:
-            missing = [candidate for candidate in candidates if candidate.event_id not in self._event_embeddings]
-            texts = [f"{observation.title or ''}\n{observation.text}"] + [candidate.title for candidate in missing]
             try:
-                vectors = await self.embedding_provider.embed(texts)
-                observation_embedding = vectors[0]
-                for candidate, vector in zip(missing, vectors[1:], strict=True):
-                    self._event_embeddings[candidate.event_id] = vector
-                    self._event_embedding_titles[candidate.event_id] = candidate.title
+                observation_embedding = (
+                    await self.embedding_provider.embed([f"{observation.title or ''}\n{observation.text}"])
+                )[0]
+                model_version = f"{self.embedding_provider.model}:{self.embedding_provider.dimensions}"
+                titles = {candidate.event_id: candidate.title for candidate in candidates}
+                nearest = self.repository.nearest_event_embeddings(
+                    observation_embedding, titles, model_version, limit=50,
+                )
+                cycle_embeddings = dict(nearest)
+                observation_urls = {normalize_url(observation.url)}
+                observation_entities = entities(f"{observation.title or ''} {observation.text}")
+                priority_candidates = sorted(
+                    (candidate for candidate in candidates if candidate.event_id not in cycle_embeddings),
+                    key=lambda candidate: (
+                        not bool(candidate.urls & observation_urls or candidate.entities & observation_entities),
+                        -candidate.latest_at.timestamp(), candidate.event_id,
+                    ),
+                )[:25]
+                priority_titles = {
+                    candidate.event_id: candidate.title for candidate in priority_candidates
+                }
+                cycle_embeddings.update(self.repository.load_event_embeddings(
+                    priority_titles, model_version, self.embedding_provider.dimensions,
+                ))
+                missing = [
+                    candidate for candidate in priority_candidates
+                    if candidate.event_id not in cycle_embeddings
+                ]
+                missing_vectors = (
+                    await self.embedding_provider.embed([candidate.title for candidate in missing])
+                    if missing else []
+                )
+                for candidate, vector in zip(missing, missing_vectors, strict=True):
+                    cycle_embeddings[candidate.event_id] = vector
+                    self.repository.save_event_embedding(
+                        candidate.event_id,
+                        model_version,
+                        candidate.title,
+                        vector,
+                    )
+                # Keep only this cycle's HNSW top-K plus bounded hard/recent
+                # candidates. Persisted vectors outside the shortlist are not
+                # loaded or regenerated, so Python similarity remains bounded.
+                self._event_embeddings = cycle_embeddings
+                self._event_embedding_titles = {
+                    event_id: titles[event_id] for event_id in cycle_embeddings
+                }
                 for candidate in candidates:
                     candidate.embedding = self._event_embeddings.get(candidate.event_id)
             except Exception:
@@ -240,10 +448,17 @@ class EventProcessor:
             event_id = f"evt-{fingerprint[:16]}"
             current = self._skeleton(observation, event_id)
             self.repository.upsert_event(current)
+            current = self.repository.get_event(event_id) or current
             cluster_score = 1.0
             if observation_embedding:
                 self._event_embeddings[event_id] = observation_embedding
                 self._event_embedding_titles[event_id] = f"{current.title} {current.title_en}"
+                self.repository.save_event_embedding(
+                    event_id,
+                    f"{self.embedding_provider.model}:{self.embedding_provider.dimensions}",
+                    self._event_embedding_titles[event_id],
+                    observation_embedding,
+                )
         else:
             created_new = False
             event_id = decision.event_id or ""
@@ -282,17 +497,75 @@ class EventProcessor:
             return updated_candidate
         if not trusted_observations:
             raise RuntimeError("verified observation revision was not persisted as trusted provenance")
+        earliest = min(trusted_observations, key=lambda item: item.published_at)
+        classification_basis = next(
+            (item for item in sorted(trusted_observations, key=lambda item: item.published_at)
+             if item.signal_family in {"official", "research"}),
+            earliest,
+        )
+        not_supported = unsupported_reason(classification_basis)
+        if not_supported:
+            evidence_items = _evidence_items(event_id, observations)
+            verified_evidence_count = sum(
+                item.provenance_level != "unverified_discovery" for item in evidence_items
+            )
+            updated_unsupported = current.model_copy(update={
+                "classification_status": "unsupported", "unsupported_reason": not_supported,
+                "event_type": infer_event_type(classification_basis),
+                "first_seen": min(item.published_at for item in trusted_observations),
+                "state": LifecycleState.INSUFFICIENT_DATA, "labels": [],
+                "attention": 0, "behavior": 0, "diversity": 0, "coordination_risk": 0,
+                "coverage": 0, "uncertainty": 100, "evidence_strength": "low",
+                "evidence_score": 0, "velocity": 0, "gap_residual": 0,
+                "updated_at": max(item.collected_at for item in trusted_observations),
+                "independent_sources": len({item.entity_id or item.source_id for item in trusted_observations}),
+                "platforms": list(dict.fromkeys(item.platform for item in trusted_observations)),
+                "signal_families": list(dict.fromkeys(item.signal_family for item in trusted_observations)),
+                "evidence_count": verified_evidence_count,
+                "driver": f"未支持队列：{not_supported}。该事件不进入数值评分或强告警。",
+                "coverage_note": "V1 仅评分五类 AI 产品、开发、研究与安全事件；该候选保留证据供人工分流。",
+                "timeline": [], "evidence": evidence_items[:30],
+            })
+            # Deliberately no StoredScore and no score.created outbox: an
+            # unsupported candidate is a triage item, not a forced profile.
+            self.repository.upsert_event(updated_unsupported)
+            return updated_unsupported
+        signal_snapshots = _snapshots(trusted_observations)
+        evaluation_at = max(item.collected_at for item in trusted_observations)
+        bucket_at = _score_bucket(evaluation_at)
+        initializing_from_discovery = current.evidence_count == 0 and not current.timeline
+        effective_event_type = infer_event_type(earliest) if initializing_from_discovery else current.event_type
+        effective_first_seen = (
+            earliest.published_at
+            if initializing_from_discovery
+            else min(current.first_seen, earliest.published_at)
+        )
+        baseline_history, baseline_digest, baseline_fact_count = self.repository.load_baseline_history(effective_event_type, event_id)
+        feature_registry_version, feature_registry_digest = feature_registry_identity()
         digest_material = {
             "observations": [
                 {
-                    "id": item.id, "collectedAt": item.collected_at.isoformat(),
-                    "metrics": item.metrics, "provenanceLevel": item.provenance_level,
+                    "id": item.id, "externalId": item.external_id, "sourceId": item.source_id,
+                    "accountId": item.account_id, "entityId": item.entity_id,
+                    "platform": item.platform, "signalFamily": item.signal_family,
+                    "publishedAt": item.published_at.isoformat(), "availableAt": item.available_at.isoformat() if item.available_at else None,
+                    "availabilityBasis": item.availability_basis, "collectedAt": item.collected_at.isoformat(),
+                    "contentFingerprint": item.content_fingerprint, "metrics": item.metrics,
+                    "rawEvidenceRef": item.raw_evidence_ref, "provenanceLevel": item.provenance_level,
                 }
-                for item in trusted_observations
+                for item in sorted(trusted_observations, key=lambda row: (row.id, row.collected_at))
             ],
             "behaviorApplicability": current.behavior_evidence_state.value,
+            "clusterAssignmentVersion": CLUSTER_VERSION,
+            "clusterVersion": current.cluster_version,
+            "featureRegistryVersion": feature_registry_version,
+            "featureRegistryDigest": feature_registry_digest,
+            "baselineDigest": baseline_digest,
             "scoreVersion": SCORE_VERSION,
             "thresholdVersion": THRESHOLD_VERSION,
+            "evidencePolicyVersion": EVIDENCE_POLICY_VERSION,
+            "labelPolicyVersion": LABEL_POLICY_VERSION,
+            "identityVersion": "identity-account-fallback-v1",
         }
         digest = hashlib.sha256(json.dumps(digest_material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         input_digest = f"sha256:{digest}"
@@ -305,27 +578,8 @@ class EventProcessor:
             if committed is None:
                 raise RuntimeError(f"score digest exists without event state: {event_id}")
             return committed
-        signal_snapshots = _snapshots(trusted_observations)
-        evaluation_at = max(item.collected_at for item in trusted_observations)
-        bucket_at = _score_bucket(evaluation_at)
-        earliest = min(trusted_observations, key=lambda item: item.published_at)
-        initializing_from_discovery = current.evidence_count == 0 and not current.timeline
-        effective_event_type = infer_event_type(earliest) if initializing_from_discovery else current.event_type
-        effective_first_seen = (
-            earliest.published_at
-            if initializing_from_discovery
-            else min(current.first_seen, earliest.published_at)
-        )
-        pending_baseline = self._pending_baselines.get(event_id)
-        if pending_baseline and pending_baseline[0] < bucket_at:
-            self._record_baseline(pending_baseline[1], pending_baseline[2])
-        baseline_history = self._baseline_history[effective_event_type]
         metrics = aggregate_metrics(effective_event_type, signal_snapshots, Baseline(dict(baseline_history)))
         baseline_samples = max((len(values) for values in baseline_history.values()), default=0)
-        # Do not let an event calibrate itself while its 15-minute scoring bucket
-        # is still being assembled. The latest bucket becomes historical only
-        # when a later bucket arrives.
-        self._pending_baselines[event_id] = (bucket_at, effective_event_type, signal_snapshots)
         prior_timeline = [point for point in current.timeline if point.at < bucket_at]
         previous_point = prior_timeline[-1] if prior_timeline else None
         velocity = 0.0 if previous_point is None else round(((metrics.attention - previous_point.attention) + (metrics.behavior - previous_point.behavior)) / 2, 2)
@@ -347,10 +601,9 @@ class EventProcessor:
             previous_state=current.state,
             behavior_applicable=behavior_applicable,
         )
-        result = score_event(
-            score_input,
-            hours_since_first_seen=max(0, (evaluation_at - effective_first_seen).total_seconds() / 3600),
-        )
+        hours_since_first_seen = max(0, (evaluation_at - effective_first_seen).total_seconds() / 3600)
+        result = score_event(score_input, hours_since_first_seen=hours_since_first_seen)
+        stable_labels = self._stable_labels(event_id, current, result.labels, bucket_at)
 
         evidence_items = _evidence_items(event_id, observations)
         verified_evidence_count = sum(
@@ -366,8 +619,9 @@ class EventProcessor:
             "title": earliest.title or earliest.text[:120] or "未命名 AI 事件",
             "title_en": earliest.title or earliest.text[:120] or "Untitled AI event",
             "event_type": effective_event_type,
+            "classification_status": "supported", "unsupported_reason": None,
             "first_seen": effective_first_seen,
-            "state": result.state, "labels": result.labels, "attention": metrics.attention,
+            "state": result.state, "labels": stable_labels, "attention": metrics.attention,
             "behavior": metrics.behavior, "diversity": metrics.diversity, "authority": metrics.authority,
             "coordination_risk": metrics.coordination_risk, "coverage": score_input.coverage,
             "uncertainty": result.uncertainty, "evidence_strength": strength_tier(result.evidence_strength),
@@ -395,12 +649,29 @@ class EventProcessor:
             "timeline": timeline, "evidence": evidence_items[:30],
             "score_version": SCORE_VERSION, "threshold_version": THRESHOLD_VERSION,
         })
+        replay_payload = updated.model_dump(mode="json", by_alias=True)
+        replay_payload["_replay"] = {
+            "scoreInput": score_input_record(score_input),
+            "hoursSinceFirstSeen": hours_since_first_seen,
+            "expected": {
+                "state": result.state.value, "labels": [label.value for label in result.labels],
+                "evidenceStrength": result.evidence_strength, "uncertainty": result.uncertainty,
+                "gapResidual": result.gap_residual,
+            },
+        }
         score_record = StoredScore(
             event_id=event_id, score_version=SCORE_VERSION, threshold_version=THRESHOLD_VERSION,
+            baseline_version=f"baseline-{effective_event_type.value}-{baseline_fact_count}",
+            baseline_digest=baseline_digest,
+            feature_registry_version=feature_registry_version, feature_registry_digest=feature_registry_digest,
+            evidence_policy_version=EVIDENCE_POLICY_VERSION, label_policy_version=LABEL_POLICY_VERSION,
+            cluster_version=updated.cluster_version, identity_version="identity-account-fallback-v1",
+            input_observation_ids=sorted({item.id for item in trusted_observations}),
             input_from=min(item.collected_at for item in trusted_observations),
             input_to=max(item.collected_at for item in trusted_observations), input_digest=input_digest,
-            drivers=drivers, payload=updated.model_dump(mode="json", by_alias=True),
+            drivers=drivers, payload=replay_payload,
             created_at=datetime.now(timezone.utc),
         )
         self.repository.commit_scored_event(updated, score_record)
+        self._record_baseline(event_id, effective_event_type, signal_snapshots)
         return updated

@@ -1,0 +1,135 @@
+import AxeBuilder from "@axe-core/playwright";
+import { expect, test, type Page, type Route } from "@playwright/test";
+import { demoPayload } from "../../app/lib/demo-data";
+
+const now = new Date().toISOString();
+const receipt = (operation: string) => ({
+  id: crypto.randomUUID(), status: "completed", operation, createdAt: now,
+});
+
+async function mockApi(page: Page) {
+  await page.addInitScript(() => {
+    class StableEventSource {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 2;
+      readonly CONNECTING = 0;
+      readonly OPEN = 1;
+      readonly CLOSED = 2;
+      readonly readyState = 1;
+      readonly url: string;
+      readonly withCredentials = false;
+      onopen = null;
+      onmessage = null;
+      onerror = null;
+      constructor(url: string | URL) { this.url = String(url); }
+      addEventListener() {}
+      removeEventListener() {}
+      dispatchEvent() { return true; }
+      close() {}
+    }
+    Object.defineProperty(window, "EventSource", { value: StableEventSource, configurable: true });
+  });
+  await page.route("http://127.0.0.1:8017/**", async (route: Route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path === "/api/v1/radar") {
+      await route.fulfill({ json: { ...demoPayload, generatedAt: now, dataMode: "live" } });
+      return;
+    }
+    if (path === "/api/v1/stream") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: ": ready\n\n" });
+      return;
+    }
+    if (path === "/api/v1/watchlists" && request.method() === "GET") {
+      await route.fulfill({ json: { items: [] } });
+      return;
+    }
+    if (path === "/api/v1/coverage") {
+      await route.fulfill({ json: { budget: { currency: "CNY", spent: 0, limit: 2000, remaining: 2000 } } });
+      return;
+    }
+    if (/\/api\/v1\/events\/[^/]+\/lineage$/.test(path)) {
+      const eventId = decodeURIComponent(path.split("/")[4]);
+      await route.fulfill({ json: { eventId, clusterVersion: 1, supersededBy: [], parents: [], children: [], currentObservationCount: 3, pendingOperations: [] } });
+      return;
+    }
+    if (/\/api\/v1\/events\/[^/]+$/.test(path)) {
+      await route.fulfill({ json: {
+        assessment: null,
+        decisionContext: { queueEligibilityKey: "queue:test:1", alertDeliveryKey: "alert:test:1", capturedAt: now },
+      } });
+      return;
+    }
+    const operation = path.includes("watchlists") ? "watchlist.create"
+      : path.includes("feedback") ? "feedback.create"
+        : path.includes("interactions") ? "interaction.create" : "test.create";
+    await route.fulfill({ json: receipt(operation) });
+  });
+}
+
+async function assertNoWcagAaViolations(page: Page) {
+  const result = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+  expect(result.violations, JSON.stringify(result.violations, null, 2)).toEqual([]);
+}
+
+test("desktop keyboard flow and chart data alternative pass WCAG AA scan", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/");
+  await expect(page.getByText("LIVE PIPELINE")).toBeVisible();
+
+  await page.keyboard.press("/");
+  await expect(page.getByLabel("搜索事件")).toBeFocused();
+  await page.getByLabel("关闭详情").click();
+  const firstRow = page.locator(".event-select").first();
+  await firstRow.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByLabel("事件研判详情")).toBeVisible();
+
+  await page.getByRole("button", { name: "信号雷达" }).click();
+  await page.getByText("查看图表数据表").click();
+  await expect(page.getByRole("table").last()).toContainText("讨论");
+  await assertNoWcagAaViolations(page);
+});
+
+test("mobile user can filter, watch and accept with dialog focus containment", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockApi(page);
+  await page.goto("/");
+
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
+  await page.getByLabel("关闭详情").click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
+
+  await page.getByLabel("打开导航").click();
+  await expect(page.getByLabel("关闭导航")).toHaveAttribute("aria-expanded", "true");
+  await page.keyboard.press("Escape");
+  await expect(page.getByLabel("打开导航")).toBeFocused();
+  await expect(page.locator("#mobile-navigation")).toHaveAttribute("aria-hidden", "true");
+  await page.getByLabel("打开导航").click();
+  await page.getByRole("button", { name: "数据覆盖" }).click();
+  await expect(page.getByRole("heading", { name: "覆盖与连接器" })).toBeVisible();
+  await page.getByLabel("打开导航").click();
+  await page.getByRole("button", { name: /研判队列/ }).click();
+
+  await page.getByRole("button", { name: /筛选/ }).click();
+  await page.getByRole("dialog").getByLabel("事件类型").selectOption("security_incident");
+  await page.getByRole("button", { name: "应用筛选" }).click();
+  await expect(page.locator(".event-select")).toHaveCount(1);
+
+  const firstRow = page.locator(".event-select").first();
+  await firstRow.focus();
+  await page.keyboard.press("Enter");
+  await expect(dialog).toBeVisible();
+  await expect(page.getByRole("button", { name: "接受", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "关注事件" }).click();
+  await expect(page.getByRole("button", { name: "取消关注" })).toBeVisible();
+  await page.getByRole("button", { name: "接受", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("已接受");
+  await assertNoWcagAaViolations(page);
+});

@@ -1,11 +1,17 @@
 import type { RadarPayload } from "./types";
 
-const t = (hoursAgo: number) => new Date(Date.now() - hoursAgo * 3_600_000).toISOString();
+// This is a recorded fixture, not live data. A fixed reference instant keeps
+// server rendering and browser hydration byte-for-byte deterministic.
+const demoRecordedAt = new Date("2026-07-16T20:27:00.000Z");
+const t = (hoursAgo: number) => new Date(demoRecordedAt.getTime() - hoursAgo * 3_600_000).toISOString();
 
 export const demoPayload: RadarPayload = {
-  generatedAt: new Date().toISOString(),
+  generatedAt: demoRecordedAt.toISOString(),
   dataMode: "recorded_demo",
   window: "6h",
+  totalEvents: 5,
+  limit: 200,
+  hasMore: false,
   events: [
     {
       id: "evt-open-model",

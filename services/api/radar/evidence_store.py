@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
+import uuid
 
 
 def evidence_key(reference: str) -> str:
@@ -19,6 +20,8 @@ def evidence_key(reference: str) -> str:
 class RawEvidenceStore(Protocol):
     async def put(self, reference: str, body: bytes, content_type: str) -> None: ...
     async def delete_many(self, references: list[str]) -> None: ...
+    async def probe(self, bucket: str) -> None: ...
+    async def probe_delete(self, bucket: str) -> None: ...
 
 
 class LocalEvidenceStore:
@@ -37,6 +40,15 @@ class LocalEvidenceStore:
             target = (self.root / evidence_key(reference)).resolve()
             if self.root in target.parents and target.exists():
                 await asyncio.to_thread(target.unlink)
+
+    async def probe(self, bucket: str) -> None:
+        reference = f"r2://{bucket}/.health/{uuid.uuid4().hex}"
+        await self.put(reference, b"ok", "text/plain")
+        await self.delete_many([reference])
+
+    async def probe_delete(self, bucket: str) -> None:
+        """Exercise only the delete capability used by the alert consumer."""
+        await self.delete_many([f"r2://{bucket}/.radar-health-delete/{uuid.uuid4().hex}"])
 
 
 class S3EvidenceStore:
@@ -72,3 +84,22 @@ class S3EvidenceStore:
                 if errors:
                     failed = ", ".join(str(item.get("Key", "unknown")) for item in errors)
                     raise RuntimeError(f"raw evidence deletion was only partially successful: {failed}")
+
+    async def probe(self, bucket: str) -> None:
+        """Verify the exact bucket has write, read and delete permissions."""
+        key = f".radar-health/{uuid.uuid4().hex}"
+        try:
+            await asyncio.to_thread(
+                self.client.put_object, Bucket=bucket, Key=key, Body=b"radar-health", ContentType="text/plain",
+            )
+            response = await asyncio.to_thread(self.client.get_object, Bucket=bucket, Key=key)
+            body = await asyncio.to_thread(response["Body"].read)
+            if body != b"radar-health":
+                raise RuntimeError("R2 probe returned unexpected bytes")
+        finally:
+            await asyncio.to_thread(self.client.delete_object, Bucket=bucket, Key=key)
+
+    async def probe_delete(self, bucket: str) -> None:
+        """Verify delete-only credentials without requiring write or read access."""
+        key = f".radar-health-delete/{uuid.uuid4().hex}"
+        await asyncio.to_thread(self.client.delete_object, Bucket=bucket, Key=key)

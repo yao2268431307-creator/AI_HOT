@@ -206,6 +206,7 @@ async def test_s3_compatible_raw_evidence_put_read_and_delete() -> None:
     store = S3EvidenceStore(endpoint, access_key, secret_key)
     store.client.create_bucket(Bucket=bucket)
     try:
+        await store.probe_delete(bucket)
         await store.put(reference, b'{"evidence":true}', "application/json")
         response = store.client.get_object(Bucket=bucket, Key=key)
         assert response["Body"].read() == b'{"evidence":true}'

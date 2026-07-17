@@ -1,0 +1,71 @@
+name: signal-ai-radar
+
+x-api-runtime: &api-runtime
+  image: "${RADAR_API_IMAGE_REPOSITORY:?RADAR_API_IMAGE_REPOSITORY is required}@${RADAR_API_IMAGE_DIGEST:?RADAR_API_IMAGE_DIGEST must be sha256}"
+  restart: unless-stopped
+  environment:
+    RADAR_ACTUAL_IMAGE_DIGESTS: '{"api":"${RADAR_API_IMAGE_DIGEST}","web":"${RADAR_WEB_IMAGE_DIGEST}"}'
+  networks: [backend]
+  deploy:
+    resources:
+      limits: { cpus: "2.0", memory: 2G }
+      reservations: { cpus: "0.25", memory: 256M }
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: ["/tmp:size=128m,mode=1777"]
+
+services:
+  api:
+    <<: *api-runtime
+    env_file: ${RADAR_API_ENV_FILE:?RADAR_API_ENV_FILE is required}
+    command: ["python", "-m", "uvicorn", "radar.main:app", "--host", "0.0.0.0", "--port", "8017", "--workers", "2"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8017/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    ports: ["127.0.0.1:${RADAR_API_PORT:-8017}:8017"]
+
+  scheduler-worker:
+    <<: *api-runtime
+    env_file: ${RADAR_SCHEDULER_ENV_FILE:?RADAR_SCHEDULER_ENV_FILE is required}
+    command: ["python", "-m", "radar.runner", "--interval-seconds", "900"]
+    environment:
+      RADAR_ACTUAL_IMAGE_DIGESTS: '{"api":"${RADAR_API_IMAGE_DIGEST}","web":"${RADAR_WEB_IMAGE_DIGEST}"}'
+      DELETION_DATABASE_URL: ""
+      SOURCE_IDENTITIES_FILE: /run/config/source_identities.json
+    volumes:
+      - "${RADAR_SOURCE_IDENTITIES_FILE:?RADAR_SOURCE_IDENTITIES_FILE is required}:/run/config/source_identities.json:ro"
+    stop_grace_period: 45s
+
+  alert-consumer:
+    <<: *api-runtime
+    env_file: ${RADAR_ALERT_ENV_FILE:?RADAR_ALERT_ENV_FILE is required}
+    command: ["python", "-m", "radar.alert_worker"]
+    environment:
+      RADAR_ACTUAL_IMAGE_DIGESTS: '{"api":"${RADAR_API_IMAGE_DIGEST}","web":"${RADAR_WEB_IMAGE_DIGEST}"}'
+      DELETION_DATABASE_URL: ""
+    stop_grace_period: 45s
+
+  web:
+    image: "${RADAR_WEB_IMAGE_REPOSITORY:?RADAR_WEB_IMAGE_REPOSITORY is required}@${RADAR_WEB_IMAGE_DIGEST:?RADAR_WEB_IMAGE_DIGEST must be sha256}"
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${RADAR_PUBLIC_API_URL:?RADAR_PUBLIC_API_URL is required}
+    ports: ["127.0.0.1:${RADAR_WEB_PORT:-3000}:3000"]
+    networks: [frontend]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777", "/app/.next/cache:size=128m,mode=1777,uid=1000,gid=1000"]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1G }
+        reservations: { cpus: "0.10", memory: 128M }
+
+networks:
+  frontend: {}
+  # Managed PostgreSQL/Redis/R2 and connector providers are external to this
+  # compose project, so runtime services need outbound access. Host exposure is
+  # still limited to explicit loopback port bindings above.
+  backend: {}

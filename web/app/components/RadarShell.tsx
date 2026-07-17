@@ -339,6 +339,7 @@ function DetailPanel({ event, peers, assessment, decisionContext, lineage, windo
       <section className="context-strip"><div><span>NARRATIVE</span><b>{event.narrativeTitle ?? "未关联长期主题"}</b><small>{event.narrativeId ? `主题 ID · ${event.narrativeId}；当前 Event 仍独立评分。` : "当前 Event 独立评分，不推断模型家族或公司级趋势。"}</small></div><div><span>24H 结果</span><b>N/A</b><small>等待冻结结果标注集</small></div><div><span>7D 结果</span><b>N/A</b><small>不得用未来结果回写时点判断</small></div></section>
       <section className="verdict-card">
         <div className="section-kicker"><BookOpenCheck size={14} /> 判定摘要</div>
+        {event.classificationStatus === "unsupported" && <p className="unsupported-notice"><b>未支持队列：</b>{event.unsupportedReason ?? "该候选不属于 V1 五类评分模型。"}</p>}
         <p>{event.driver}</p>
         <div className="coverage-note"><ShieldCheck size={14} /><span>{event.coverageNote}</span></div>
       </section>
@@ -370,6 +371,7 @@ function DetailPanel({ event, peers, assessment, decisionContext, lineage, windo
           </div>)}
         </div>
         <div className="legend">{hasDiscussion && <span><i className="legend-attention" />讨论</span>}{hasBehavior && <span><i className="legend-behavior" />行为</span>}{hasBehavior && <span className="mono">残差 {event.gapResidual > 0 ? "+" : ""}{event.gapResidual}</span>}</div>
+        <details className="trajectory-data"><summary>查看轨迹数据表</summary><table><thead><tr><th>时间</th><th>讨论</th><th>行为</th></tr></thead><tbody>{event.timeline.map((point) => <tr key={point.at}><td>{new Date(point.at).toLocaleString("zh-CN")}</td><td>{hasDiscussion ? point.attention : "N/A"}</td><td>{hasBehavior ? point.behavior : "N/A"}</td></tr>)}</tbody></table></details>
       </section>
       <section className="state-history">
         <div className="section-title"><span>状态时间线</span><span className="mono">CLUSTER V{event.clusterVersion ?? 1}</span></div>
@@ -441,16 +443,18 @@ function AlertRuleDialog() {
 }
 
 function FilterDialog({ filters, onChange }: { filters: Filters; onChange: (next: Filters) => void }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<Filters>(filters);
   const active = Object.values(filters).filter((value) => value !== "all").length;
-  return <Dialog.Root>
+  return <Dialog.Root open={open} onOpenChange={(nextOpen) => { setOpen(nextOpen); if (nextOpen) setDraft(filters); }}>
     <Dialog.Trigger asChild><button className="filter-button"><Filter size={14} /> 筛选 {active > 0 && <span>{active}</span>}</button></Dialog.Trigger>
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay" /><Dialog.Content className="dialog-content filter-dialog">
       <Dialog.Title>筛选研判队列</Dialog.Title>
       <Dialog.Description>筛选只影响当前工作台，不改变评分或告警规则。</Dialog.Description>
-      <label>生命周期<select value={filters.state} onChange={(event) => onChange({ ...filters, state: event.target.value as Filters["state"] })}><option value="all">全部阶段</option>{Object.entries(stateName).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-      <label>事件类型<select value={filters.eventType} onChange={(event) => onChange({ ...filters, eventType: event.target.value as Filters["eventType"] })}><option value="all">全部类型</option><option value="model_release">模型发布</option><option value="developer_tool_release">开发工具</option><option value="research_or_benchmark">研究 / 基准</option><option value="official_product_release">产品发布</option><option value="security_incident">安全事件</option></select></label>
-      <label>证据强度<select value={filters.evidence} onChange={(event) => onChange({ ...filters, evidence: event.target.value as Filters["evidence"] })}><option value="all">全部强度</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
-      <div className="dialog-actions"><button type="button" className="button-secondary" onClick={() => onChange({ state: "all", eventType: "all", evidence: "all" })}>清空</button><Dialog.Close asChild><button className="button-primary" type="button">应用筛选</button></Dialog.Close></div>
+      <label>生命周期<select value={draft.state} onChange={(event) => setDraft({ ...draft, state: event.target.value as Filters["state"] })}><option value="all">全部阶段</option>{Object.entries(stateName).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <label>事件类型<select value={draft.eventType} onChange={(event) => setDraft({ ...draft, eventType: event.target.value as Filters["eventType"] })}><option value="all">全部类型</option><option value="model_release">模型发布</option><option value="developer_tool_release">开发工具</option><option value="research_or_benchmark">研究 / 基准</option><option value="official_product_release">产品发布</option><option value="security_incident">安全事件</option></select></label>
+      <label>证据强度<select value={draft.evidence} onChange={(event) => setDraft({ ...draft, evidence: event.target.value as Filters["evidence"] })}><option value="all">全部强度</option><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
+      <div className="dialog-actions"><button type="button" className="button-secondary" onClick={() => setDraft({ state: "all", eventType: "all", evidence: "all" })}>清空</button><button className="button-primary" type="button" onClick={() => { onChange(draft); setOpen(false); }}>应用筛选</button></div>
       <Dialog.Close className="dialog-close" aria-label="关闭"><X size={17} /></Dialog.Close>
     </Dialog.Content></Dialog.Portal>
   </Dialog.Root>;
@@ -499,15 +503,22 @@ function CoverageView({ connectors, budget }: { connectors: ConnectorStatus[]; b
   const families = new Set(connectors.filter((c) => c.status !== "paused").map((c) => c.family)).size;
   const latencies = connectors.filter((c) => c.status !== "paused").map((c) => c.latencyMinutes).sort((a, b) => a - b);
   const p95Latency = latencies.length ? latencies[Math.ceil(latencies.length * .95) - 1] : null;
+  const connectorBudgetLimits = budget?.connectorLimits ?? [];
+  const familyBudgetLimits = budget?.signalFamilyLimits ?? [];
   return (
     <div className="content-view coverage-view">
       <div className="view-heading"><div><div className="eyebrow">DATA PLANE</div><h1>覆盖与连接器</h1><p>数据缺口会显式降低证据强度，不会被解释为热度下降。</p></div></div>
       <div className="coverage-summary"><div><b>{healthy}/{connectors.length}</b><span>健康连接器</span></div><div><b>{observations.toLocaleString()}</b><span>24H 观测</span></div><div><b>{families}</b><span>独立信号家族</span></div><div><b>{p95Latency === null ? "N/A" : `${p95Latency}m`}</b><span>P95 采集轮次耗时</span></div><div><b>{budget ? `¥${budget.spent.toFixed(0)} / ¥${budget.limit.toFixed(0)}` : "N/A"}</b><span>{budget ? `本月剩余 ¥${budget.remaining.toFixed(0)}` : "预算接口未连接"}</span></div></div>
+      {budget && (connectorBudgetLimits.length > 0 || familyBudgetLimits.length > 0) && <section className="budget-scope-grid" aria-label="分类预算硬闸门">
+        {[...connectorBudgetLimits.map((item) => ({ ...item, kind: "连接器" })), ...familyBudgetLimits.map((item) => ({ ...item, kind: "信号族" }))].map((item) => <article className={`budget-scope-card ${item.hardPaused ? "budget-paused" : ""}`} key={`${item.kind}-${item.scope}`}>
+          <small>{item.kind}</small><b>{item.scope}</b><span className="mono">¥{item.spent.toFixed(1)} / ¥{item.limit.toFixed(1)}</span><em>{item.hardPaused ? "硬暂停" : `剩余 ¥${item.remaining.toFixed(1)}`}</em>
+        </article>)}
+      </section>}
       <div className="connector-grid">{connectors.map((connector) => (
         <article className="connector-card" key={connector.id}>
           <div className="connector-head"><div className="connector-icon"><Database size={18} /></div><div><h3>{connector.name}</h3><span>{connector.family}</span></div><span className={`connector-status connector-${connector.status}`}>{connector.status}</span></div>
           <div className="connector-metrics"><div><span>覆盖</span><b>{connector.coverage}%</b></div><div><span>延迟</span><b>{connector.status === "paused" ? "—" : `${connector.latencyMinutes}m`}</b></div><div><span>24H</span><b>{connector.observations24h.toLocaleString()}</b></div></div>
-          <div className="connector-ops"><span>配额 {connector.quotaLimit ? `${connector.quotaUsed ?? 0} / ${connector.quotaLimit}` : "N/A"}</span><span>本月成本 {connector.costRmbMonth == null ? "N/A" : `¥${connector.costRmbMonth}`}</span><span>权利 {connector.rightsStatus === "blocked" ? "关闭" : connector.rightsStatus === "experimental" ? "实验" : "可用"}</span></div>
+          <div className="connector-ops"><span>配额 {connector.quotaLimit ? `${connector.quotaUsed ?? 0} / ${connector.quotaLimit}` : "N/A"}</span><span>本月成本 {connector.costRmbMonth == null ? "N/A" : `¥${connector.costRmbMonth}`}</span><span>权利 {connector.rightsStatus === "active" ? "可用" : connector.rightsStatus === "pending" ? "待审" : connector.rightsStatus === "experimental" ? "实验" : "关闭"}</span></div>
           <div className="connector-progress"><i style={{ width: `${connector.coverage}%` }} /></div>
           <p>{connector.note}</p><small>最近成功 · {timeAgo(connector.lastSuccess)}</small>
         </article>
@@ -558,6 +569,8 @@ export function RadarShell() {
   const [watchedIds, setWatchedIds] = useState<Set<string>>(new Set());
   const [showWatched, setShowWatched] = useState(false);
   const searchInput = useRef<HTMLInputElement>(null);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const detailTrigger = useRef<HTMLElement | null>(null);
   const interactionSession = useRef("");
   const recordInteraction = useCallback(async (kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled", eventId: string, metadata: Record<string, string | number | boolean> = {}) => {
     if (!interactionSession.current) {
@@ -694,16 +707,47 @@ export function RadarShell() {
     const matchesQuery = `${event.title} ${event.titleEn} ${event.platforms.join(" ")}`.toLowerCase().includes(query.toLowerCase());
     return matchesQuery && (!showWatched || watchedIds.has(event.id)) && (filters.state === "all" || event.state === filters.state) && (filters.eventType === "all" || event.eventType === filters.eventType) && (filters.evidence === "all" || event.evidenceStrength === filters.evidence);
   }), [payload.events, query, filters, showWatched, watchedIds]);
+  const applyFilters = useCallback((next: Filters) => {
+    setFilters(next);
+    const nextEvents = payload.events.filter((event) => {
+      const matchesQuery = `${event.title} ${event.titleEn} ${event.platforms.join(" ")}`.toLowerCase().includes(query.toLowerCase());
+      return matchesQuery && (!showWatched || watchedIds.has(event.id)) && (next.state === "all" || event.state === next.state) && (next.eventType === "all" || event.eventType === next.eventType) && (next.evidence === "all" || event.evidenceStrength === next.evidence);
+    });
+    if (selectedId && !nextEvents.some((event) => event.id === selectedId)) {
+      setDetailOpen(false);
+      setSelectedId(nextEvents[0]?.id ?? "");
+    }
+  }, [payload.events, query, selectedId, showWatched, watchedIds]);
+  useEffect(() => {
+    if (!mobileNav) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMobileNav(false);
+      window.setTimeout(() => menuButton.current?.focus(), 0);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileNav]);
   const radarEvents = useMemo(() => events.filter((event) =>
     discussionObserved(event) && behaviorObserved(event)
   ), [events]);
-  const selected = payload.events.find((event) => event.id === selectedId) ?? payload.events[0];
+  const selected = events.find((event) => event.id === selectedId);
   const strongLifecycle = payload.events.filter((e) => e.state === "accelerating" || e.state === "established").length;
   const gap = payload.events.filter((e) => e.labels.includes("attention_behavior_gap")).length;
   const concentrated = payload.events.filter((e) => e.labels.includes("platform_concentrated")).length;
   const generatedAtMs = new Date(payload.generatedAt).getTime();
   const recentlyUpdated = payload.events.filter((event) => generatedAtMs - new Date(event.updatedAt).getTime() <= 3_600_000).length;
-  const selectEvent = useCallback((id: string) => { setSelectedId(id); setDetailAssessment(null); setDetailDecisionContext(null); setDetailLineage(null); setDetailOpen(true); }, []);
+  const selectEvent = useCallback((id: string) => {
+    detailTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (id !== selectedId) {
+      setSelectedId(id);
+      setDetailAssessment(null);
+      setDetailDecisionContext(null);
+      setDetailLineage(null);
+    }
+    setDetailOpen(true);
+  }, [selectedId]);
+  const closeDetail = useCallback(() => { setDetailOpen(false); window.setTimeout(() => detailTrigger.current?.focus(), 0); }, []);
   const refreshLineage = useCallback(() => {
     if (!selectedId || dataMode !== "live") return;
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
@@ -722,9 +766,10 @@ export function RadarShell() {
     <Tooltip.Provider delayDuration={250}>
       <div className="app-shell">
         <header className="topbar">
-          <button className="mobile-menu icon-button" onClick={() => setMobileNav((v) => !v)} aria-label="打开导航"><Menu size={19} /></button>
+          <button ref={menuButton} className="mobile-menu icon-button" onClick={() => setMobileNav((v) => !v)} aria-label={mobileNav ? "关闭导航" : "打开导航"} aria-expanded={mobileNav} aria-controls="mobile-navigation"><Menu size={19} /></button>
           <div className="brand"><span className="brand-mark"><Radar size={19} /></span><b>SIGNAL<span>{"//"}</span>AI</b><small>开发者与研究生态信号 Beta</small></div>
           <div className="system-status"><i className={dataMode === "live" ? "pulse-live" : "pulse-demo"} /><span>{dataMode === "live" ? "LIVE PIPELINE" : dataMode === "stale" ? "POLLING / STALE" : "RECORDED DEMO"}</span><em>·</em><span>更新 {timeAgo(payload.generatedAt)}</span></div>
+          <span className="mobile-pipeline-status">{dataMode === "live" ? "LIVE" : dataMode === "stale" ? "STALE" : "DEMO"}</span>
           <div className="top-actions">
             <Tooltip.Root><Tooltip.Trigger asChild><button className="icon-button" aria-label="搜索" onClick={() => { setView("queue"); window.setTimeout(() => searchInput.current?.focus(), 0); }}><Search size={17} /></button></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip">快捷搜索 <kbd>/</kbd><Tooltip.Arrow className="tooltip-arrow" /></Tooltip.Content></Tooltip.Portal></Tooltip.Root>
             <AlertRuleDialog />
@@ -732,21 +777,21 @@ export function RadarShell() {
           </div>
         </header>
 
-        <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
+        <aside id="mobile-navigation" className={`sidebar ${mobileNav ? "open" : ""}`} aria-hidden={mobileDetail ? !mobileNav : undefined} inert={mobileDetail && !mobileNav ? true : undefined}>
           <nav aria-label="主导航">
             {([
               ["queue", LayoutList, "研判队列"], ["radar", CircleGauge, "信号雷达"],
               ["sources", UsersRound, "信源治理"], ["coverage", Database, "数据覆盖"],
               ["method", BookOpenCheck, "方法与边界"],
-            ] as const).map(([id, Icon, label]) => <button key={id} className={view === id ? "active" : ""} onClick={() => { setView(id); setMobileNav(false); }}><Icon size={17} /><span>{label}</span>{id === "queue" && <em>{events.length}</em>}</button>)}
+            ] as const).map(([id, Icon, label]) => <button key={id} className={view === id ? "active" : ""} aria-current={view === id ? "page" : undefined} onClick={() => { setView(id); setMobileNav(false); window.setTimeout(() => menuButton.current?.focus(), 0); }}><Icon size={17} /><span>{label}</span>{id === "queue" && <em>{events.length}</em>}</button>)}
           </nav>
-          <div className="sidebar-section"><span>工作区</span><button><Activity size={16} /><span>AI 行业雷达</span><i className="workspace-dot" /></button></div>
+          <div className="sidebar-section"><span>工作区</span><button type="button" disabled><Activity size={16} /><span>AI 行业雷达</span><i className="workspace-dot" /></button></div>
           <div className="sidebar-foot"><div><b>V1 · RC2</b><span>评分引擎 0.6.0</span></div><small>预算守卫已启用 · 实时支出见覆盖页</small><i><em style={{ width: "0%" }} /></i></div>
         </aside>
 
         <main className={`main ${detailOpen && (view === "queue" || view === "radar") ? "with-detail" : ""}`}>
           {view === "queue" && <div className="content-view queue-view">
-            <div className="view-heading"><div><div className="eyebrow">REVIEW QUEUE / {windowSize}</div><h1>AI 热点研判队列</h1><p>优先处理高速度、高证据、状态刚发生变化的事件。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
+            <div className="view-heading"><div><div className="eyebrow">REVIEW QUEUE / {windowSize}</div><h1>AI 热点研判队列</h1><p>优先处理高速度、高证据、状态刚发生变化的事件。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} aria-pressed={windowSize === item} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
             <div className="summary-grid">
               <div className="summary-card"><span>待研判事件</span><b>{payload.events.length.toString().padStart(2, "0")}</b><small><i className="dot-blue" /> {recentlyUpdated} 个事件在 1 小时内更新</small></div>
               <div className="summary-card"><span>加速 / 已建立</span><b className="tone-green">{strongLifecycle.toString().padStart(2, "0")}</b><small>满足对应事件类型的阶段门槛</small></div>
@@ -754,26 +799,31 @@ export function RadarShell() {
               <div className="summary-card"><span>单平台集中</span><b className="tone-amber">{concentrated.toString().padStart(2, "0")}</b><small>尚未跨平台迁移</small></div>
             </div>
             <section className="queue-section">
-              <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input ref={searchInput} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索事件、平台或信源…" aria-label="搜索事件" /></div><button className={`filter-button watch-toggle ${showWatched ? "active" : ""}`} aria-pressed={showWatched} onClick={() => setShowWatched((value) => !value)}><Bell size={14} />只看关注 <span>{watchedIds.size}</span></button><FilterDialog filters={filters} onChange={setFilters} /><div className="queue-count">显示 {events.length} / {payload.events.length}</div></div>
+              <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input ref={searchInput} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索事件、平台或信源…" aria-label="搜索事件" /></div><button className={`filter-button watch-toggle ${showWatched ? "active" : ""}`} aria-pressed={showWatched} onClick={() => setShowWatched((value) => !value)}><Bell size={14} />只看关注 <span>{watchedIds.size}</span></button><FilterDialog filters={filters} onChange={applyFilters} /><div className="queue-count">显示 {events.length} / {payload.events.length}</div></div>
               <QueueTable events={events} selectedId={selectedId} windowSize={windowSize} onSelect={selectEvent} />
             </section>
           </div>}
-          {view === "radar" && <div className="content-view radar-view"><div className="view-heading"><div><div className="eyebrow">SIGNAL MAP / {windowSize}</div><h1>讨论 × 行为信号雷达</h1><p>坐标只用于适配事件类型；圆点大小表示证据强度。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div><section className="radar-card"><div className="radar-legend"><span><i className="state-accelerating-dot" />加速</span><span><i className="state-emerging-dot" />萌发</span><span><i className="state-detected-dot" />已发现</span></div><Suspense fallback={<div className="radar-chart" role="status">正在加载雷达图…</div>}><RadarChart events={radarEvents} onSelect={selectEvent} /></Suspense><details className="radar-data"><summary>查看图表数据表</summary><div className="table-scroll"><table><thead><tr><th>事件</th><th>讨论</th><th>行为</th><th>证据</th></tr></thead><tbody>{radarEvents.map((event) => <tr key={event.id}><td>{event.title}</td><td>{event.attention}</td><td>{event.behavior}</td><td>{({ low: "低", medium: "中", high: "高" })[event.evidenceStrength]}</td></tr>)}</tbody></table></div></details></section><div className="radar-insight"><Activity size={18} /><div><b>当前结构</b><p>{strongLifecycle} 个事件处于加速或已建立阶段，{gap} 个事件存在注意力与实际行为的显著偏离。</p></div></div></div>}
+          {view === "radar" && <div className="content-view radar-view">
+            <div className="view-heading"><div><div className="eyebrow">SIGNAL MAP / {windowSize}</div><h1>讨论 × 行为信号雷达</h1><p>坐标只用于适配事件类型；圆点大小表示证据强度。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} aria-pressed={windowSize === item} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
+            <div className="queue-toolbar radar-toolbar"><FilterDialog filters={filters} onChange={applyFilters} /><span className="queue-count">显示 {radarEvents.length} / {payload.events.length}</span></div>
+            <section className="radar-card"><div className="radar-legend"><span><i className="state-accelerating-dot" />加速</span><span><i className="state-emerging-dot" />萌发</span><span><i className="state-detected-dot" />已发现</span></div><Suspense fallback={<div className="radar-chart" role="status">正在加载雷达图…</div>}><RadarChart events={radarEvents} onSelect={selectEvent} /></Suspense><details className="radar-data"><summary>查看图表数据表</summary><div className="table-scroll"><table><thead><tr><th>事件</th><th>阶段</th><th>结构标签</th><th>讨论</th><th>行为</th><th>证据</th></tr></thead><tbody>{radarEvents.map((event) => <tr key={event.id}><td>{event.title}</td><td>{stateName[event.state]}</td><td>{event.labels.map((label) => labelName[label]).join("、") || "无"}</td><td>{event.attention}</td><td>{event.behavior}</td><td>{({ low: "低", medium: "中", high: "高" })[event.evidenceStrength]}</td></tr>)}{radarEvents.length === 0 && <tr><td colSpan={6}>没有同时具备讨论与行为证据的事件。</td></tr>}</tbody></table></div></details></section>
+            <div className="radar-insight"><Activity size={18} /><div><b>当前结构</b><p>{strongLifecycle} 个事件处于加速或已建立阶段，{gap} 个事件存在注意力与实际行为的显著偏离。</p></div></div>
+          </div>}
           {view === "sources" && <SourceView catalog={sourceCatalog} loading={!sourceCatalogFailed} query={sourceQuery} status={sourceStatus} onQueryChange={(value) => { setSourceQuery(value); setSourceOffset(0); }} onStatusChange={(value) => { setSourceStatus(value); setSourceOffset(0); }} onPageChange={setSourceOffset} />}
           {view === "coverage" && <CoverageView connectors={payload.connectors} budget={coverageBudget} />}
           {view === "method" && <MethodView />}
         </main>
         {detailOpen && selected && (view === "queue" || view === "radar") && (mobileDetail ?
-          <Dialog.Root open={detailOpen} onOpenChange={setDetailOpen}>
+          <Dialog.Root open={detailOpen} onOpenChange={(open) => { if (!open) closeDetail(); }}>
             <Dialog.Portal>
               <Dialog.Overlay className="dialog-overlay mobile-detail-overlay" />
               <Dialog.Content className="mobile-detail-dialog" aria-describedby={undefined}>
                 <Dialog.Title className="sr-only">{selected.title}事件研判详情</Dialog.Title>
-                <DetailPanel key={`${selected.id}:${windowSize}`} event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} decisionContext={detailDecisionContext} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={() => setDetailOpen(false)} />
+                <DetailPanel key={`${selected.id}:${windowSize}`} event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} decisionContext={detailDecisionContext} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={closeDetail} />
               </Dialog.Content>
             </Dialog.Portal>
           </Dialog.Root> :
-          <DetailPanel key={`${selected.id}:${windowSize}`} event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} decisionContext={detailDecisionContext} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={() => setDetailOpen(false)} />)}
+          <DetailPanel key={`${selected.id}:${windowSize}`} event={selected} peers={payload.events} assessment={detailAssessment?.eventId === selected.id ? detailAssessment : null} decisionContext={detailDecisionContext} lineage={detailLineage?.eventId === selected.id ? detailLineage : null} windowSize={windowSize} watched={watchedIds.has(selected.id)} onWatchChange={updateWatched} onLineageRefresh={refreshLineage} onInteraction={recordInteraction} onClose={closeDetail} />)}
       </div>
     </Tooltip.Provider>
   );

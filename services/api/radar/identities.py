@@ -27,9 +27,22 @@ class SourceIdentityResolver:
     @classmethod
     def from_json_file(cls, path: str | Path) -> "SourceIdentityResolver":
         rows = json.loads(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(rows, list):
-            raise ValueError("source identity registry must be a JSON array")
-        return cls([SourceIdentity(row["sourceId"], row["accountId"], row["entityId"]) for row in rows])
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("source identity registry must be a non-empty JSON array")
+        identities: list[SourceIdentity] = []
+        source_ids: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("source identity entries must be objects")
+            values = [row.get("sourceId"), row.get("accountId"), row.get("entityId")]
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError("source identity entries require non-empty sourceId/accountId/entityId")
+            source_id, account_id, entity_id = (str(value).strip() for value in values)
+            if source_id in source_ids:
+                raise ValueError(f"duplicate source identity: {source_id}")
+            source_ids.add(source_id)
+            identities.append(SourceIdentity(source_id, account_id, entity_id))
+        return cls(identities)
 
     def resolve(self, observation: Observation) -> Observation:
         identity = self._by_source.get(observation.source_id)

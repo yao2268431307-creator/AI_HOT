@@ -52,6 +52,9 @@ class MetricBundle:
     primary_response_observed: bool
     primary_adoption_score: float
     primary_response_score: float
+    official_source_present: bool
+    research_source_present: bool
+    discussion_source_present: bool
     drivers: list[str]
     max_anomaly_z: float = 0.0
 
@@ -102,7 +105,7 @@ def _platform_family(platform: str) -> str:
 def aggregate_metrics(event_type: EventType, snapshots: list[SignalSnapshot], baseline: Baseline | None = None) -> MetricBundle:
     baseline = baseline or Baseline()
     if not snapshots:
-        return MetricBundle(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, False, False, False, 0, 0, ["没有可用观测"])
+        return MetricBundle(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, False, False, False, 0, 0, False, False, False, ["没有可用观测"])
 
     discussion = [snapshot for snapshot in snapshots if snapshot.signal_family == "discussion"]
     behavior_rows = [snapshot for snapshot in snapshots if snapshot.signal_family == "behavior"]
@@ -114,8 +117,10 @@ def aggregate_metrics(event_type: EventType, snapshots: list[SignalSnapshot], ba
     for snapshot in discussion:
         for metric in ("comments", "replies", "mentions", "score"):
             if metric in snapshot.metrics:
-                discussion_growth.append(_normalized_growth(metric, snapshot.metrics[metric], snapshot.previous_metrics.get(metric, 0), baseline, snapshot.platform))
-                anomaly_scores.append(_growth_anomaly_z(metric, snapshot.metrics[metric], snapshot.previous_metrics.get(metric, 0), baseline, snapshot.platform))
+                if metric not in snapshot.previous_metrics:
+                    continue
+                discussion_growth.append(_normalized_growth(metric, snapshot.metrics[metric], snapshot.previous_metrics[metric], baseline, snapshot.platform))
+                anomaly_scores.append(_growth_anomaly_z(metric, snapshot.metrics[metric], snapshot.previous_metrics[metric], baseline, snapshot.platform))
     attention = clamp(unique_discussers * 8 + (sum(discussion_growth) / len(discussion_growth) if discussion_growth else 0) * .55)
 
     valid_metrics = BEHAVIOR_METRICS[event_type]
@@ -126,17 +131,21 @@ def aggregate_metrics(event_type: EventType, snapshots: list[SignalSnapshot], ba
         for metric in valid_metrics:
             if metric not in snapshot.metrics:
                 continue
+            # Cumulative provider counters need two snapshots. Treat the first
+            # value as a baseline seed, never as growth from an invented zero.
+            if metric not in snapshot.previous_metrics:
+                continue
             role = METRIC_ROLES[event_type][metric]
             if role == "attention_only":
                 continue
             rule = METRIC_RULES[event_type][metric]
             if float(rule["weight"]) <= 0 or not snapshot.verifiable:
                 continue
-            score = _normalized_growth(metric, snapshot.metrics[metric], snapshot.previous_metrics.get(metric, 0), baseline, snapshot.platform)
+            score = _normalized_growth(metric, snapshot.metrics[metric], snapshot.previous_metrics[metric], baseline, snapshot.platform)
             feature_samples[metric].append(score)
             feature_sample_keys[metric].add((snapshot.source_group, snapshot.captured_at))
             feature_platform_samples[metric][_platform_family(snapshot.platform)].append(score)
-            anomaly_scores.append(_growth_anomaly_z(metric, snapshot.metrics[metric], snapshot.previous_metrics.get(metric, 0), baseline, snapshot.platform))
+            anomaly_scores.append(_growth_anomaly_z(metric, snapshot.metrics[metric], snapshot.previous_metrics[metric], baseline, snapshot.platform))
 
     feature_scores = {
         metric: sum(scores) / len(scores)
@@ -225,7 +234,11 @@ def aggregate_metrics(event_type: EventType, snapshots: list[SignalSnapshot], ba
         round(coordination, 2), round(coverage, 2), round(verifiability, 2),
         round(concentration, 4), len(families), platform_families, ownership_entities, behavior_observed,
         primary_adoption_observed, primary_response_observed,
-        round(primary_adoption_score, 2), round(primary_response_score, 2), drivers,
+        round(primary_adoption_score, 2), round(primary_response_score, 2),
+        any(snapshot.signal_family == "official" for snapshot in snapshots),
+        any(snapshot.signal_family == "research" for snapshot in snapshots),
+        any(snapshot.signal_family == "discussion" for snapshot in snapshots),
+        drivers,
         max(anomaly_scores, default=0.0),
     )
 
@@ -255,5 +268,8 @@ def to_score_input(event_type: EventType, metrics: MetricBundle, *, velocity: fl
         primary_response_observed=metrics.primary_response_observed,
         primary_adoption_score=metrics.primary_adoption_score,
         primary_response_score=metrics.primary_response_score,
+        official_source_present=metrics.official_source_present,
+        research_source_present=metrics.research_source_present,
+        discussion_source_present=metrics.discussion_source_present,
         previous_state=previous_state,
     )

@@ -40,7 +40,10 @@ class HuggingFaceConnector(BaseConnector):
                 id=f"hf:{model_id}", platform=self.platform,
                 externalId=model_id, sourceId=f"hf:{model_id.split('/')[0]}", publishedAt=published, collectedAt=collected,
                 language="en", title=model_id, text=text, url=url,
-                metrics={"downloads": float(model.get("downloads", 0)), "likes": float(model.get("likes", 0)), "trending": float(model.get("trendingScore", 0) or 0)},
+                metrics={
+                    "downloads": float(model.get("downloads", 0)),
+                    "likes": float(model.get("likes", 0)),
+                },
                 rawEvidenceRef=item_ref, relation="original",
                 contentFingerprint=content_fingerprint(model_id, text, url), signalFamily="behavior",
             ))

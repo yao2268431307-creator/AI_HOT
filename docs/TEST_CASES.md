@@ -1,7 +1,7 @@
 # AI 热点雷达 V1 用例设计
 
 版本：`test-cases-2026-07-17`
-对应评分：`score-0.6.0` / `thresholds-2026-07-rc2`
+对应评分：`score-0.7.0` / `thresholds-2026-07-rc3`
 
 ## 自动化验收矩阵
 
@@ -107,7 +107,7 @@
 | E-11 | Precision 与提前量防自证 | Top-5 快照和 baseline 首次发现时间由同一角色或未登记密钥签名 | 拒绝；Precision 要求两个 reviewer 独立签名且点估计、95% CI 下界均 ≥ 0.70，提前量必须使用独立 baseline collector 的全量 eligible manifest 和首次发现日志 |
 | W-01 | Web | 服务端渲染首页 | 返回 200、正确标题、研判队列与覆盖说明 |
 | W-02 | Web | 静态产品契约 | 四个核心视图、移动断点和 reduced motion 均存在 |
-| W-03 | Web 静态可访问性 | 检查移动端详情实现 | 使用 Radix Dialog 模态、可访问标题、移动断点及 reduced-motion 规则；真实焦点行为仍进入浏览器验收 |
+| W-03 | Web 可访问性 | 用真实 Chromium 检查移动端详情 | Radix Dialog 模态、可访问标题、Tab/Escape、背景不可交互、关闭后焦点恢复、移动断点及 reduced-motion 均通过 Playwright/Axe 回归 |
 | W-04 | Web 时间窗契约 | 检查 1H/6H/24H/7D 绑定 | 请求参数、列表轨迹标题和详情轨迹标题引用同一 `windowSize` 状态 |
 | W-05 | 信源治理视图 | 打开信源中心且 SourceScore 尚未校准 | 显示候选/活跃容量、生命周期、有效观测、发现与阻断原因；明确“排行关闭”和 N/A，不按候选分排序；服务端分页可访问 200 active + 500 candidate，账号/实体搜索能命中末页候选 |
 
@@ -117,7 +117,7 @@
 
 | 编号 | 场景 | 预期 |
 |---|---|---|
-| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc2.9`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过，health 返回 production-ready |
+| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc3.0`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过；完整 ready 还要求 JWT、Redis/R2、组件心跳、DR 与镜像摘要 |
 | I-02 | 跨 workspace 查询告警规则，尝试修改 append-only 晋级事实和迁移 marker | workspace-b 看不到 workspace-a 行；晋级事实 UPDATE 被 trigger 拒绝；应用角色不能改迁移 marker |
 | I-03 | 两线程并发写同一 source+fingerprint | 两条 Observation 均可审计，信源有效观测只增加一次，并记录重复发现原因 |
 | I-04 | 插入真实 PG Outbox 后发布到真实 Redis Stream | 流中字段和 payload 一致；Outbox 标记已发布、尝试次数为 1、无错误 |
@@ -131,6 +131,10 @@
 | I-12 | 告警 reservation 后 confirm 失败，随后事件/规则更新或删除 | 身份绑定稳定 `outbox_id`；in-app 恢复为唯一 delivered；Webhook 无快照/规则或重试耗尽时变为可查询的 `aborted + terminalReason`，重复消息视为终态跳过 |
 | I-13 | 两个不同进度的 Redis consumer group 执行安全保留 | 活跃 publisher 租约阻断维护；过期 participant 与被替换的 exclusive token 均不能 XADD；PEL 为全局最早水位并保留较慢组尚未读取消息；最终 Lua 原子校验排他 token、续租、复核完整组状态并裁剪，新增组或锁替换均拒绝；execute 绑定 dry-run ID；只精确删除当前恢复工具支持且已发布的 Outbox 前缀；并发 PG 删除被行锁阻断；错误 kind/缺失事实时 fail closed 且 Stream 不变 |
 | I-14 | PostgreSQL 通用来源可信级别升级 | 构造一个支持后续 provider 复核的通用稳定 Observation ID，先写 `unverified_discovery`，后写已复核 revision | 未复核阶段有效信源观测为 0 且任何伪指标不落库；单向升级原子覆盖已复核正文/指纹，只增加一次去重有效观测，旧候选对象进入删除队列，并调度新的 processing revision；不得从已复核降级。当前 Bluesky 不走此升级路径 |
+| I-15 | 两个 Worker 并发预留同一连接器/信号族预算 | 两个 60 元请求争用 100 元额度 | PostgreSQL 同一月度锁域内只能一个预留成功；月度台账包含活动预留且不会出现 TOCTOU 超额 |
+| I-16 | 同一事件两个陈旧副本依次提交 | 第一个副本更新后，第二个仍携带旧 storage revision | 第二次提交抛出并发冲突且不得覆盖新状态；处理器刷新后有界重试 |
+| I-17 | 1024 维事件向量近邻检索 | 保存正交向量并查询 top-1 | SQL 使用 pgvector cosine 距离运算和 HNSW 索引形状，返回标题哈希匹配的最近事件 |
+| I-18 | 容量探针统计 active events | 同时插入 active 与 `superseded_by` 非空事件 | 只增加一个 active event，不得因数组默认值把全部活动事件统计为 0 |
 
 ## 必须在真实环境执行的验收
 
@@ -143,5 +147,5 @@
 | L-05 | API 性能 | 缓存命中 P95 < 500ms | 依赖生产网络、Redis 和部署区域 |
 | L-06 | 第三方授权 | X、YouTube、Bilibili 合规凭证可用 | 必须由数据权利人/组织提供 |
 | L-07 | 身份联邦 | Sites 身份能安全映射到 FastAPI Role | 需要真实部署域、密钥和组织配置 |
-| L-08 | 浏览器可访问性 | 移动端 Tab/Escape、焦点恢复、背景 inert、屏幕阅读器 | 需要真实浏览器/辅助技术 E2E；源码静态契约不能替代交互验收 |
+| L-08 | 浏览器与辅助技术验收 | 自动化已覆盖移动端 Tab/Escape、焦点恢复、背景 inert、reduced motion、对比度和语义；目标用户使用屏幕阅读器复核仍为发布门槛 | Playwright/Axe 通过不替代真实辅助技术用户验收 |
 | L-09 | 产品 KPI 与人工证据最低样本 | 30 条强告警、5 个有告警工作日、50 个可研判事件、50 次完成研判且 telemetry 覆盖率 ≥95%；证据窗每个本地日期均有一个签名 Precision@5 快照，至少 7 个快照；至少 30 个签名独立基线事件；Precision 点估计和 95% CI 下界均 ≥0.70，中位提前量 ≥30 分钟 | 必须来自策略冻结后的真实影子运行；预登记日历、scheduler/reviewer/baseline 隔离密钥、监控 commitment 和原始首次发现日志全部齐备；合成数据和录制演示不得进入分母 |

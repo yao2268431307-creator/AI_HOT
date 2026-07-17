@@ -103,6 +103,8 @@ class Observation(BaseModel):
     account_id: str | None = Field(default=None, alias="accountId")
     entity_id: str | None = Field(default=None, alias="entityId")
     published_at: datetime = Field(alias="publishedAt")
+    available_at: datetime | None = Field(default=None, alias="availableAt")
+    availability_basis: Literal["provider_timestamp", "first_detected"] = Field(default="first_detected", alias="availabilityBasis")
     collected_at: datetime = Field(alias="collectedAt")
     language: Literal["zh", "en", "other"]
     title: str | None = Field(default=None, max_length=1000)
@@ -118,12 +120,21 @@ class Observation(BaseModel):
 
     model_config = {"populate_by_name": True}
 
-    @field_validator("published_at", "collected_at")
+    @field_validator("published_at", "available_at", "collected_at")
     @classmethod
     def require_timezone(cls, value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value
+
+    @model_validator(mode="after")
+    def normalize_availability(self) -> Observation:
+        if self.available_at is None:
+            self.available_at = self.collected_at
+            self.availability_basis = "first_detected"
+        if self.available_at > self.collected_at:
+            raise ValueError("availableAt cannot be after collectedAt")
+        return self
 
     @field_validator("url")
     @classmethod
@@ -217,6 +228,9 @@ class MetricPoint(BaseModel):
 
 class RadarEvent(BaseModel):
     id: str
+    # Internal optimistic-concurrency token. It is populated by durable
+    # repositories and never serialized into API or score payloads.
+    storage_revision: int = Field(default=0, exclude=True, ge=0)
     narrative_id: str | None = Field(default=None, alias="narrativeId")
     narrative_title: str | None = Field(default=None, alias="narrativeTitle")
     cluster_version: int = Field(default=1, alias="clusterVersion", ge=1)
@@ -228,6 +242,8 @@ class RadarEvent(BaseModel):
     title: str
     title_en: str = Field(alias="titleEn")
     event_type: EventType = Field(alias="eventType")
+    classification_status: Literal["supported", "unsupported"] = Field(default="supported", alias="classificationStatus")
+    unsupported_reason: str | None = Field(default=None, alias="unsupportedReason")
     state: LifecycleState
     labels: list[StructureLabel]
     attention: float = Field(ge=0, le=100)
@@ -249,12 +265,16 @@ class RadarEvent(BaseModel):
     platforms: list[str]
     signal_families: list[Literal["discussion", "behavior", "official", "research"]] = Field(default_factory=list, alias="signalFamilies")
     evidence_count: int = Field(default=0, alias="evidenceCount", ge=0)
+    new_evidence_count: int = Field(default=0, alias="newEvidenceCount", ge=0)
+    queue_priority_score: float = Field(default=0, alias="queuePriorityScore", ge=0)
+    queue_priority_reasons: list[str] = Field(default_factory=list, alias="queuePriorityReasons")
+    review_anchor_at: datetime | None = Field(default=None, alias="reviewAnchorAt")
     driver: str
     coverage_note: str = Field(alias="coverageNote")
     timeline: list[MetricPoint]
     evidence: list[Evidence]
-    score_version: str = Field(default="score-0.6.0", alias="scoreVersion")
-    threshold_version: str = Field(default="thresholds-2026-07-rc2", alias="thresholdVersion")
+    score_version: str = Field(default="score-0.7.0", alias="scoreVersion")
+    threshold_version: str = Field(default="thresholds-2026-07-rc3", alias="thresholdVersion")
 
     model_config = {"populate_by_name": True}
 
@@ -313,6 +333,9 @@ class RadarPayload(BaseModel):
     window: str
     events: list[RadarEvent]
     connectors: list[ConnectorStatus]
+    total_events: int = Field(alias="totalEvents", ge=0)
+    limit: int = Field(ge=1, le=500)
+    has_more: bool = Field(alias="hasMore")
 
     model_config = {"populate_by_name": True}
 
@@ -545,6 +568,16 @@ class StoredScore(BaseModel):
     event_id: str
     score_version: str
     threshold_version: str
+    scoring_revision: int = Field(default=1, ge=1)
+    baseline_version: str = "baseline-empty"
+    baseline_digest: str = "sha256:empty"
+    feature_registry_version: str = "unknown"
+    feature_registry_digest: str = "sha256:unknown"
+    evidence_policy_version: str = "unknown"
+    label_policy_version: str = "unknown"
+    cluster_version: int = Field(default=1, ge=1)
+    identity_version: str = "identity-account-fallback-v1"
+    input_observation_ids: list[str] = Field(default_factory=list)
     input_from: datetime
     input_to: datetime
     input_digest: str

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from radar.contracts import EventType, LifecycleState, StructureLabel
 from radar.scoring import ScoreInput, evidence_strength, robust_z, score_event
 
@@ -27,6 +29,9 @@ def base(**overrides: object) -> ScoreInput:
         "consecutive_joint_growth": 3,
         "consecutive_gap_growth": 0,
         "official_source_led": True,
+        "official_source_present": True,
+        "research_source_present": True,
+        "discussion_source_present": True,
         "primary_adoption_observed": True,
         "primary_adoption_score": 72,
     }
@@ -90,7 +95,7 @@ def test_marketing_scissor_gap_is_a_structure_label_not_lifecycle() -> None:
         consecutive_joint_growth=0,
         consecutive_gap_growth=2,
         independent_signal_families=3,
-    ))
+    ), hours_since_first_seen=72)
     assert result.state == LifecycleState.EMERGING
     assert StructureLabel.ATTENTION_BEHAVIOR_GAP in result.labels
     assert StructureLabel.COORDINATION_RISK in result.labels
@@ -129,6 +134,53 @@ def test_research_behavior_lag_is_not_mislabeled_as_marketing() -> None:
     ), hours_since_first_seen=4)
     assert StructureLabel.EXPECTED_BEHAVIOR_LAG in result.labels
     assert StructureLabel.ATTENTION_BEHAVIOR_GAP not in result.labels
+
+
+@pytest.mark.parametrize(("event_type", "missing"), [
+    (EventType.MODEL_RELEASE, "official_source_present"),
+    (EventType.MODEL_RELEASE, "discussion_source_present"),
+    (EventType.MODEL_RELEASE, "behavior_observed"),
+    (EventType.DEVELOPER_TOOL_RELEASE, "official_source_present"),
+    (EventType.DEVELOPER_TOOL_RELEASE, "discussion_source_present"),
+    (EventType.DEVELOPER_TOOL_RELEASE, "primary_adoption_observed"),
+    (EventType.RESEARCH_OR_BENCHMARK, "research_source_present"),
+    (EventType.RESEARCH_OR_BENCHMARK, "discussion_source_present"),
+    (EventType.OFFICIAL_PRODUCT_RELEASE, "official_source_present"),
+    (EventType.OFFICIAL_PRODUCT_RELEASE, "discussion_source_present"),
+    (EventType.SECURITY_INCIDENT, "official_source_present"),
+])
+def test_each_event_type_minimum_evidence_combination_blocks_strong_state(
+    event_type: EventType, missing: str,
+) -> None:
+    overrides: dict[str, object] = {"event_type": event_type, missing: False}
+    if event_type == EventType.SECURITY_INCIDENT:
+        overrides.update({"discussion_source_present": False, "primary_response_observed": False})
+    result = score_event(base(**overrides), hours_since_first_seen=200)
+    assert result.state == LifecycleState.INSUFFICIENT_DATA
+    assert "最低证据组合不足" in "；".join(result.drivers)
+
+
+@pytest.mark.parametrize(("event_type", "inside_hours", "outside_hours"), [
+    (EventType.MODEL_RELEASE, 6, 25),
+    (EventType.DEVELOPER_TOOL_RELEASE, 12, 49),
+    (EventType.RESEARCH_OR_BENCHMARK, 24, 169),
+    (EventType.OFFICIAL_PRODUCT_RELEASE, 12, 73),
+    (EventType.SECURITY_INCIDENT, 12, 49),
+])
+def test_type_specific_normal_delay_suppresses_marketing_gap(
+    event_type: EventType, inside_hours: float, outside_hours: float,
+) -> None:
+    values = base(
+        event_type=event_type, attention=95, behavior=0,
+        consecutive_joint_growth=0, consecutive_gap_growth=2,
+        primary_response_observed=event_type == EventType.SECURITY_INCIDENT,
+    )
+    inside = score_event(values, hours_since_first_seen=inside_hours)
+    outside = score_event(values, hours_since_first_seen=outside_hours)
+    assert StructureLabel.EXPECTED_BEHAVIOR_LAG in inside.labels
+    assert StructureLabel.ATTENTION_BEHAVIOR_GAP not in inside.labels
+    assert StructureLabel.EXPECTED_BEHAVIOR_LAG not in outside.labels
+    assert StructureLabel.ATTENTION_BEHAVIOR_GAP in outside.labels
 
 
 def test_low_coverage_never_emits_strong_state() -> None:

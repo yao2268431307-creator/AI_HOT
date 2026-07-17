@@ -77,27 +77,27 @@ def ranking_ledger(at: datetime) -> dict[str, object]:
     ]
     artifact: dict[str, object] = {
         "schemaVersion": "signed-score-ledger-v1",
-        "productMetricPolicyVersion": "product-metrics-2026-07-rc2.12",
-        "thresholdVersion": "thresholds-2026-07-rc2",
+        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
+        "thresholdVersion": "thresholds-2026-07-rc3",
         "selectionRuleVersion": "daily-top5-score-v2",
         "generatedAt": at.isoformat(), "rows": rows,
         "leadCrossings": [
             {
                 "eventId": f"event-ledger-{rank:02d}", "crossedAt": SERIES_START.isoformat(),
-                "scoreRunId": f"score-run-ledger-{rank:02d}", "thresholdVersion": "thresholds-2026-07-rc2",
-                "policyVersion": "product-metrics-2026-07-rc2.12",
+                "scoreRunId": f"score-run-ledger-{rank:02d}", "thresholdVersion": "thresholds-2026-07-rc3",
+                "policyVersion": "product-metrics-2026-07-rc3.2",
             }
             for rank in range(1, 36)
         ] + [
             {
                 "eventId": "event-pre-window-crossing", "crossedAt": (SERIES_START - timedelta(days=1)).isoformat(),
-                "scoreRunId": "score-run-pre-window", "thresholdVersion": "thresholds-2026-07-rc2",
-                "policyVersion": "product-metrics-2026-07-rc2.12",
+                "scoreRunId": "score-run-pre-window", "thresholdVersion": "thresholds-2026-07-rc3",
+                "policyVersion": "product-metrics-2026-07-rc3.2",
             },
             {
                 "eventId": "event-crossed-then-superseded", "crossedAt": SERIES_START.isoformat(),
-                "scoreRunId": "score-run-superseded", "thresholdVersion": "thresholds-2026-07-rc2",
-                "policyVersion": "product-metrics-2026-07-rc2.12",
+                "scoreRunId": "score-run-superseded", "thresholdVersion": "thresholds-2026-07-rc3",
+                "policyVersion": "product-metrics-2026-07-rc3.2",
             },
         ],
         "ledgerKeyId": LEDGER_KEY_ID,
@@ -123,10 +123,17 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
         "responses": {
             "health": {
                 "status": "ok", "storageBackend": "postgresql", "rlsVerified": True,
-                "authRequired": True, "productionReady": True, "migrationVersion": "001_init_rc2.9",
+                "authRequired": True, "authMode": "jwt", "productionReady": True,
+                "jwtConfigurationReady": True,
+                "migrationVersion": "001_init_rc3.0", "redisConfigured": True,
+                "r2Configured": True, "runtimeComponentsReady": True,
+                "dependencyProbesReady": True,
+                "disasterRecoveryReady": True, "releaseImagesPinned": True,
                 "instanceId": "test-postgres-instance", "databaseClockSkewSeconds": .1,
                 "databaseUser": "radar_app", "databaseRoleSuperuser": False,
                 "databaseRoleBypassRls": False,
+                "deletionRole": "radar_deletion_worker", "deletionRoleReady": True,
+                "budgetReconciliationPending": 0,
                 "auditTriggersVerified": True, "migrationMarkerReadOnly": True,
             },
             "coverage": {"connectors": [{"id": connector_id, "family": FAMILIES[connector_id], "rightsStatus": "active"} for connector_id in CONNECTORS]},
@@ -142,7 +149,7 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
             "betaMetrics": {
                 "evidenceStatus": "eligible" if beta_passes else "insufficient",
                 "passesMeasuredGates": True if beta_passes else None,
-                "productMetricPolicyVersion": "product-metrics-2026-07-rc2.12",
+                "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
                 "productMetricPolicyDigest": POLICY_DIGEST,
                 "policyStatus": "frozen_for_beta_collection",
                 "policyFrozenAt": POLICY_FROZEN_AT.isoformat(),
@@ -156,7 +163,7 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
                     ).hexdigest(),
                     "snapshotTimezone": "Asia/Shanghai", "snapshotLocalTime": "09:00:00",
                     "snapshotTimeToleranceMinutes": 5,
-                    "requiredThresholdVersion": "thresholds-2026-07-rc2",
+                    "requiredThresholdVersion": "thresholds-2026-07-rc3",
                     "precisionAt5Target": .70, "precisionAt5MinimumCiLow": .70,
                     "minimumSnapshots": 7, "candidatesPerSnapshot": 5,
                     "intervalMethod": "bootstrap", "confidenceLevel": .95,
@@ -168,7 +175,7 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
                 },
                 "acceptanceMonitoringPolicy": {
                     **TEST_KEYRING_IDENTITY,
-                    "monitorVersion": "acceptance-monitor-v1.1", "monitorDigest": MONITOR_DIGEST,
+                    "monitorVersion": "acceptance-monitor-v1.3", "monitorDigest": MONITOR_DIGEST,
                     "cadenceSeconds": 900, "minimumDistinctConnectorFamilies": 4,
                     "requiredSignalFamilies": ["discussion", "behavior"],
                     "requireNonzeroConnectorObservations": True,
@@ -291,7 +298,7 @@ def test_shadow_gate_requires_real_product_samples_and_independent_manual_evalua
         {
             "eventId": row["eventId"], "radarDetectedAt": row["crossedAt"],
             "baselineDetectedAt": (monitor.parse_time(str(row["crossedAt"])) + timedelta(minutes=42)).isoformat(),
-            "scoreRunId": row["scoreRunId"], "thresholdVersion": "thresholds-2026-07-rc2",
+            "scoreRunId": row["scoreRunId"], "thresholdVersion": "thresholds-2026-07-rc3",
             "baselineLogRef": f"baseline-log-{index:02d}",
         }
         for index, row in enumerate(first_ledger_crossings)
@@ -301,7 +308,7 @@ def test_shadow_gate_requires_real_product_samples_and_independent_manual_evalua
     preregistered_at = (snapshot_start - timedelta(days=1)).isoformat()
     preregistration = {
         "schemaVersion": "manual-product-preregistration-v2",
-        "productMetricPolicyVersion": "product-metrics-2026-07-rc2.12",
+        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
         "productMetricPolicyDigest": POLICY_DIGEST,
         "selectionRuleVersion": "daily-top5-score-v2",
         "inclusionRules": ["top five eligible radar candidates at each scheduled snapshot"],
@@ -310,7 +317,7 @@ def test_shadow_gate_requires_real_product_samples_and_independent_manual_evalua
         "snapshotTimezone": "Asia/Shanghai",
         "snapshotLocalTime": "09:00",
         "leadEligibilityRuleVersion": "lead-threshold-v1",
-        "thresholdVersion": "thresholds-2026-07-rc2",
+        "thresholdVersion": "thresholds-2026-07-rc3",
         "baselineDefinitionId": "independent-baseline-v1",
         "bootstrapSeed": 20260717,
         "bootstrapIterations": 5000,
@@ -352,7 +359,7 @@ def test_shadow_gate_requires_real_product_samples_and_independent_manual_evalua
     monitor.seal_baseline_artifact(baseline_artifact, BASELINE_PRIVATE_BYTES, BASELINE_KEY_ID)
     manual = {
         "schemaVersion": "manual-product-evaluation-v1.3",
-        "productMetricPolicyVersion": "product-metrics-2026-07-rc2.12",
+        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
         "productMetricPolicyDigest": POLICY_DIGEST,
         "precisionCandidateEventSetDigest": "sha256:" + hashlib.sha256(
             __import__("json").dumps(precision_candidate_event_ids, ensure_ascii=False, separators=(",", ":")).encode()

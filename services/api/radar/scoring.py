@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from math import isfinite
 from statistics import median
 from typing import Iterable
 
 from .contracts import EventType, EvidenceStrength, LifecycleState, StructureLabel
+from .feature_registry import normal_behavior_delay_hours
 
 
-SCORE_VERSION = "score-0.6.0"
-THRESHOLD_VERSION = "thresholds-2026-07-rc2"
+SCORE_VERSION = "score-0.7.0"
+THRESHOLD_VERSION = "thresholds-2026-07-rc3"
+EVIDENCE_POLICY_VERSION = "minimum-evidence-2026-07-rc3"
+LABEL_POLICY_VERSION = "structure-labels-2026-07-rc3"
 
 
 def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -67,6 +70,26 @@ DORMANCY_HOURS: dict[EventType, float] = {
     EventType.SECURITY_INCIDENT: 12,
 }
 
+# No-arrival evaluation starts after this quiet period. Active windows bound
+# how long old observations may contribute to current Attention/Behavior.
+COOLING_START_HOURS: dict[EventType, float] = {
+    EventType.MODEL_RELEASE: 6,
+    EventType.DEVELOPER_TOOL_RELEASE: 6,
+    EventType.RESEARCH_OR_BENCHMARK: 24,
+    EventType.OFFICIAL_PRODUCT_RELEASE: 12,
+    EventType.SECURITY_INCIDENT: 3,
+}
+
+ACTIVE_WINDOW_HOURS: dict[EventType, float] = {
+    EventType.MODEL_RELEASE: 24,
+    EventType.DEVELOPER_TOOL_RELEASE: 48,
+    EventType.RESEARCH_OR_BENCHMARK: 168,
+    EventType.OFFICIAL_PRODUCT_RELEASE: 72,
+    EventType.SECURITY_INCIDENT: 48,
+}
+
+NORMAL_BEHAVIOR_DELAY_HOURS = normal_behavior_delay_hours()
+
 
 @dataclass(slots=True)
 class ScoreInput:
@@ -101,6 +124,9 @@ class ScoreInput:
     consecutive_joint_growth: int = 0
     consecutive_gap_growth: int = 0
     official_source_led: bool = False
+    official_source_present: bool = False
+    research_source_present: bool = False
+    discussion_source_present: bool = False
     reactivated: bool = False
     previous_state: LifecycleState | None = None
 
@@ -117,13 +143,51 @@ class ScoreResult:
     threshold_version: str = THRESHOLD_VERSION
 
 
+def score_input_record(data: ScoreInput) -> dict[str, object]:
+    payload = asdict(data)
+    payload["event_type"] = data.event_type.value
+    payload["previous_state"] = data.previous_state.value if data.previous_state else None
+    return payload
+
+
+def score_input_from_record(payload: dict[str, object]) -> ScoreInput:
+    values = dict(payload)
+    values["event_type"] = EventType(str(values["event_type"]))
+    previous = values.get("previous_state")
+    values["previous_state"] = LifecycleState(str(previous)) if previous else None
+    return ScoreInput(**values)  # type: ignore[arg-type]
+
+
+def replay_score_payload(payload: dict[str, object]) -> ScoreResult:
+    replay = payload.get("_replay")
+    if not isinstance(replay, dict) or not isinstance(replay.get("scoreInput"), dict):
+        raise ValueError("stored score does not contain a replay input")
+    hours = float(replay.get("hoursSinceFirstSeen", 0))
+    return score_event(score_input_from_record(replay["scoreInput"]), hours_since_first_seen=hours)
+
+
 def expected_behavior(event_type: EventType, attention: float, hours_since_first_seen: float = 6.0) -> float:
     ratio = EVENT_BEHAVIOR_RATIO[event_type]
-    if event_type == EventType.RESEARCH_OR_BENCHMARK:
-        # Reproduction and citation behavior normally trails discussion for research events.
-        maturity = clamp(hours_since_first_seen / 24.0, 0.35, 1.0)
+    delay_start, delay_end = NORMAL_BEHAVIOR_DELAY_HOURS[event_type]
+    if hours_since_first_seen < delay_end:
+        duration = max(1.0, delay_end - delay_start)
+        maturity = clamp((hours_since_first_seen - delay_start) / duration, 0.20, 1.0)
         ratio *= maturity
     return clamp(attention * ratio)
+
+
+def minimum_evidence_combination_met(data: ScoreInput) -> bool:
+    if data.event_type == EventType.MODEL_RELEASE:
+        return data.official_source_present and data.discussion_source_present and data.behavior_observed
+    if data.event_type == EventType.DEVELOPER_TOOL_RELEASE:
+        return data.official_source_present and data.discussion_source_present and data.primary_adoption_observed
+    if data.event_type == EventType.RESEARCH_OR_BENCHMARK:
+        return data.research_source_present and data.discussion_source_present
+    if data.event_type == EventType.OFFICIAL_PRODUCT_RELEASE:
+        return data.official_source_present and data.discussion_source_present
+    return data.official_source_present and (
+        data.discussion_source_present or data.primary_response_observed
+    )
 
 
 def evidence_strength(coverage: float, sample_reliability: float, baseline_maturity: float, cluster_confidence: float, temporal_stability: float) -> float:
@@ -175,17 +239,16 @@ def score_event(data: ScoreInput, *, hours_since_first_seen: float = 6.0) -> Sco
         drivers.append("独立信源群多样性不足")
     if data.official_source_led:
         labels.append(StructureLabel.OFFICIAL_SOURCE_LED)
-    research_lag = (
-        data.event_type == EventType.RESEARCH_OR_BENCHMARK
-        and hours_since_first_seen < 24
+    normal_delay = (
+        hours_since_first_seen < NORMAL_BEHAVIOR_DELAY_HOURS[data.event_type][1]
         and nominal_gap >= 25
         and data.consecutive_gap_growth >= 2
     )
     gap_z = data.gap_residual_robust_z if data.gap_residual_robust_z is not None else gap / 12.5
     gap_is_material = data.behavior_applicable and data.behavior_observed and strength >= 45 and gap_z >= 2 and data.consecutive_gap_growth >= 2
-    if research_lag:
+    if normal_delay:
         labels.append(StructureLabel.EXPECTED_BEHAVIOR_LAG)
-        drivers.append("研究类事件仍处于预期行为滞后窗口")
+        drivers.append("事件仍处于类型专用的预期行为滞后窗口")
     elif gap_is_material:
         labels.append(StructureLabel.ATTENTION_BEHAVIOR_GAP)
         drivers.append("实际行为显著低于该事件类型的预期行为")
@@ -207,9 +270,10 @@ def score_event(data: ScoreInput, *, hours_since_first_seen: float = 6.0) -> Sco
     if reactivated:
         labels.append(StructureLabel.REACTIVATED)
 
-    if coverage < 40 or data.independent_signal_families < 2:
+    minimum_evidence_met = minimum_evidence_combination_met(data)
+    if coverage < 40 or data.independent_signal_families < 2 or not minimum_evidence_met:
         state = LifecycleState.INSUFFICIENT_DATA
-        drivers.append("数据覆盖或独立信号家族不足，不输出强结论")
+        drivers.append("数据覆盖、独立信号家族或事件类型最低证据组合不足，不输出强结论")
     elif reactivated:
         state = LifecycleState.EMERGING
         drivers.append("休眠事件出现 robust Z≥2 的新异常证据，重新进入萌发阶段")
@@ -226,6 +290,12 @@ def score_event(data: ScoreInput, *, hours_since_first_seen: float = 6.0) -> Sco
         else:
             state = LifecycleState.COOLING
             drivers.append("事件在类型专用休眠窗口内没有新的异常增长，继续保持降温")
+    elif data.previous_state == LifecycleState.ESTABLISHED and data.consecutive_decline < 2:
+        # Lifecycle hysteresis: a confirmed event cannot collapse because of a
+        # single quiet evaluation. Two consecutive declining buckets are the
+        # only normal path from established to cooling.
+        state = LifecycleState.ESTABLISHED
+        drivers.append("已确认事件仅出现一个下降周期，保留确认状态等待再次确认")
     elif (
         hours_since_first_seen >= CONFIRMATION_HOURS[data.event_type]
         and strength >= 70

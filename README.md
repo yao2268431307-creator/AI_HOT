@@ -6,7 +6,7 @@
 
 产品 KPI 使用冻结的 `config/product_metric_policy.json`。`GET /api/v1/metrics/beta` 以已送达强告警、不可变 QueueEligibility、持久化人工反馈和服务端接收的版本化心跳为事实源；未达到最低样本时只返回“证据不足”，不会把演示或合成数据写成 Beta 达标。原有 `GET /api/v1/metrics/review` 仅用于探索性漏斗。
 
-当前冻结版本为 `product-metrics-2026-07-rc2.12`，冻结时间为 2026-07-17 08:38（Asia/Shanghai）。本次因 Bluesky 收紧为 discovery-only、权利策略摘要上限变为可执行约束、并发 provenance 升级回归补齐，把迁移证明推进至 rc2.9，并改变绑定的验收监控摘要而重新冻结；此前任何样本不得进入当前证据窗口。有效研判时长只累计认证 Analyst 的连续 `active` 心跳并要求至少 95% 覆盖，跨详情关闭/重开累计；客户端时长汇总被忽略，服务端心跳墙钟作为不能被 state 缩短的独立护栏。正式 Top5 必须逐项来自独立签名的完整排序账本，发现提前量使用版本化 append-only 阈值跨越事实。策略还绑定人工评估 schema、预登记 schema、四类隔离的 Ed25519 keyring 和验收 evaluator 的 SHA-256，任一变更都必须重新冻结并重新开始证据窗口。
+当前冻结版本为 `product-metrics-2026-07-rc3.2`，冻结时间为 2026-07-17 13:05（Asia/Shanghai）。评分为 `score-0.7.0`，阈值为 `thresholds-2026-07-rc3`，迁移证明为 `001_init_rc3.0`。本次重新冻结还绑定每轮 Redis/R2 探测、隔离删除角色、崩溃预算对账门槛和有界向量候选缓存；此前任何样本不得进入当前证据窗口。有效研判时长只累计认证 Analyst 的连续 `active` 心跳并要求至少 95% 覆盖，跨详情关闭/重开累计；客户端时长汇总被忽略，服务端心跳墙钟作为不能被 state 缩短的独立护栏。正式 Top5 必须逐项来自独立签名的完整排序账本，发现提前量使用版本化 append-only 阈值跨越事实。策略还绑定人工评估 schema、预登记 schema、四类隔离的 Ed25519 keyring 和验收 evaluator 的 SHA-256，任一变更都必须重新冻结并重新开始证据窗口。
 
 owner-only 的 Sites 录制数据候选位于 <https://signal-ai-radar-rc2-seasun.m4gicarp.chatgpt.site>。它用于视觉和产品流程评审，不代表 FastAPI、真实数据、身份联邦或 rc2 正式 Beta 已上线；部署证据见 [Sites 私有候选记录](docs/evidence/SITES_PRIVATE_DEPLOYMENT_2026-07-16.md)。
 
@@ -117,7 +117,7 @@ npm.cmd test
 
 测试不调用外部平台；连接器使用录制/MockTransport 响应，避免配额、网络与授权状态让 CI 变得不确定。真实源的连通性属于部署环境 smoke test。
 
-默认套件会跳过 12 项真实基础设施用例。启动 `docker compose` 并显式配置 `POSTGRES_INTEGRATION_DSN`、`POSTGRES_INTEGRATION_ADMIN_DSN`、`REDIS_INTEGRATION_URL` 与 `S3_INTEGRATION_*` 后，可验证实际迁移/RLS/trigger、并发去重、Outbox→Redis、consumer group、安全水位裁剪和 MinIO 对象操作。协调重启脚本还要求用 `DOCKER_INTEGRATION_CONTEXT` 指定经校验的本地 Docker context，并 fail-closed 限定 compose 的 loopback 端口 `5432/6379/9000`，不会接触远端服务：
+默认套件会跳过 18 项需要 PostgreSQL、Redis 或 S3 兼容对象存储的真实基础设施用例。启动 `docker compose` 并显式配置 `POSTGRES_INTEGRATION_DSN`、`POSTGRES_INTEGRATION_ADMIN_DSN`、`POSTGRES_INTEGRATION_DELETION_DSN`、`REDIS_INTEGRATION_URL` 与 `S3_INTEGRATION_*` 后，可验证实际迁移/RLS/trigger、隔离删除角色、并发去重、Outbox→Redis、consumer group、安全水位裁剪和 MinIO 对象操作。协调重启脚本还要求用 `DOCKER_INTEGRATION_CONTEXT` 指定经校验的本地 Docker context，并 fail-closed 限定 compose 的 loopback 端口 `5432/6379/9000`，不会接触远端服务：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest services\api\tests\test_postgres_integration.py services\api\tests\test_infrastructure_integration.py -q
@@ -159,7 +159,7 @@ npm.cmd test
 
 正式采集还要求外部调度器在每次调用前注入 `ACCEPTANCE_MONITOR_SCHEDULED_AT`、`ACCEPTANCE_MONITOR_RUN_ID`、`ACCEPTANCE_MONITOR_ED25519_KEY_ID` 和 32-byte raw private key 的 Base64 值 `ACCEPTANCE_MONITOR_ED25519_PRIVATE_KEY`。API 进程另用独立的 `SCORE_LEDGER_ED25519_KEY_ID` / `SCORE_LEDGER_ED25519_PRIVATE_KEY` 签名每个采样时点的完整排序与阈值跨越账本。每日固定时点额外传入 `--manual-snapshot`，将由完整账本机械选出的 Top5 承诺绑定进同一监控样本。私钥不能写入仓库；四类公钥只登记在 `config/acceptance_monitor_public_keys.json`。
 
-正式模式会 fail closed，只有以下条件同时成立才有资格判定：PostgreSQL、受限 `radar_app` 角色、强制 RLS、精确匹配表/函数/schema/事件/启用状态的关键审计 triggers、只读迁移标记 `001_init_rc2.9`、`AUTH_REQUIRED=true`、稳定 `RADAR_INSTANCE_ID`、数据库/应用时钟偏差不超过 5 秒、冻结 keyring 中存在分离的 scheduler/reviewer/baseline/ledger 公钥，以及所有必需连接器获得显式数据权利批准。InMemory、录制 demo、空 keyring 和 `pending/blocked` 权利状态均不能通过正式 72H/7D。
+正式模式会 fail closed，只有以下条件同时成立才有资格判定：PostgreSQL、受限 `radar_app` 角色、强制 RLS、精确匹配表/函数/schema/事件/启用状态的关键审计 triggers、只读迁移标记 `001_init_rc3.0`、短时 EdDSA/RS256 JWT 与服务端成员关系、稳定 `RADAR_INSTANCE_ID`、数据库/应用时钟偏差不超过 5 秒、Redis ping 与目标 R2 bucket 读写实探、五个运行组件的新鲜心跳、DR 证明、实际运行 API/Web 摘要与发布清单精确一致、冻结 keyring 中分离的 scheduler/reviewer/baseline/ledger 公钥，以及所有必需连接器获得显式数据权利批准。InMemory、录制 demo、空 keyring 和 `pending/blocked` 权利状态均不能通过正式 72H/7D。
 
 ## 关键约束
 

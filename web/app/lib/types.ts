@@ -56,6 +56,8 @@ export interface RadarEvent {
   title: string;
   titleEn: string;
   eventType: EventType;
+  classificationStatus?: "supported" | "unsupported";
+  unsupportedReason?: string | null;
   state: LifecycleState;
   labels: StructureLabel[];
   attention: number;
@@ -77,6 +79,10 @@ export interface RadarEvent {
   platforms: string[];
   signalFamilies?: Array<"discussion" | "behavior" | "official" | "research">;
   evidenceCount?: number;
+  newEvidenceCount?: number;
+  queuePriorityScore?: number;
+  queuePriorityReasons?: string[];
+  reviewAnchorAt?: string | null;
   driver: string;
   coverageNote: string;
   timeline: MetricPoint[];
@@ -135,6 +141,8 @@ export interface CoverageBudget {
   spent: number;
   limit: number;
   remaining: number;
+  connectorLimits?: Array<{ scope: string; spent: number; limit: number; remaining: number; hardPaused: boolean }>;
+  signalFamilyLimits?: Array<{ scope: string; spent: number; limit: number; remaining: number; hardPaused: boolean }>;
 }
 
 export interface ConnectorStatus {
@@ -159,6 +167,9 @@ export interface RadarPayload {
   window: string;
   events: RadarEvent[];
   connectors: ConnectorStatus[];
+  totalEvents: number;
+  limit: number;
+  hasMore: boolean;
 }
 
 export type SourceStatus = "candidate" | "active" | "paused" | "blocked";

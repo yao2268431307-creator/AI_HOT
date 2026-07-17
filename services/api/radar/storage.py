@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import uuid
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
-from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, ConnectorStatus, EvidenceState, EvidenceStrength, FeedbackRequest, LifecycleState, MetricIncidentRequest, MetricSnapshot, MutationReceipt, Observation, ProductInteractionRequest, RadarEvent, StoredScore, WatchlistItem, WatchlistRequest
+from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, ConnectorStatus, EventType, EvidenceState, EvidenceStrength, FeedbackRequest, LifecycleState, MetricIncidentRequest, MetricSnapshot, MutationReceipt, Observation, ProductInteractionRequest, RadarEvent, StoredScore, WatchlistItem, WatchlistRequest
 from .facts import split_observation
 from .product_metrics import TRIAGE_ACTIONS, load_product_metric_policy
 from .source_discovery import SourceCandidate, load_source_score_policy, promote_candidates, source_score_policy_digest
@@ -28,6 +29,12 @@ AUDIT_TRIGGER_SPECS = {
     "metric_incidents_append_only": ("public", "metric_incidents", "public", "reject_audit_fact_mutation"),
     "source_promotion_facts_append_only": (
         "public", "source_promotion_facts", "public", "reject_audit_fact_mutation",
+    ),
+    "score_history_erasure_audit_append_only": (
+        "public", "score_history_erasure_audit", "public", "reject_audit_fact_mutation",
+    ),
+    "connector_budget_reconciliation_audit_append_only": (
+        "public", "connector_budget_reconciliation_audit", "public", "reject_audit_fact_mutation",
     ),
     "alert_deliveries_immutable": ("public", "alert_deliveries", "public", "protect_alert_delivery_fact"),
     "observation_processing_history_monotonic": (
@@ -54,6 +61,10 @@ def audit_trigger_specs_verified(rows: list[tuple[object, ...]]) -> bool:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class ConcurrentScoreConflict(RuntimeError):
+    """The durable event changed after the scorer read its input snapshot."""
 
 
 def score_cycle(value: datetime) -> str:
@@ -115,6 +126,7 @@ class InMemoryRepository:
         self.lineage_edges: list[dict[str, object]] = []
         self.outbox: list[dict[str, object]] = []
         self.score_runs: list[StoredScore] = []
+        self.baseline_samples: dict[str, dict[str, object]] = {}
         self.event_observations: dict[str, dict[str, float]] = {}
         self.metric_facts: dict[str, MetricSnapshot] = {}
         self.observation_processing: dict[str, dict[str, object]] = {}
@@ -130,11 +142,35 @@ class InMemoryRepository:
         self.source_content_fingerprints: set[tuple[str, str]] = set()
         self.source_promotion_facts: list[dict[str, object]] = []
         self.raw_evidence_deletions: dict[str, dict[str, object]] = {}
+        self.runtime_components: dict[str, dict[str, object]] = {}
+        self.event_embeddings: dict[tuple[str, str], dict[str, object]] = {}
+        self.connector_budget_reservations: dict[str, dict[str, object]] = {}
+        self.workspace_memberships: dict[tuple[str, str], dict[str, str]] = {}
+        self.revoked_token_jtis: set[str] = set()
+
+    def set_workspace_membership(
+        self, subject: str, workspace_id: str, role: str, status: str = "active",
+    ) -> None:
+        self.workspace_memberships[(workspace_id, subject)] = {"role": role, "status": status}
+
+    def resolve_workspace_membership(self, subject: str, workspace_id: str) -> str | None:
+        membership = self.workspace_memberships.get((workspace_id, subject))
+        return str(membership["role"]) if membership and membership.get("status") == "active" else None
+
+    def is_token_revoked(self, jti: str) -> bool:
+        return jti in self.revoked_token_jtis
 
     def runtime_attestation(self) -> dict[str, object]:
         return {
             "storageBackend": "in_memory", "rlsVerified": False,
             "migrationVersion": None, "instanceId": "local-demo", "databaseClockSkewSeconds": None,
+            "runtimeComponents": [row.copy() for row in self.runtime_components.values()],
+            "disasterRecoveryAttestation": None,
+        }
+
+    def heartbeat_runtime_component(self, component_id: str, instance_id: str, details: dict[str, object] | None = None) -> None:
+        self.runtime_components[component_id] = {
+            "componentId": component_id, "instanceId": instance_id, "lastSeenAt": utcnow(), "details": details or {},
         }
 
     def save_observation_with_outbox(self, observation: Observation) -> bool:
@@ -375,6 +411,17 @@ class InMemoryRepository:
                 and (state.get("leaseUntil") is None or state["leaseUntil"] < now)
             ][:limit]
 
+    def pipeline_backlog_counts(self) -> dict[str, int]:
+        with self._lock:
+            processing_pending = sum(
+                int(state["processedRevision"]) < int(state["revision"])
+                for state in self.observation_processing.values()
+            )
+            return {
+                "processingPending": processing_pending,
+                "outboxPending": len(self.outbox),
+            }
+
     def get_latest_observation(self, observation_id: str) -> Observation | None:
         base = self.observations.get(observation_id)
         if base is None:
@@ -401,16 +448,139 @@ class InMemoryRepository:
 
     def save_score(self, score: StoredScore) -> None:
         with self._lock:
-            cycle = score_cycle(score.input_to)
-            index = next((index for index, item in enumerate(self.score_runs) if item.event_id == score.event_id and score_cycle(item.input_to) == cycle), None)
-            if index is None:
-                self.score_runs.append(score)
-                self.outbox.append({"id": str(uuid.uuid4()), "kind": "score.created", "aggregate_id": score.event_id, "created_at": utcnow(), "cycle_id": cycle})
-            else:
-                self.score_runs[index] = score
+            self._append_score(score)
+
+    def _append_score(self, score: StoredScore) -> StoredScore:
+        existing = next((item for item in self.score_runs if item.event_id == score.event_id and item.input_digest == score.input_digest), None)
+        if existing is not None:
+            return existing
+        cycle = score_cycle(score.input_to)
+        revisions = [
+            item.scoring_revision for item in self.score_runs
+            if item.event_id == score.event_id and score_cycle(item.input_to) == cycle
+        ]
+        appended = score.model_copy(update={"scoring_revision": max(revisions, default=0) + 1})
+        self.score_runs.append(appended)
+        self.outbox.append({
+            "id": str(uuid.uuid4()), "kind": "score.created", "aggregate_id": score.event_id,
+            "created_at": utcnow(), "cycle_id": cycle, "revision": appended.scoring_revision,
+        })
+        return appended
 
     def has_score_input_digest(self, event_id: str, input_digest: str) -> bool:
         return any(score.event_id == event_id and score.input_digest == input_digest for score in self.score_runs)
+
+    def list_score_runs(self, event_id: str) -> list[StoredScore]:
+        return sorted(
+            (score for score in self.score_runs if score.event_id == event_id),
+            key=lambda score: (score.input_to, score.scoring_revision, score.created_at),
+        )
+
+    def review_priority_context(
+        self, event_anchors: dict[str, datetime]
+    ) -> dict[str, dict[str, object]]:
+        with self._lock:
+            result: dict[str, dict[str, object]] = {}
+            for event_id, anchor in event_anchors.items():
+                observation_ids = self.event_observations.get(event_id, {})
+                new_evidence_count = len({
+                    observation_id
+                    for observation_id in observation_ids
+                    if (observation := self.observations.get(observation_id)) is not None
+                    and observation.provenance_level != "unverified_discovery"
+                    and observation.collected_at > anchor
+                })
+                runs = self.list_score_runs(event_id)[-2:]
+                result[event_id] = {
+                    "newEvidenceCount": new_evidence_count,
+                    "scoreRuns": [
+                        {"payload": item.payload, "inputTo": item.input_to}
+                        for item in runs
+                    ],
+                }
+            return result
+
+    def load_event_embeddings(
+        self, event_titles: dict[str, str], model_version: str, dimensions: int
+    ) -> dict[str, list[float]]:
+        result: dict[str, list[float]] = {}
+        with self._lock:
+            for event_id, title in event_titles.items():
+                row = self.event_embeddings.get((event_id, model_version))
+                title_hash = hashlib.sha256(title.encode()).hexdigest()
+                if row and row["titleHash"] == title_hash and row["dimensions"] == dimensions:
+                    result[event_id] = list(row["embedding"])
+        return result
+
+    def save_event_embedding(
+        self, event_id: str, model_version: str, title: str, embedding: list[float]
+    ) -> None:
+        if not embedding:
+            raise ValueError("event embedding cannot be empty")
+        with self._lock:
+            self.event_embeddings[(event_id, model_version)] = {
+                "titleHash": hashlib.sha256(title.encode()).hexdigest(),
+                "dimensions": len(embedding), "embedding": list(embedding),
+            }
+
+    def nearest_event_embeddings(
+        self, query_embedding: list[float], event_titles: dict[str, str], model_version: str, limit: int = 50,
+    ) -> dict[str, list[float]]:
+        query_norm = math.sqrt(sum(value * value for value in query_embedding)) or 1.0
+        ranked: list[tuple[float, str, list[float]]] = []
+        with self._lock:
+            for (event_id, stored_model), row in self.event_embeddings.items():
+                title = event_titles.get(event_id)
+                vector = list(row["embedding"])
+                if (
+                    stored_model != model_version or title is None
+                    or row["titleHash"] != hashlib.sha256(title.encode()).hexdigest()
+                    or len(vector) != len(query_embedding)
+                ):
+                    continue
+                vector_norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+                similarity = sum(
+                    left * right for left, right in zip(query_embedding, vector, strict=True)
+                ) / (query_norm * vector_norm)
+                ranked.append((-similarity, event_id, vector))
+        return {event_id: vector for _, event_id, vector in sorted(ranked)[:limit]}
+
+    def delete_event_embeddings(self, event_ids: list[str]) -> None:
+        with self._lock:
+            deleting = set(event_ids)
+            self.event_embeddings = {
+                key: value for key, value in self.event_embeddings.items()
+                if key[0] not in deleting
+            }
+
+    def append_baseline_sample(
+        self, fact_key: str, source_event_id: str, event_type: EventType, baseline_key: str, observed_at: datetime, value: float,
+    ) -> bool:
+        with self._lock:
+            if fact_key in self.baseline_samples:
+                return False
+            self.baseline_samples[fact_key] = {
+                "factKey": fact_key, "sourceEventId": source_event_id, "eventType": event_type.value, "baselineKey": baseline_key,
+                "observedAt": observed_at, "value": max(0.0, value),
+            }
+            return True
+
+    def load_baseline_history(self, event_type: EventType, exclude_event_id: str | None = None) -> tuple[dict[str, list[float]], str, int]:
+        rows = sorted(
+            (row for row in self.baseline_samples.values() if row["eventType"] == event_type.value and row["sourceEventId"] != exclude_event_id),
+            key=lambda row: (str(row["baselineKey"]), row["observedAt"], str(row["factKey"])),
+        )
+        history: dict[str, list[float]] = {}
+        for row in rows:
+            history.setdefault(str(row["baselineKey"]), []).append(float(row["value"]))
+        for values in history.values():
+            del values[:-1000]
+        material = [
+            [row["factKey"], row["baselineKey"], row["observedAt"].isoformat(), row["value"]]
+            for row in rows
+        ]
+        digest = "sha256:" + hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest()
+        return history, digest, len(rows)
 
     def list_ranking_score_facts(self) -> list[dict[str, object]]:
         with self._lock:
@@ -443,13 +613,7 @@ class InMemoryRepository:
         with self._lock:
             previous = self.events.get(event.id)
             self.events[event.id] = event
-            cycle = score_cycle(score.input_to)
-            index = next((index for index, item in enumerate(self.score_runs) if item.event_id == score.event_id and score_cycle(item.input_to) == cycle), None)
-            if index is None:
-                self.score_runs.append(score)
-                self.outbox.append({"id": str(uuid.uuid4()), "kind": "score.created", "aggregate_id": event.id, "created_at": utcnow(), "cycle_id": cycle})
-            else:
-                self.score_runs[index] = score
+            self._append_score(score)
             crossing_key = (event.id, score.threshold_version, load_product_metric_policy().version)
             if _meets_lead_threshold(event) and crossing_key not in self.lead_threshold_crossings:
                 self.lead_threshold_crossings[crossing_key] = {
@@ -486,18 +650,87 @@ class InMemoryRepository:
                 values.append(base.model_copy(update={"metrics": {}}))
         return sorted(values, key=lambda item: (item.published_at, item.collected_at))
 
+    def list_observation_freshness(self, since: datetime) -> list[dict[str, object]]:
+        return [
+            {
+                "id": item.id, "connectorId": item.platform.lower().replace(" ", "-"),
+                "availableAt": item.available_at or item.collected_at, "collectedAt": item.collected_at,
+                "availabilityBasis": item.availability_basis,
+            }
+            for item in self.observations.values() if item.collected_at >= since
+        ]
+
+    def rollup_and_retain_event_metrics(self, at: datetime, raw_retention_days: int = 90, rollup_retention_days: int = 730) -> dict[str, int]:
+        # The in-memory preview keeps only each event's bounded timeline.
+        return {"rolledUp": 0, "rawDeleted": 0, "rollupsDeleted": 0}
+
     def upsert_connector(self, connector: ConnectorStatus) -> None:
         with self._lock:
             self.connectors[connector.id] = connector
 
-    def record_connector_run(self, connector_id: str, started_at: datetime, finished_at: datetime, status: str, inserted: int, duplicates: int, coverage: float, error: str | None = None, estimated_cost_rmb: float = 0) -> None:
+    def reserve_connector_budget(
+        self, connector_id: str, signal_family: str, maximum_cost_rmb: float,
+        total_limit_rmb: float, connector_limit_rmb: float | None,
+        family_limit_rmb: float | None, family_connector_ids: set[str], base_spend_rmb: float = 0,
+    ) -> str | None:
         with self._lock:
+            total_spend = base_spend_rmb + self.monthly_connector_spend()
+            connector_spend = self.monthly_connector_spend(connector_ids={connector_id})
+            family_spend = self.monthly_connector_spend(connector_ids=family_connector_ids)
+            if total_spend + maximum_cost_rmb > total_limit_rmb:
+                return None
+            if connector_limit_rmb is not None and connector_spend + maximum_cost_rmb > connector_limit_rmb:
+                return None
+            if family_limit_rmb is not None and family_spend + maximum_cost_rmb > family_limit_rmb:
+                return None
+            reservation_id = str(uuid.uuid4())
+            self.connector_budget_reservations[reservation_id] = {
+                "connectorId": connector_id, "signalFamily": signal_family,
+                "reservedAmountRmb": maximum_cost_rmb, "status": "reserved", "createdAt": utcnow(),
+                "leaseUntil": utcnow() + timedelta(hours=1),
+            }
+            return reservation_id
+
+    def reconcile_expired_connector_budget_reservations(self) -> int:
+        now = utcnow()
+        changed = 0
+        with self._lock:
+            for reservation in self.connector_budget_reservations.values():
+                if reservation["status"] == "reserved" and reservation["leaseUntil"] < now:
+                    reservation.update({
+                        "status": "reconciliation_required",
+                        "reconciliationReason": "reservation lease expired before run confirmation",
+                    })
+                    changed += 1
+        return changed
+
+    def connector_budget_reconciliation_count(self) -> int:
+        now = utcnow()
+        return sum(
+            row["status"] == "reconciliation_required"
+            or (row["status"] == "reserved" and row["leaseUntil"] < now)
+            for row in self.connector_budget_reservations.values()
+        )
+
+    def record_connector_run(self, connector_id: str, started_at: datetime, finished_at: datetime, status: str, inserted: int, duplicates: int, coverage: float, error: str | None = None, estimated_cost_rmb: float = 0, budget_reservation_id: str | None = None) -> None:
+        with self._lock:
+            if budget_reservation_id:
+                reservation = self.connector_budget_reservations.get(budget_reservation_id)
+                if not reservation or reservation["status"] not in {"reserved", "reconciliation_required"} or reservation["connectorId"] != connector_id:
+                    raise RuntimeError("budget reservation is missing or no longer active")
+                if estimated_cost_rmb > float(reservation["reservedAmountRmb"]) + 1e-9:
+                    raise RuntimeError("actual connector cost exceeded its worst-case reservation")
             self.connector_runs.append({
                 "connectorId": connector_id, "startedAt": started_at, "finishedAt": finished_at,
                 "status": status, "inserted": inserted, "duplicates": duplicates,
                 "latencyMs": max(0, int((finished_at - started_at).total_seconds() * 1000)),
                 "coverage": coverage, "error": error, "estimatedCostRmb": max(0, estimated_cost_rmb),
             })
+            if budget_reservation_id:
+                self.connector_budget_reservations[budget_reservation_id].update({
+                    "status": "confirmed", "actualAmountRmb": max(0, estimated_cost_rmb),
+                    "confirmedAt": utcnow(),
+                })
             # Keep enough ledger history to cover any calendar month plus
             # operational lookback; pruning at 8 days would silently forget
             # earlier monthly spend.
@@ -521,12 +754,22 @@ class InMemoryRepository:
         keys = [(item["connectorId"], item["contentFingerprint"]) for item in rows]
         return len(rows), len(keys) - len(set(keys))
 
-    def monthly_connector_spend(self, at: datetime | None = None) -> float:
+    def monthly_connector_spend(self, at: datetime | None = None, connector_ids: set[str] | None = None) -> float:
         current = at or utcnow()
-        return round(sum(
+        confirmed = sum(
             float(item.get("estimatedCostRmb", 0)) for item in self.connector_runs
             if item["startedAt"].year == current.year and item["startedAt"].month == current.month
-        ), 4)
+            and (connector_ids is None or str(item["connectorId"]) in connector_ids)
+        )
+        reserved = sum(
+            float(item.get("actualAmountRmb") if item["status"] == "reconciled_charged" else item["reservedAmountRmb"])
+            for item in self.connector_budget_reservations.values()
+            if item["status"] in {"reserved", "reconciliation_required", "reconciled_charged"}
+            and item["createdAt"].year == current.year
+            and item["createdAt"].month == current.month
+            and (connector_ids is None or str(item["connectorId"]) in connector_ids)
+        )
+        return round(confirmed + reserved, 4)
 
     def get_connector(self, connector_id: str) -> ConnectorStatus | None:
         return self.connectors.get(connector_id)
@@ -1189,6 +1432,7 @@ class InMemoryRepository:
                     "updated_at": utcnow(),
                 })
             self.score_runs = [score for score in self.score_runs if score.event_id not in affected_event_ids]
+            self.delete_event_embeddings(list(affected_event_ids))
             cache_tags = ["radar", "events", f"source:{source_id}"] + [f"event:{event_id}" for event_id in sorted(affected_event_ids)]
             self.outbox.append({
                 "id": str(uuid.uuid4()), "kind": "source.erased", "aggregate_id": source_id,
@@ -1203,8 +1447,9 @@ class InMemoryRepository:
 class PostgresRepository:
     """PostgreSQL repository. psycopg is imported lazily so scoring tests stay lightweight."""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, deletion_dsn: str | None = None) -> None:
         self.dsn = dsn
+        self.deletion_dsn = deletion_dsn or os.getenv("DELETION_DATABASE_URL")
 
     @contextmanager
     def connection(self) -> Iterator[object]:
@@ -1213,11 +1458,66 @@ class PostgresRepository:
         with psycopg.connect(self.dsn) as connection:
             yield connection
 
+    @contextmanager
+    def deletion_connection(self) -> Iterator[object]:
+        import psycopg
+
+        if not self.deletion_dsn:
+            raise RuntimeError("source erasure requires the isolated deletion-worker database role")
+        with psycopg.connect(self.deletion_dsn) as connection:
+            yield connection
+
+    def resolve_workspace_membership(self, subject: str, workspace_id: str) -> str | None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._set_workspace(cursor, workspace_id)
+                cursor.execute(
+                    """SELECT role FROM workspace_memberships
+                    WHERE workspace_id=%s AND subject=%s AND status='active'""",
+                    (workspace_id, subject),
+                )
+                row = cursor.fetchone()
+        return str(row[0]) if row else None
+
+    def is_token_revoked(self, jti: str) -> bool:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT EXISTS (SELECT 1 FROM jwt_revocations WHERE jti=%s AND expires_at>clock_timestamp())",
+                    (jti,),
+                )
+                row = cursor.fetchone()
+        return bool(row and row[0])
+
     def runtime_attestation(self) -> dict[str, object]:
         required_rls_tables = {
             "feedback", "alert_rules", "alert_deliveries", "watchlists",
             "product_interactions", "cluster_edit_requests", "metric_incidents",
+            "workspace_memberships",
         }
+        deletion_role_ready = False
+        deletion_role_name: str | None = None
+        if self.deletion_dsn:
+            try:
+                with self.deletion_connection() as deletion_connection:
+                    with deletion_connection.cursor() as deletion_cursor:
+                        deletion_cursor.execute(
+                            """SELECT current_user,roles.rolsuper,roles.rolbypassrls,
+                            has_function_privilege(current_user,'erase_source_score_history(text)','EXECUTE'),
+                            has_table_privilege(current_user,'events','DELETE'),
+                            has_table_privilege(current_user,'score_history_erasure_audit','INSERT')
+                            FROM pg_roles roles WHERE roles.rolname=current_user"""
+                        )
+                        deletion_row = deletion_cursor.fetchone()
+                deletion_role_name = str(deletion_row[0]) if deletion_row else None
+                deletion_role_ready = bool(
+                    deletion_row and deletion_row[0] == "radar_deletion_worker"
+                    and deletion_row[1] is False and deletion_row[2] is False
+                    and deletion_row[3] is True and deletion_row[4] is False
+                    and deletion_row[5] is False
+                )
+            except Exception:
+                deletion_role_ready = False
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1258,6 +1558,26 @@ class PostgresRepository:
                     has_table_privilege(current_user,'schema_attestations','DELETE')"""
                 )
                 marker_privileges = cursor.fetchone()
+                cursor.execute(
+                    """SELECT component_id,instance_id,last_seen_at,details
+                    FROM runtime_component_heartbeats ORDER BY component_id"""
+                )
+                runtime_components = [
+                    {"componentId": row[0], "instanceId": row[1], "lastSeenAt": row[2], "details": row[3]}
+                    for row in cursor.fetchall()
+                ]
+                cursor.execute(
+                    """SELECT performed_at,backup_reference,restored_instance_id,verification_digest,
+                      measured_rpo_seconds,measured_rto_seconds,status,operator_subject
+                    FROM disaster_recovery_attestations ORDER BY performed_at DESC,created_at DESC LIMIT 1"""
+                )
+                recovery_row = cursor.fetchone()
+                recovery_attestation = ({
+                    "performedAt": recovery_row[0], "backupReference": recovery_row[1],
+                    "restoredInstanceId": recovery_row[2], "verificationDigest": recovery_row[3],
+                    "measuredRpoSeconds": recovery_row[4], "measuredRtoSeconds": recovery_row[5],
+                    "status": recovery_row[6], "operatorSubject": recovery_row[7],
+                } if recovery_row else None)
         return {
             "storageBackend": "postgresql",
             "rlsVerified": set(rls_rows) == required_rls_tables and all(rls_rows.values()),
@@ -1268,8 +1588,26 @@ class PostgresRepository:
             "databaseUser": str(database_user),
             "databaseRoleSuperuser": bool(role_superuser),
             "databaseRoleBypassRls": bool(role_bypass_rls),
+            "deletionRole": deletion_role_name,
+            "deletionRoleReady": deletion_role_ready,
             "databaseClockSkewSeconds": abs((utcnow() - database_time).total_seconds()),
+            "runtimeComponents": runtime_components,
+            "disasterRecoveryAttestation": recovery_attestation,
         }
+
+    def heartbeat_runtime_component(self, component_id: str, instance_id: str, details: dict[str, object] | None = None) -> None:
+        if not component_id or not instance_id:
+            raise ValueError("runtime component and instance IDs are required")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO runtime_component_heartbeats (component_id,instance_id,last_seen_at,details)
+                    VALUES (%s,%s,clock_timestamp(),%s::jsonb)
+                    ON CONFLICT (component_id) DO UPDATE SET instance_id=excluded.instance_id,
+                      last_seen_at=excluded.last_seen_at,details=excluded.details""",
+                    (component_id, instance_id, json.dumps(details or {}, ensure_ascii=False)),
+                )
+            connection.commit()
 
     def save_observation_with_outbox(self, observation: Observation) -> bool:
         content, snapshots = split_observation(observation)
@@ -1280,13 +1618,14 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO observations (id,schema_version,connector,platform,external_id,source_id,account_id,entity_id,published_at,collected_at,
+                    INSERT INTO observations (id,schema_version,connector,platform,external_id,source_id,account_id,entity_id,published_at,available_at,availability_basis,collected_at,
                       language,title,body,url,normalized_url,content_fingerprint,metrics,raw_evidence_ref,parser_version,rights_policy_id,provenance_level,deletion_state,signal_family)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'{}'::jsonb,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (id) DO NOTHING RETURNING id
                     """,
                     (content.id, content.schema_version, content.connector, content.platform, content.external_id, observation.source_id,
-                     content.account_id, content.entity_id, content.published_at, content.collected_at, content.language, content.title,
+                     content.account_id, content.entity_id, content.published_at, observation.available_at, observation.availability_basis,
+                     content.collected_at, content.language, content.title,
                      content.text_excerpt, observation.url, content.canonical_url, digest, content.raw_ref or "", content.parser_version,
                      content.rights_policy_id, content.provenance_level, content.deletion_state, observation.signal_family),
                 )
@@ -1305,7 +1644,7 @@ class PostgresRepository:
                         cursor.execute(
                             """UPDATE observations SET
                               schema_version=%s,connector=%s,platform=%s,external_id=%s,source_id=%s,
-                              account_id=%s,entity_id=%s,published_at=%s,collected_at=%s,language=%s,
+                              account_id=%s,entity_id=%s,published_at=%s,available_at=%s,availability_basis=%s,collected_at=%s,language=%s,
                               title=%s,body=%s,url=%s,normalized_url=%s,content_fingerprint=%s,
                               raw_evidence_ref=%s,parser_version=%s,rights_policy_id=%s,
                               provenance_level=%s,deletion_state=%s,signal_family=%s
@@ -1313,7 +1652,7 @@ class PostgresRepository:
                             (
                                 content.schema_version, content.connector, content.platform, content.external_id,
                                 observation.source_id, content.account_id, content.entity_id, content.published_at,
-                                content.collected_at, content.language, content.title, content.text_excerpt,
+                                observation.available_at, observation.availability_basis, content.collected_at, content.language, content.title, content.text_excerpt,
                                 observation.url, content.canonical_url, digest, content.raw_ref or "",
                                 content.parser_version, content.rights_policy_id, content.provenance_level,
                                 content.deletion_state, observation.signal_family, observation.id,
@@ -1644,12 +1983,23 @@ class PostgresRepository:
                 rows = cursor.fetchall()
         return [str(row[0]) for row in rows]
 
+    def pipeline_backlog_counts(self) -> dict[str, int]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT
+                      (SELECT count(*) FROM observation_processing WHERE processed_revision < revision),
+                      (SELECT count(*) FROM outbox WHERE published_at IS NULL)"""
+                )
+                row = cursor.fetchone()
+        return {"processingPending": int(row[0]), "outboxPending": int(row[1])}
+
     def get_latest_observation(self, observation_id: str) -> Observation | None:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id,platform,external_id,source_id,account_id,entity_id,published_at,collected_at,
+                    SELECT id,platform,external_id,source_id,account_id,entity_id,published_at,available_at,availability_basis,collected_at,
                            language,title,body,url,raw_evidence_ref,content_fingerprint,signal_family,rights_policy_id,provenance_level
                     FROM observations WHERE id=%s
                     """,
@@ -1666,9 +2016,9 @@ class PostgresRepository:
                     (observation_id,),
                 )
                 metric_rows = cursor.fetchall()
-        collected_at = row[7]
+        collected_at = row[9]
         metrics: dict[str, float] = {}
-        raw_ref = row[12]
+        raw_ref = row[14]
         if metric_rows:
             collected_at = metric_rows[0][2]
             latest = [item for item in metric_rows if item[2] == collected_at]
@@ -1676,9 +2026,10 @@ class PostgresRepository:
             raw_ref = next((item[3] for item in latest if item[3]), raw_ref)
         return Observation(
             id=row[0], platform=row[1], externalId=row[2], sourceId=row[3], accountId=row[4], entityId=row[5],
-            publishedAt=row[6], collectedAt=collected_at, language=row[8], title=row[9], text=row[10], url=row[11],
-            metrics=metrics, rawEvidenceRef=raw_ref, contentFingerprint=row[13], signalFamily=row[14], rightsPolicyId=row[15],
-            provenanceLevel=row[16], relation="unknown",
+            publishedAt=row[6], availableAt=row[7], availabilityBasis=row[8], collectedAt=collected_at,
+            language=row[10], title=row[11], text=row[12], url=row[13], metrics=metrics,
+            rawEvidenceRef=raw_ref, contentFingerprint=row[15], signalFamily=row[16], rightsPolicyId=row[17],
+            provenanceLevel=row[18], relation="unknown",
         )
 
     def upsert_event(self, event: RadarEvent) -> None:
@@ -1686,9 +2037,14 @@ class PostgresRepository:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (event.id,))
-                cursor.execute("SELECT lifecycle_state FROM events WHERE id=%s FOR UPDATE", (event.id,))
+                cursor.execute("SELECT lifecycle_state,version FROM events WHERE id=%s FOR UPDATE", (event.id,))
                 previous_row = cursor.fetchone()
                 previous_state = str(previous_row[0]) if previous_row else None
+                durable_revision = int(previous_row[1]) if previous_row else 0
+                if durable_revision != event.storage_revision:
+                    raise ConcurrentScoreConflict(
+                        f"event {event.id} changed from revision {event.storage_revision} to {durable_revision}"
+                    )
                 cursor.execute(
                     """
                     INSERT INTO events (id, canonical_title_zh, canonical_title_en, event_type, lifecycle_state,
@@ -1711,19 +2067,37 @@ class PostgresRepository:
         cycle = score_cycle(score.input_to)
         with self.connection() as connection:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (score.event_id,))
+                cursor.execute(
+                    "SELECT COALESCE(max(scoring_revision),0)+1 FROM score_runs WHERE event_id=%s AND cycle_id=%s",
+                    (score.event_id, cycle),
+                )
+                revision = int(cursor.fetchone()[0])
                 cursor.execute(
                     """
-                    INSERT INTO score_runs (event_id,cycle_id,score_version,threshold_version,input_from,input_to,input_digest,drivers,payload,created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
-                    ON CONFLICT (event_id,cycle_id) DO UPDATE SET
-                      score_version=excluded.score_version,threshold_version=excluded.threshold_version,
-                      input_from=excluded.input_from,input_to=excluded.input_to,input_digest=excluded.input_digest,
-                      drivers=excluded.drivers,payload=excluded.payload,created_at=excluded.created_at
+                    INSERT INTO score_runs
+                      (event_id,cycle_id,scoring_revision,score_version,threshold_version,
+                       baseline_version,baseline_digest,feature_registry_version,feature_registry_digest,
+                       evidence_policy_version,label_policy_version,cluster_version,identity_version,input_observation_ids,
+                       input_from,input_to,input_digest,drivers,payload,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
+                    ON CONFLICT (event_id,input_digest) DO NOTHING
+                    RETURNING scoring_revision
                     """,
-                    (score.event_id, cycle, score.score_version, score.threshold_version, score.input_from, score.input_to,
-                     score.input_digest, json.dumps(score.drivers, ensure_ascii=False), json.dumps(score.payload, ensure_ascii=False), score.created_at),
+                    (
+                        score.event_id, cycle, revision, score.score_version, score.threshold_version,
+                        score.baseline_version, score.baseline_digest, score.feature_registry_version, score.feature_registry_digest,
+                        score.evidence_policy_version, score.label_policy_version, score.cluster_version, score.identity_version,
+                        json.dumps(score.input_observation_ids), score.input_from, score.input_to, score.input_digest,
+                        json.dumps(score.drivers, ensure_ascii=False), json.dumps(score.payload, ensure_ascii=False), score.created_at,
+                    ),
                 )
-                cursor.execute("INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb) ON CONFLICT DO NOTHING", (score.event_id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle})))
+                inserted = cursor.fetchone()
+                if inserted:
+                    cursor.execute(
+                        "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb)",
+                        (score.event_id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle, "revision": inserted[0]})),
+                    )
             connection.commit()
 
     def has_score_input_digest(self, event_id: str, input_digest: str) -> bool:
@@ -1731,6 +2105,179 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1 FROM score_runs WHERE event_id=%s AND input_digest=%s LIMIT 1", (event_id, input_digest))
                 return cursor.fetchone() is not None
+
+    def list_score_runs(self, event_id: str) -> list[StoredScore]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT score_version,threshold_version,scoring_revision,baseline_version,baseline_digest,
+                      feature_registry_version,feature_registry_digest,evidence_policy_version,label_policy_version,
+                      cluster_version,identity_version,input_observation_ids,input_from,input_to,input_digest,drivers,payload,created_at
+                    FROM score_runs WHERE event_id=%s ORDER BY input_to,scoring_revision,created_at""",
+                    (event_id,),
+                )
+                rows = cursor.fetchall()
+        return [StoredScore(
+            event_id=event_id, score_version=row[0], threshold_version=row[1], scoring_revision=row[2],
+            baseline_version=row[3], baseline_digest=row[4], feature_registry_version=row[5],
+            feature_registry_digest=row[6], evidence_policy_version=row[7], label_policy_version=row[8],
+            cluster_version=row[9], identity_version=row[10], input_observation_ids=row[11],
+            input_from=row[12], input_to=row[13], input_digest=row[14], drivers=row[15], payload=row[16], created_at=row[17],
+        ) for row in rows]
+
+    def review_priority_context(
+        self, event_anchors: dict[str, datetime]
+    ) -> dict[str, dict[str, object]]:
+        if not event_anchors:
+            return {}
+        event_ids = list(event_anchors)
+        anchors = [event_anchors[event_id] for event_id in event_ids]
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """WITH anchors(event_id,anchor_at) AS (
+                      SELECT * FROM unnest(%s::text[],%s::timestamptz[])
+                    )
+                    SELECT anchors.event_id,count(DISTINCT observations.id)
+                    FROM anchors
+                    LEFT JOIN event_observations
+                      ON event_observations.event_id=anchors.event_id
+                    LEFT JOIN observations
+                      ON observations.id=event_observations.observation_id
+                     AND observations.provenance_level<>'unverified_discovery'
+                     AND observations.collected_at>anchors.anchor_at
+                    GROUP BY anchors.event_id""",
+                    (event_ids, anchors),
+                )
+                evidence_rows = cursor.fetchall()
+                cursor.execute(
+                    """SELECT event_id,payload,input_to,recent_rank FROM (
+                      SELECT event_id,payload,input_to,
+                        row_number() OVER (
+                          PARTITION BY event_id
+                          ORDER BY input_to DESC,scoring_revision DESC,created_at DESC
+                        ) AS recent_rank
+                      FROM score_runs WHERE event_id=ANY(%s)
+                    ) ranked WHERE recent_rank<=2
+                    ORDER BY event_id,recent_rank DESC""",
+                    (event_ids,),
+                )
+                score_rows = cursor.fetchall()
+        result = {
+            event_id: {"newEvidenceCount": 0, "scoreRuns": []}
+            for event_id in event_ids
+        }
+        for event_id, count in evidence_rows:
+            result[str(event_id)]["newEvidenceCount"] = int(count)
+        for event_id, payload, input_to, _ in score_rows:
+            score_runs = result[str(event_id)]["scoreRuns"]
+            assert isinstance(score_runs, list)
+            score_runs.append({"payload": payload, "inputTo": input_to})
+        return result
+
+    def load_event_embeddings(
+        self, event_titles: dict[str, str], model_version: str, dimensions: int
+    ) -> dict[str, list[float]]:
+        if not event_titles or dimensions != 1024:
+            return {}
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT event_id,title_hash,embedding::text FROM event_embeddings
+                    WHERE event_id=ANY(%s) AND model_version=%s AND dimensions=%s""",
+                    (list(event_titles), model_version, dimensions),
+                )
+                rows = cursor.fetchall()
+        result: dict[str, list[float]] = {}
+        for event_id, title_hash, embedding_text in rows:
+            title = event_titles.get(str(event_id))
+            if title is not None and title_hash == hashlib.sha256(title.encode()).hexdigest():
+                result[str(event_id)] = [float(value) for value in json.loads(embedding_text)]
+        return result
+
+    def save_event_embedding(
+        self, event_id: str, model_version: str, title: str, embedding: list[float]
+    ) -> None:
+        if len(embedding) != 1024:
+            raise ValueError("PostgreSQL event embeddings require 1024 dimensions")
+        vector_literal = "[" + ",".join(format(float(value), ".9g") for value in embedding) + "]"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO event_embeddings
+                      (event_id,model_version,dimensions,title_hash,embedding,updated_at)
+                    VALUES (%s,%s,1024,%s,%s::vector,now())
+                    ON CONFLICT (event_id,model_version) DO UPDATE SET
+                      dimensions=excluded.dimensions,title_hash=excluded.title_hash,
+                      embedding=excluded.embedding,updated_at=excluded.updated_at""",
+                    (event_id, model_version, hashlib.sha256(title.encode()).hexdigest(), vector_literal),
+                )
+            connection.commit()
+
+    def nearest_event_embeddings(
+        self, query_embedding: list[float], event_titles: dict[str, str], model_version: str, limit: int = 50,
+    ) -> dict[str, list[float]]:
+        if len(query_embedding) != 1024 or not event_titles or limit < 1:
+            return {}
+        vector_literal = "[" + ",".join(format(float(value), ".9g") for value in query_embedding) + "]"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT embeddings.event_id,embeddings.title_hash,embeddings.embedding::text
+                    FROM event_embeddings embeddings
+                    JOIN events ON events.id=embeddings.event_id
+                    WHERE embeddings.model_version=%s AND cardinality(events.superseded_by)=0
+                    ORDER BY embeddings.embedding <=> %s::vector LIMIT %s""",
+                    (model_version, vector_literal, min(500, limit)),
+                )
+                rows = cursor.fetchall()
+        result: dict[str, list[float]] = {}
+        for event_id, title_hash, embedding_text in rows:
+            title = event_titles.get(str(event_id))
+            if title is not None and title_hash == hashlib.sha256(title.encode()).hexdigest():
+                result[str(event_id)] = [float(value) for value in json.loads(embedding_text)]
+        return result
+
+    def delete_event_embeddings(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM event_embeddings WHERE event_id=ANY(%s)", (event_ids,))
+            connection.commit()
+
+    def append_baseline_sample(
+        self, fact_key: str, source_event_id: str, event_type: EventType, baseline_key: str, observed_at: datetime, value: float,
+    ) -> bool:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO baseline_samples (fact_key,source_event_id,event_type,baseline_key,observed_at,value)
+                    VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (fact_key) DO NOTHING""",
+                    (fact_key, source_event_id, event_type.value, baseline_key, observed_at, max(0.0, value)),
+                )
+                inserted = cursor.rowcount == 1
+            connection.commit()
+        return inserted
+
+    def load_baseline_history(self, event_type: EventType, exclude_event_id: str | None = None) -> tuple[dict[str, list[float]], str, int]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT fact_key,baseline_key,observed_at,value FROM baseline_samples
+                    WHERE event_type=%s AND source_event_id<>COALESCE(%s,'')
+                    ORDER BY baseline_key,observed_at,fact_key""",
+                    (event_type.value, exclude_event_id),
+                )
+                rows = cursor.fetchall()
+        history: dict[str, list[float]] = {}
+        for _, baseline_key, _, value in rows:
+            history.setdefault(str(baseline_key), []).append(float(value))
+        for values in history.values():
+            del values[:-1000]
+        material = [[row[0], row[1], row[2].isoformat(), float(row[3])] for row in rows]
+        digest = "sha256:" + hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest()
+        return history, digest, len(rows)
 
     def list_ranking_score_facts(self) -> list[dict[str, object]]:
         with self.connection() as connection:
@@ -1815,9 +2362,14 @@ class PostgresRepository:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (event.id,))
-                cursor.execute("SELECT lifecycle_state FROM events WHERE id=%s FOR UPDATE", (event.id,))
+                cursor.execute("SELECT lifecycle_state,version FROM events WHERE id=%s FOR UPDATE", (event.id,))
                 previous_row = cursor.fetchone()
                 previous_state = str(previous_row[0]) if previous_row else None
+                durable_revision = int(previous_row[1]) if previous_row else 0
+                if durable_revision != event.storage_revision:
+                    raise ConcurrentScoreConflict(
+                        f"event {event.id} changed from revision {event.storage_revision} to {durable_revision}"
+                    )
                 cursor.execute(
                     """
                     INSERT INTO events (id,canonical_title_zh,canonical_title_en,event_type,lifecycle_state,
@@ -1834,20 +2386,59 @@ class PostgresRepository:
                 )
                 cursor.execute(
                     """
-                    INSERT INTO score_runs (event_id,cycle_id,score_version,threshold_version,input_from,input_to,input_digest,drivers,payload,created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
-                    ON CONFLICT (event_id,cycle_id) DO UPDATE SET
-                      score_version=excluded.score_version,threshold_version=excluded.threshold_version,
-                      input_from=excluded.input_from,input_to=excluded.input_to,input_digest=excluded.input_digest,
-                      drivers=excluded.drivers,payload=excluded.payload,created_at=excluded.created_at
+                    INSERT INTO score_runs
+                      (event_id,cycle_id,scoring_revision,score_version,threshold_version,
+                       baseline_version,baseline_digest,feature_registry_version,feature_registry_digest,
+                       evidence_policy_version,label_policy_version,cluster_version,identity_version,input_observation_ids,
+                       input_from,input_to,input_digest,drivers,payload,created_at)
+                    SELECT
+                      %(event_id)s,%(cycle_id)s,COALESCE(max(scoring_revision),0)+1,
+                      %(score_version)s,%(threshold_version)s,
+                      %(baseline_version)s,%(baseline_digest)s,
+                      %(feature_registry_version)s,%(feature_registry_digest)s,
+                      %(evidence_policy_version)s,%(label_policy_version)s,
+                      %(cluster_version)s,%(identity_version)s,%(input_observation_ids)s::jsonb,
+                      %(input_from)s,%(input_to)s,%(input_digest)s,
+                      %(drivers)s::jsonb,%(payload)s::jsonb,%(created_at)s
+                    FROM score_runs WHERE event_id=%(event_id)s AND cycle_id=%(cycle_id)s
+                    ON CONFLICT (event_id,input_digest) DO NOTHING
+                    RETURNING id,scoring_revision
                     """,
-                    (score.event_id, cycle, score.score_version, score.threshold_version, score.input_from, score.input_to,
-                     score.input_digest, json.dumps(score.drivers, ensure_ascii=False), json.dumps(score.payload, ensure_ascii=False), score.created_at),
+                    {
+                        "event_id": score.event_id, "cycle_id": cycle,
+                        "score_version": score.score_version, "threshold_version": score.threshold_version,
+                        "baseline_version": score.baseline_version, "baseline_digest": score.baseline_digest,
+                        "feature_registry_version": score.feature_registry_version,
+                        "feature_registry_digest": score.feature_registry_digest,
+                        "evidence_policy_version": score.evidence_policy_version,
+                        "label_policy_version": score.label_policy_version,
+                        "cluster_version": score.cluster_version, "identity_version": score.identity_version,
+                        "input_observation_ids": json.dumps(score.input_observation_ids),
+                        "input_from": score.input_from, "input_to": score.input_to,
+                        "input_digest": score.input_digest,
+                        "drivers": json.dumps(score.drivers, ensure_ascii=False),
+                        "payload": json.dumps(score.payload, ensure_ascii=False), "created_at": score.created_at,
+                    },
                 )
-                cursor.execute(
-                    "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb) ON CONFLICT DO NOTHING",
-                    (event.id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle})),
-                )
+                inserted = cursor.fetchone()
+                if inserted:
+                    cursor.execute(
+                        "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('score.created',%s,%s::jsonb)",
+                        (event.id, json.dumps({"scoreVersion": score.score_version, "inputDigest": score.input_digest, "cycleId": cycle, "revision": inserted[1]})),
+                    )
+                    cursor.execute(
+                        """INSERT INTO event_metric_snapshots
+                          (event_id,captured_at,attention,behavior,diversity,authority,coordination_risk,coverage,evidence_strength,score_run_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (event_id,captured_at) DO UPDATE SET
+                          attention=excluded.attention,behavior=excluded.behavior,diversity=excluded.diversity,
+                          authority=excluded.authority,coordination_risk=excluded.coordination_risk,
+                          coverage=excluded.coverage,evidence_strength=excluded.evidence_strength,score_run_id=excluded.score_run_id""",
+                        (
+                            event.id, score.input_to, event.attention, event.behavior, event.diversity, event.authority,
+                            event.coordination_risk, event.coverage, event.evidence_score, inserted[0],
+                        ),
+                    )
                 if _meets_lead_threshold(event):
                     cursor.execute(
                         """INSERT INTO lead_threshold_crossings
@@ -1882,7 +2473,7 @@ class PostgresRepository:
                 cursor.execute(
                     """
                     SELECT o.id,o.platform,o.external_id,o.source_id,o.account_id,o.entity_id,o.published_at,
-                      COALESCE(ms.collected_at,o.collected_at),o.language,o.title,o.body,o.url,
+                      o.available_at,o.availability_basis,COALESCE(ms.collected_at,o.collected_at),o.language,o.title,o.body,o.url,
                       COALESCE(jsonb_object_agg(ms.metric_name,ms.value) FILTER (WHERE ms.metric_name IS NOT NULL),'{}'::jsonb),
                       o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id,o.provenance_level
                     FROM observations o
@@ -1890,7 +2481,7 @@ class PostgresRepository:
                     LEFT JOIN metric_snapshots ms ON ms.subject_id=o.id
                     WHERE eo.event_id=%s
                     GROUP BY o.id,o.platform,o.external_id,o.source_id,o.account_id,o.entity_id,o.published_at,
-                      o.collected_at,ms.collected_at,o.language,o.title,o.body,o.url,o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id,o.provenance_level
+                      o.available_at,o.availability_basis,o.collected_at,ms.collected_at,o.language,o.title,o.body,o.url,o.raw_evidence_ref,o.content_fingerprint,o.signal_family,o.rights_policy_id,o.provenance_level
                     ORDER BY o.published_at,COALESCE(ms.collected_at,o.collected_at)
                     """,
                     (event_id,),
@@ -1898,24 +2489,70 @@ class PostgresRepository:
                 rows = cursor.fetchall()
         return [Observation(
             id=row[0], platform=row[1], externalId=row[2], sourceId=row[3], accountId=row[4], entityId=row[5],
-            publishedAt=row[6], collectedAt=row[7], language=row[8], title=row[9], text=row[10], url=row[11],
-            metrics=row[12], rawEvidenceRef=row[13], contentFingerprint=row[14], signalFamily=row[15], rightsPolicyId=row[16],
-            provenanceLevel=row[17], relation="unknown",
+            publishedAt=row[6], availableAt=row[7], availabilityBasis=row[8], collectedAt=row[9], language=row[10],
+            title=row[11], text=row[12], url=row[13], metrics=row[14], rawEvidenceRef=row[15],
+            contentFingerprint=row[16], signalFamily=row[17], rightsPolicyId=row[18], provenanceLevel=row[19], relation="unknown",
         ) for row in rows]
+
+    def list_observation_freshness(self, since: datetime) -> list[dict[str, object]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT id,connector,available_at,collected_at,availability_basis
+                    FROM observations WHERE collected_at>=%s ORDER BY collected_at,id""",
+                    (since,),
+                )
+                rows = cursor.fetchall()
+        return [
+            {"id": row[0], "connectorId": row[1], "availableAt": row[2], "collectedAt": row[3], "availabilityBasis": row[4]}
+            for row in rows
+        ]
+
+    def rollup_and_retain_event_metrics(self, at: datetime, raw_retention_days: int = 90, rollup_retention_days: int = 730) -> dict[str, int]:
+        if raw_retention_days < 1 or rollup_retention_days < raw_retention_days:
+            raise ValueError("event metric retention windows are invalid")
+        raw_cutoff = at - timedelta(days=raw_retention_days)
+        rollup_cutoff = (at - timedelta(days=rollup_retention_days)).date()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO event_metric_daily_rollups
+                      (event_id,day,samples,attention_avg,attention_max,behavior_avg,behavior_max,coverage_min,evidence_strength_max)
+                    SELECT event_id,captured_at::date,count(*),avg(attention),max(attention),avg(behavior),max(behavior),min(coverage),max(evidence_strength)
+                    FROM event_metric_snapshots WHERE captured_at<%s GROUP BY event_id,captured_at::date
+                    ON CONFLICT (event_id,day) DO UPDATE SET
+                      samples=excluded.samples,attention_avg=excluded.attention_avg,attention_max=excluded.attention_max,
+                      behavior_avg=excluded.behavior_avg,behavior_max=excluded.behavior_max,
+                      coverage_min=excluded.coverage_min,evidence_strength_max=excluded.evidence_strength_max""",
+                    (raw_cutoff,),
+                )
+                rolled_up = cursor.rowcount
+                cursor.execute("DELETE FROM event_metric_snapshots WHERE captured_at<%s", (raw_cutoff,))
+                raw_deleted = cursor.rowcount
+                cursor.execute("DELETE FROM event_metric_daily_rollups WHERE day<%s", (rollup_cutoff,))
+                rollups_deleted = cursor.rowcount
+            connection.commit()
+        return {"rolledUp": rolled_up, "rawDeleted": raw_deleted, "rollupsDeleted": rollups_deleted}
 
     def get_event(self, event_id: str) -> RadarEvent | None:
         with self.connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT current_score FROM events WHERE id=%s", (event_id,))
+                cursor.execute("SELECT current_score,version FROM events WHERE id=%s", (event_id,))
                 row = cursor.fetchone()
-        return RadarEvent.model_validate(row[0]) if row else None
+        return (
+            RadarEvent.model_validate(row[0]).model_copy(update={"storage_revision": int(row[1])})
+            if row else None
+        )
 
     def list_events(self) -> list[RadarEvent]:
         with self.connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT current_score FROM events WHERE cardinality(superseded_by)=0 ORDER BY (current_score->>'velocity')::numeric DESC NULLS LAST")
+                cursor.execute("SELECT current_score,version FROM events WHERE cardinality(superseded_by)=0 ORDER BY (current_score->>'velocity')::numeric DESC NULLS LAST")
                 rows = cursor.fetchall()
-        return [RadarEvent.model_validate(row[0]) for row in rows]
+        return [
+            RadarEvent.model_validate(row[0]).model_copy(update={"storage_revision": int(row[1])})
+            for row in rows
+        ]
 
     def apply_connector_coverage_penalty(self, platform: str, penalty: float, note: str) -> int:
         events = self.list_events()
@@ -1943,10 +2580,96 @@ class PostgresRepository:
                 )
             connection.commit()
 
-    def record_connector_run(self, connector_id: str, started_at: datetime, finished_at: datetime, status: str, inserted: int, duplicates: int, coverage: float, error: str | None = None, estimated_cost_rmb: float = 0) -> None:
+    def reserve_connector_budget(
+        self, connector_id: str, signal_family: str, maximum_cost_rmb: float,
+        total_limit_rmb: float, connector_limit_rmb: float | None,
+        family_limit_rmb: float | None, family_connector_ids: set[str], base_spend_rmb: float = 0,
+    ) -> str | None:
+        current = utcnow()
+        month_start = current.date().replace(day=1)
+        connector_ids = sorted(family_connector_ids)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"connector-budget:{month_start.isoformat()}",),
+                )
+                cursor.execute(
+                    """UPDATE connector_budget_reservations SET status='reconciliation_required',
+                    reconciliation_reason='reservation lease expired before run confirmation'
+                    WHERE status='reserved' AND lease_until<clock_timestamp()"""
+                )
+                cursor.execute(
+                    """SELECT
+                      COALESCE((SELECT sum(estimated_cost_rmb) FROM connector_runs WHERE started_at>=date_trunc('month',clock_timestamp())),0)
+                        + COALESCE((SELECT sum(CASE WHEN status='reconciled_charged' THEN actual_amount_rmb ELSE reserved_amount_rmb END) FROM connector_budget_reservations WHERE month_start=%s AND status IN ('reserved','reconciliation_required','reconciled_charged')),0),
+                      COALESCE((SELECT sum(estimated_cost_rmb) FROM connector_runs WHERE started_at>=date_trunc('month',clock_timestamp()) AND connector_id=%s),0)
+                        + COALESCE((SELECT sum(CASE WHEN status='reconciled_charged' THEN actual_amount_rmb ELSE reserved_amount_rmb END) FROM connector_budget_reservations WHERE month_start=%s AND status IN ('reserved','reconciliation_required','reconciled_charged') AND connector_id=%s),0),
+                      COALESCE((SELECT sum(estimated_cost_rmb) FROM connector_runs WHERE started_at>=date_trunc('month',clock_timestamp()) AND connector_id=ANY(%s)),0)
+                        + COALESCE((SELECT sum(CASE WHEN status='reconciled_charged' THEN actual_amount_rmb ELSE reserved_amount_rmb END) FROM connector_budget_reservations WHERE month_start=%s AND status IN ('reserved','reconciliation_required','reconciled_charged') AND signal_family=%s),0)""",
+                    (month_start, connector_id, month_start, connector_id, connector_ids, month_start, signal_family),
+                )
+                total_spend, connector_spend, family_spend = (float(value) for value in cursor.fetchone())
+                if base_spend_rmb + total_spend + maximum_cost_rmb > total_limit_rmb:
+                    return None
+                if connector_limit_rmb is not None and connector_spend + maximum_cost_rmb > connector_limit_rmb:
+                    return None
+                if family_limit_rmb is not None and family_spend + maximum_cost_rmb > family_limit_rmb:
+                    return None
+                cursor.execute(
+                    """INSERT INTO connector_budget_reservations
+                    (month_start,connector_id,signal_family,reserved_amount_rmb)
+                    VALUES (%s,%s,%s,%s) RETURNING owner_token""",
+                    (month_start, connector_id, signal_family, maximum_cost_rmb),
+                )
+                reservation_id = str(cursor.fetchone()[0])
+            connection.commit()
+        return reservation_id
+
+    def reconcile_expired_connector_budget_reservations(self) -> int:
+        current = utcnow().date().replace(day=1)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"connector-budget:{current.isoformat()}",),
+                )
+                cursor.execute(
+                    """UPDATE connector_budget_reservations SET status='reconciliation_required',
+                    reconciliation_reason='reservation lease expired before run confirmation'
+                    WHERE status='reserved' AND lease_until<clock_timestamp()"""
+                )
+                changed = cursor.rowcount
+            connection.commit()
+        return changed
+
+    def connector_budget_reconciliation_count(self) -> int:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT count(*) FROM connector_budget_reservations
+                    WHERE status='reconciliation_required'
+                       OR (status='reserved' AND lease_until<clock_timestamp())"""
+                )
+                row = cursor.fetchone()
+        return int(row[0])
+
+    def record_connector_run(self, connector_id: str, started_at: datetime, finished_at: datetime, status: str, inserted: int, duplicates: int, coverage: float, error: str | None = None, estimated_cost_rmb: float = 0, budget_reservation_id: str | None = None) -> None:
         latency_ms = max(0, int((finished_at - started_at).total_seconds() * 1000))
         with self.connection() as connection:
             with connection.cursor() as cursor:
+                if budget_reservation_id:
+                    cursor.execute(
+                        """SELECT reserved_amount_rmb FROM connector_budget_reservations
+                        WHERE owner_token=%s AND connector_id=%s
+                          AND status IN ('reserved','reconciliation_required') FOR UPDATE""",
+                        (budget_reservation_id, connector_id),
+                    )
+                    reservation = cursor.fetchone()
+                    if reservation is None:
+                        raise RuntimeError("budget reservation is missing or no longer active")
+                    if estimated_cost_rmb > float(reservation[0]) + 1e-9:
+                        raise RuntimeError("actual connector cost exceeded its worst-case reservation")
                 cursor.execute(
                     """
                     INSERT INTO connector_runs
@@ -1955,6 +2678,13 @@ class PostgresRepository:
                     """,
                     (connector_id, started_at, finished_at, status, inserted, duplicates, latency_ms, coverage, error, max(0, estimated_cost_rmb)),
                 )
+                if budget_reservation_id:
+                    cursor.execute(
+                        """UPDATE connector_budget_reservations SET status='confirmed',
+                        actual_amount_rmb=%s,confirmed_at=clock_timestamp(),
+                        reconciliation_reason=NULL WHERE owner_token=%s""",
+                        (max(0, estimated_cost_rmb), budget_reservation_id),
+                    )
             connection.commit()
 
     def connector_stats_24h(self, connector_id: str) -> tuple[int, int]:
@@ -2001,15 +2731,29 @@ class PostgresRepository:
                 row = cursor.fetchone()
         return int(row[0]), int(row[1])
 
-    def monthly_connector_spend(self, at: datetime | None = None) -> float:
+    def monthly_connector_spend(self, at: datetime | None = None, connector_ids: set[str] | None = None) -> float:
         current = at or utcnow()
         month_start = current.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT COALESCE(SUM(estimated_cost_rmb),0) FROM connector_runs WHERE started_at >= %s AND started_at < %s",
-                    (month_start, next_month),
+                    """SELECT
+                      COALESCE((SELECT SUM(estimated_cost_rmb) FROM connector_runs
+                        WHERE started_at >= %s AND started_at < %s
+                        AND (%s::text[] IS NULL OR connector_id=ANY(%s))),0)
+                      + COALESCE((SELECT SUM(CASE WHEN status='reconciled_charged' THEN actual_amount_rmb ELSE reserved_amount_rmb END) FROM connector_budget_reservations
+                        WHERE month_start=%s AND status IN ('reserved','reconciliation_required','reconciled_charged')
+                        AND (%s::text[] IS NULL OR connector_id=ANY(%s))),0)""",
+                    (
+                        month_start,
+                        next_month,
+                        list(connector_ids) if connector_ids is not None else None,
+                        list(connector_ids) if connector_ids is not None else None,
+                        month_start.date(),
+                        list(connector_ids) if connector_ids is not None else None,
+                        list(connector_ids) if connector_ids is not None else None,
+                    ),
                 )
                 row = cursor.fetchone()
         return float(row[0])
@@ -3012,7 +3756,7 @@ class PostgresRepository:
         ]
 
     def purge_source(self, source_id: str) -> int:
-        with self.connection() as connection:
+        with self.deletion_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT id FROM observations WHERE source_id=%s", (source_id,))
                 observation_ids = [row[0] for row in cursor.fetchall()]
@@ -3027,6 +3771,14 @@ class PostgresRepository:
                     (source_id, json.dumps([{"source": source_id}])),
                 )
                 affected_event_ids = [row[0] for row in cursor.fetchall()]
+                if affected_event_ids:
+                    cursor.execute(
+                        "SELECT event_ids FROM erase_source_score_history(%s)",
+                        (source_id,),
+                    )
+                    authorized_event_ids = list(cursor.fetchone()[0])
+                    if set(authorized_event_ids) != set(affected_event_ids):
+                        raise RuntimeError("source erasure event set changed during authorization")
                 cursor.execute(
                     """
                     WITH candidate(ref) AS (
@@ -3067,9 +3819,31 @@ class PostgresRepository:
                     )
                     title_row = cursor.fetchone()
                     if title_row is None:
-                        # With no retained members, deleting the event is the
-                        # only way to guarantee title/body/embedding erasure.
-                        cursor.execute("DELETE FROM events WHERE id=%s", (event_id,))
+                        # Keep an inert, hidden tombstone so the application role
+                        # never needs DELETE on events (which would cascade into
+                        # immutable score history). All source-derived content is
+                        # replaced and the non-empty successor marker excludes it
+                        # from active-event queries.
+                        erased_successor = f"erased:{source_id}"
+                        cursor.execute(
+                            """UPDATE events SET canonical_title_zh='已删除事件',
+                              canonical_title_en='Deleted event',lifecycle_state='insufficient_data',
+                              structure_labels='{}',superseded_by=%s,
+                              current_score=current_score || %s::jsonb,updated_at=now()
+                            WHERE id=%s""",
+                            ([erased_successor], json.dumps({
+                                "title": "已删除事件", "titleEn": "Deleted event",
+                                "state": "insufficient_data", "labels": [],
+                                "classificationStatus": "unsupported",
+                                "unsupportedReason": "source_erased", "attention": 0,
+                                "behavior": 0, "coverage": 0, "evidenceScore": 0,
+                                "uncertainty": 100, "independentSources": 0,
+                                "platforms": [], "signalFamilies": [], "evidenceCount": 0,
+                                "evidence": [], "supersededBy": [erased_successor],
+                                "driver": "来源删除后事件已转为不可见审计墓碑。",
+                                "coverageNote": "全部合法成员已删除。",
+                            }, ensure_ascii=False), event_id),
+                        )
                         continue
                     rebuilt_title = str(title_row[1])
                     cursor.execute(
@@ -3108,7 +3882,7 @@ class PostgresRepository:
                         }, ensure_ascii=False), source_id, event_id),
                     )
                 if affected_event_ids:
-                    cursor.execute("DELETE FROM score_runs WHERE event_id=ANY(%s)", (affected_event_ids,))
+                    cursor.execute("DELETE FROM event_embeddings WHERE event_id=ANY(%s)", (affected_event_ids,))
                 cache_tags = ["radar", "events", f"source:{source_id}"] + [f"event:{event_id}" for event_id in sorted(affected_event_ids)]
                 cursor.execute(
                     "INSERT INTO outbox (kind,aggregate_id,payload) VALUES ('source.erased',%s,%s::jsonb)",

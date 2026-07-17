@@ -42,6 +42,37 @@ from tools.replay_outbox_to_redis import execute_replay
 NOW = datetime.now(timezone.utc)
 
 
+@pytest.mark.asyncio
+async def test_alert_dependency_probe_checks_delete_only_r2_capability() -> None:
+    class RedisProbe:
+        async def ping(self) -> bool:
+            return True
+
+    class EvidenceProbe:
+        def __init__(self, fails: bool = False) -> None:
+            self.fails = fails
+            self.calls = 0
+
+        async def probe_delete(self, bucket: str) -> None:
+            assert bucket == "raw"
+            self.calls += 1
+            if self.fails:
+                raise RuntimeError("delete denied")
+
+    healthy_store = EvidenceProbe()
+    result = await alert_worker_module.probe_alert_dependencies(  # type: ignore[arg-type]
+        RedisProbe(), healthy_store, "raw",  # type: ignore[arg-type]
+    )
+    assert result == (True, True, [])
+    failing_store = EvidenceProbe(True)
+    redis_ok, r2_delete_ok, failures = await alert_worker_module.probe_alert_dependencies(  # type: ignore[arg-type]
+        RedisProbe(), failing_store, "raw",  # type: ignore[arg-type]
+    )
+    assert redis_ok is True and r2_delete_ok is False
+    assert failures == ["r2-delete:RuntimeError"]
+    assert healthy_store.calls == failing_store.calls == 1
+
+
 def snapshot(source: str, group: str, platform: str, family: str, metrics: dict[str, float], previous: dict[str, float], *, fingerprint: str = "", captured_at: datetime = NOW) -> SignalSnapshot:
     return SignalSnapshot(source, group, platform, family, captured_at, metrics, previous, 80, True, fingerprint)
 
@@ -72,6 +103,28 @@ def test_behavior_family_without_a_type_valid_metric_remains_missing() -> None:
     assert metrics.behavior_observed is False
     assert metrics.behavior == 0
     assert metrics.independent_signal_families == 0
+
+
+def test_first_cumulative_snapshot_seeds_baseline_without_manufacturing_growth() -> None:
+    first = [
+        snapshot(f"model-{index}", f"owner-{index}", "HF", "behavior", {"downloads": 10_000_000}, {})
+        for index in range(5)
+    ]
+    seeded = aggregate_metrics(EventType.MODEL_RELEASE, first)
+    assert seeded.behavior == 0
+    assert seeded.behavior_observed is False
+    assert seeded.primary_adoption_observed is False
+
+    second = [
+        snapshot(
+            f"model-{index}", f"owner-{index}", "HF", "behavior",
+            {"downloads": 10_001_000}, {"downloads": 10_000_000},
+        )
+        for index in range(5)
+    ]
+    changed = aggregate_metrics(EventType.MODEL_RELEASE, second)
+    assert changed.behavior > 0
+    assert changed.behavior_observed is True
 
 
 def test_explicit_na_behavior_is_removed_from_coverage_denominator() -> None:
@@ -619,6 +672,33 @@ def test_connector_registry_has_required_rights_cost_backfill_and_acceptance_fie
     assert all(connector["rightsStatus"] != "active" for connector in payload["connectors"])
 
 
+def test_production_compose_and_examples_keep_service_secrets_isolated() -> None:
+    root = Path(__file__).parents[3]
+    compose = (root / "infra" / "compose.production.yml").read_text(encoding="utf-8")
+    assert "RADAR_ENV_FILE" not in compose
+    assert "RADAR_API_ENV_FILE" in compose
+    assert "RADAR_SCHEDULER_ENV_FILE" in compose
+    assert "RADAR_ALERT_ENV_FILE" in compose
+    assert "RADAR_SOURCE_IDENTITIES_FILE" in compose
+    assert "build:" not in compose
+
+    api = (root / ".env.api.example").read_text(encoding="utf-8")
+    scheduler = (root / ".env.scheduler.example").read_text(encoding="utf-8")
+    alert = (root / ".env.alert.example").read_text(encoding="utf-8")
+    assert not any(secret in api for secret in (
+        "R2_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "YOUTUBE_API_KEY", "X_BEARER_TOKEN",
+        "WEBHOOK_SIGNING_SECRET", "BGE_M3_API_KEY",
+    ))
+    assert not any(secret in scheduler for secret in (
+        "DELETION_DATABASE_URL", "WEBHOOK_SIGNING_SECRET",
+        "SCORE_LEDGER_ED25519_PRIVATE_KEY",
+    ))
+    assert not any(secret in alert for secret in (
+        "DELETION_DATABASE_URL", "GITHUB_TOKEN", "YOUTUBE_API_KEY", "X_BEARER_TOKEN",
+        "BGE_M3_API_KEY", "SCORE_LEDGER_ED25519_PRIVATE_KEY",
+    ))
+
+
 def test_stream_retention_uses_oldest_group_pending_or_delivery_watermark() -> None:
     watermarks = [
         ConsumerGroupWatermark("alerts", "100-0", 2, "80-0", "80-0"),
@@ -744,7 +824,7 @@ async def test_worker_cannot_promote_unapproved_connector_rights() -> None:
         signal_family = "discussion"
 
         async def collect(self) -> list[Observation]:
-            return []
+            raise AssertionError("unapproved connector must never perform network collection")
 
     repository = InMemoryRepository()
     connector = EmptyXConnector()
@@ -753,7 +833,12 @@ async def test_worker_cannot_promote_unapproved_connector_rights() -> None:
     finally:
         await connector.close()
     assert result.failed is False
-    assert repository.get_connector("x").rights_status == "blocked"
+    assert result.skipped is True
+    status = repository.get_connector("x")
+    assert status.rights_status == "blocked"
+    assert status.status == "paused"
+    assert status.coverage == 0
+    assert "生产采集已安全暂停" in status.note
 
 
 def test_frozen_feature_registry_is_complete_and_controls_metric_roles() -> None:

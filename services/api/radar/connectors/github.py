@@ -39,7 +39,11 @@ class GitHubConnector(BaseConnector):
                 externalId=str(repo["id"]), sourceId=f"github:{repo['owner']['login']}",
                 publishedAt=datetime.fromisoformat(repo["updated_at"].replace("Z", "+00:00")), collectedAt=collected,
                 language="en", title=title, text=text, url=url,
-                metrics={"stars": float(repo.get("stargazers_count", 0)), "forks": float(repo.get("forks_count", 0)), "issues": float(repo.get("open_issues_count", 0)), "watchers": float(repo.get("subscribers_count", 0))},
+                metrics={
+                    "stars": float(repo.get("stargazers_count", 0)),
+                    "forks": float(repo.get("forks_count", 0)),
+                    "issues": float(repo.get("open_issues_count", 0)),
+                },
                 rawEvidenceRef=item_ref, relation="original",
                 contentFingerprint=content_fingerprint(title, text, url), signalFamily="behavior",
             ))

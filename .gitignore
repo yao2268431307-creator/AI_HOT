@@ -10,4 +10,6 @@ web/.next/
 web/dist/
 web/.wrangler/
 web/.vinext/
+web/test-results/
+web/playwright-report/
 .DS_Store

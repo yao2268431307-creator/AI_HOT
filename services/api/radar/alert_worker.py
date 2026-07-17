@@ -386,15 +386,42 @@ class RedisAlertWorker:
                     raise
 
 
+async def probe_alert_dependencies(
+    redis: Redis, evidence_store: LocalEvidenceStore | S3EvidenceStore, bucket: str,
+) -> tuple[bool, bool, list[str]]:
+    """Re-probe the alert worker's Redis and delete-only R2 capabilities."""
+    failures: list[str] = []
+    try:
+        redis_verified = bool(await redis.ping())
+    except Exception as exc:  # provider clients expose several transport errors
+        redis_verified = False
+        failures.append(f"redis:{type(exc).__name__}")
+    try:
+        await evidence_store.probe_delete(bucket)
+        r2_delete_verified = True
+    except Exception as exc:  # preserve only the error class in heartbeat/logs
+        r2_delete_verified = False
+        failures.append(f"r2-delete:{type(exc).__name__}")
+    return redis_verified, r2_delete_verified, failures
+
+
 async def run() -> None:
     dsn = os.environ["DATABASE_URL"]
+    repository = PostgresRepository(dsn)
+    production = os.getenv("DEMO_MODE", "true").lower() == "false"
     workspace_ids = [value.strip() for value in os.getenv("RADAR_WORKSPACE_IDS", "").split(",") if value.strip()]
     if not workspace_ids:
         raise RuntimeError("RADAR_WORKSPACE_IDS must list workspaces served by the alert worker")
     redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+    bucket = os.getenv("RAW_EVIDENCE_BUCKET", "")
+    if production and not bucket:
+        raise RuntimeError("production alert worker requires RAW_EVIDENCE_BUCKET")
+    bucket = bucket or "raw-evidence"
     if os.getenv("R2_ENDPOINT_URL") and os.getenv("R2_ACCESS_KEY_ID") and os.getenv("R2_SECRET_ACCESS_KEY"):
         objects = S3EvidenceStore(os.environ["R2_ENDPOINT_URL"], os.environ["R2_ACCESS_KEY_ID"], os.environ["R2_SECRET_ACCESS_KEY"])
     else:
+        if production:
+            raise RuntimeError("production alert worker requires R2 credentials and cannot use local evidence")
         objects = LocalEvidenceStore(os.getenv("RAW_EVIDENCE_LOCAL_DIR", ".data/evidence"))
 
     class RedisCacheInvalidator:
@@ -406,7 +433,7 @@ async def run() -> None:
     worker = RedisAlertWorker(
         redis,
         AlertDispatcher(
-            PostgresRepository(dsn), signing_secret=os.getenv("WEBHOOK_SIGNING_SECRET", ""),
+            repository, signing_secret=os.getenv("WEBHOOK_SIGNING_SECRET", ""),
             signing_key_id=os.getenv("WEBHOOK_SIGNING_KEY_ID", "primary"),
         ),
         workspace_ids,
@@ -417,7 +444,32 @@ async def run() -> None:
     )
     try:
         while True:
+            dependency_probe_at = datetime.now(timezone.utc)
+            redis_verified, r2_delete_verified, dependency_failures = await probe_alert_dependencies(
+                redis, objects, bucket,
+            )
+            dependency_details = {
+                "workspaceCount": len(workspace_ids),
+                "dependencyProbeAt": dependency_probe_at.isoformat(),
+                "redisVerified": redis_verified,
+                "r2DeleteVerified": r2_delete_verified,
+                "dependencyProbeFailures": dependency_failures,
+            }
+            if not redis_verified or not r2_delete_verified:
+                repository.heartbeat_runtime_component(
+                    "alert-consumer", os.getenv("RADAR_INSTANCE_ID", "local-alert-worker"),
+                    dependency_details,
+                )
+                print(json.dumps({
+                    "level": "error", "event": "alert_dependency_probe_failed",
+                    **dependency_details,
+                }, ensure_ascii=False))
+                raise RuntimeError("alert dependency probe failed before stream consumption")
             await worker.run_once()
+            repository.heartbeat_runtime_component(
+                "alert-consumer", os.getenv("RADAR_INSTANCE_ID", "local-alert-worker"),
+                dependency_details,
+            )
     finally:
         await redis.aclose()
 

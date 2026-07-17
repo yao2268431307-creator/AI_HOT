@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import base64
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from radar.contracts import Observation, WatchlistRequest
 from radar.main import create_app
@@ -14,6 +18,17 @@ def client() -> TestClient:
     return TestClient(create_app(InMemoryRepository()))
 
 
+def _b64url(payload: bytes) -> str:
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+
+
+def _jwt(private_key: Ed25519PrivateKey, claims: dict[str, object]) -> str:
+    header = _b64url(json.dumps({"alg": "EdDSA", "kid": "test-key"}, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signature = _b64url(private_key.sign(f"{header}.{body}".encode()))
+    return f"{header}.{body}.{signature}"
+
+
 def test_radar_contract_and_evidence_traceability() -> None:
     with client() as http:
         response = http.get("/api/v1/radar?window=6h")
@@ -21,7 +36,14 @@ def test_radar_contract_and_evidence_traceability() -> None:
         payload = response.json()
         assert payload["window"] == "6h"
         assert payload["dataMode"] == "recorded_demo"
+        assert payload["totalEvents"] == len(payload["events"])
+        assert payload["limit"] == 200
+        assert payload["hasMore"] is False
         assert len(payload["events"]) >= 5
+        assert [event["queuePriorityScore"] for event in payload["events"]] == sorted(
+            (event["queuePriorityScore"] for event in payload["events"]), reverse=True,
+        )
+        assert all("newEvidenceCount" in event and "queuePriorityReasons" in event for event in payload["events"])
         confirmed = next(event for event in payload["events"] if event["state"] == "accelerating")
         assert len(confirmed["evidence"]) >= 3
         assert confirmed["scoreVersion"]
@@ -30,6 +52,99 @@ def test_radar_contract_and_evidence_traceability() -> None:
         evidence = http.get(f"/api/v1/topics/{confirmed['id']}/evidence")
         assert evidence.status_code == 200
         assert len(evidence.json()["items"]) >= 3
+
+
+def test_prometheus_metrics_expose_bounded_operational_signals(monkeypatch) -> None:
+    repository = InMemoryRepository()
+    app = create_app(repository)
+    now = datetime.now(timezone.utc)
+    repository.record_connector_run(
+        "rss", now - timedelta(seconds=2), now, "healthy", 2, 1, 90,
+        estimated_cost_rmb=2.5,
+    )
+    repository.heartbeat_runtime_component("scheduler", "test-instance")
+    monkeypatch.setenv("EXTERNAL_DATA_BUDGET_RMB", "100")
+    with TestClient(app) as http:
+        response = http.get("/metrics")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert 'radar_connector_runs_24h{connector="rss",status="healthy"} 1' in response.text
+    assert 'radar_connector_latency_p95_seconds_24h{connector="rss"} 2.000' in response.text
+    assert 'radar_runtime_component_heartbeat_age_seconds{component="scheduler"}' in response.text
+    assert "radar_external_data_budget_spend_rmb 2.5000" in response.text
+    assert "radar_external_data_budget_utilization_ratio 0.025000" in response.text
+    assert "radar_connector_budget_reconciliation_pending 0" in response.text
+    assert "radar_observation_processing_backlog" in response.text
+    assert "radar_outbox_backlog" in response.text
+
+
+def test_jwt_auth_validates_short_lived_token_and_server_side_membership(monkeypatch) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("RADAR_AUTH_MODE", "jwt")
+    monkeypatch.setenv("RADAR_JWT_PUBLIC_KEYS", json.dumps({"test-key": public_pem}))
+    monkeypatch.setenv("RADAR_JWT_ISSUER", "https://identity.example")
+    monkeypatch.setenv("RADAR_JWT_AUDIENCE", "signal-ai")
+    issued_at = int(time.time())
+    claims = {
+        "iss": "https://identity.example", "aud": "signal-ai", "sub": "analyst-1",
+        "workspaceId": "workspace-a", "role": "OWNER", "nbf": issued_at - 1,
+        "iat": issued_at, "exp": issued_at + 300, "jti": "token-1",
+        "signingKeyVersion": "test-key",
+    }
+    repository = InMemoryRepository()
+    repository.set_workspace_membership("analyst-1", "workspace-a", "ANALYST")
+    with TestClient(create_app(repository)) as http:
+        response = http.get("/api/v1/radar", headers={"Authorization": f"Bearer {_jwt(private_key, claims)}"})
+        assert response.status_code == 200
+        bad_token = _jwt(private_key, {**claims, "aud": "other"})
+        bad = http.get("/api/v1/radar", headers={"Authorization": f"Bearer {bad_token}"})
+        assert bad.status_code == 401
+        long_lived = _jwt(private_key, {**claims, "jti": "token-long", "exp": issued_at + 301})
+        assert http.get("/api/v1/radar", headers={"Authorization": f"Bearer {long_lived}"}).status_code == 401
+        repository.revoked_token_jtis.add("token-1")
+        assert http.get("/api/v1/radar", headers={"Authorization": f"Bearer {_jwt(private_key, claims)}"}).status_code == 401
+        repository.revoked_token_jtis.clear()
+        repository.set_workspace_membership("analyst-1", "workspace-a", "ANALYST", "revoked")
+        assert http.get("/api/v1/radar", headers={"Authorization": f"Bearer {_jwt(private_key, claims)}"}).status_code == 403
+
+
+def test_jwt_auth_rejects_malformed_and_wrongly_typed_claims_without_500_or_detail_leak(monkeypatch) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("RADAR_AUTH_MODE", "jwt")
+    monkeypatch.setenv("RADAR_JWT_PUBLIC_KEYS", json.dumps({"test-key": public_pem}))
+    monkeypatch.setenv("RADAR_JWT_ISSUER", "https://identity.example")
+    monkeypatch.setenv("RADAR_JWT_AUDIENCE", "signal-ai")
+    now = int(time.time())
+    claims = {
+        "iss": "https://identity.example", "aud": "signal-ai", "sub": "analyst-1",
+        "workspaceId": "workspace-a", "iat": now, "exp": now + 300,
+        "jti": "token-1", "signingKeyVersion": "test-key",
+    }
+    repository = InMemoryRepository()
+    repository.set_workspace_membership("analyst-1", "workspace-a", "ANALYST")
+    malformed = [
+        "%%%.e30.invalid",
+        f"{_b64url(b'[]')}.{_b64url(json.dumps(claims).encode())}.invalid",
+        _jwt(private_key, {**claims, "sub": None}),
+        _jwt(private_key, {**claims, "iat": True}),
+        _jwt(private_key, {**claims, "exp": 10 ** 1000}),
+        _jwt(private_key, {**claims, "aud": ["signal-ai", 1]}),
+    ]
+    with TestClient(create_app(repository)) as http:
+        responses = [
+            http.get("/api/v1/radar", headers={"Authorization": f"Bearer {token}"})
+            for token in malformed
+        ]
+    assert [response.status_code for response in responses] == [401] * len(malformed)
+    assert all(response.json() == {"detail": "invalid bearer token"} for response in responses)
 
 
 def test_radar_window_filters_event_timelines_and_old_events() -> None:
@@ -129,7 +244,8 @@ def test_operational_endpoints_report_duplicate_rate_and_collection_to_scoring_s
     )
     item = Observation(
         id="sla-observation", platform="RSS", externalId="sla-observation", sourceId="source-a",
-        publishedAt=current - timedelta(minutes=12), collectedAt=current - timedelta(minutes=10),
+        publishedAt=current - timedelta(minutes=12), availableAt=current - timedelta(minutes=12),
+        availabilityBasis="provider_timestamp", collectedAt=current - timedelta(minutes=10),
         language="en", title="SLA event", text="A processing latency fact", url="https://example.com/sla",
         metrics={}, rawEvidenceRef="r2://raw/sla-observation", contentFingerprint="sla-fingerprint",
         signalFamily="official", relation="original",
@@ -140,6 +256,7 @@ def test_operational_endpoints_report_duplicate_rate_and_collection_to_scoring_s
     repository.complete_observation_processing(item.id, revision)
     duplicate = item.model_copy(update={
         "id": "sla-observation-copy", "external_id": "sla-observation-copy",
+        "available_at": current - timedelta(minutes=9), "availability_basis": "first_detected",
         "collected_at": current - timedelta(minutes=9), "raw_evidence_ref": "r2://raw/sla-observation-copy",
     })
     assert repository.save_observation_with_outbox(duplicate)
@@ -157,6 +274,14 @@ def test_operational_endpoints_report_duplicate_rate_and_collection_to_scoring_s
         assert pipeline["within15Minutes"] == 1
         assert pipeline["rate"] == 1
         assert pipeline["passesTarget"] is True
+
+        freshness = http.get("/api/v1/operations/discovery-freshness?hours=1").json()
+        rss_freshness = next(row for row in freshness["items"] if row["connectorId"] == "rss")
+        assert rss_freshness["sample"] == 2
+        assert rss_freshness["providerTimestampSamples"] == 1
+        assert rss_freshness["firstDetectedFallbackSamples"] == 1
+        assert rss_freshness["measurementQuality"] == "limited_first_detection_fallback"
+        assert rss_freshness["passesTarget"] is True
 
         quality = http.get("/api/v1/operations/data-quality?hours=1").json()
         assert quality["metricScope"] == "persisted_within_connector_content_fingerprint_duplicates"
@@ -241,6 +366,12 @@ def test_role_enforcement_when_auth_is_enabled(monkeypatch) -> None:
         assert governed_promotion.status_code == 200
         assert governed_promotion.json()["autoPromotionEnabled"] is False
         assert governed_promotion.json()["promotedSourceIds"] == []
+        assert http.delete(
+            "/api/v1/privacy/sources/nonexistent", headers={"X-API-Key": "owner-key"},
+        ).status_code == 403
+        assert http.delete(
+            "/api/v1/privacy/sources/nonexistent", headers={"X-API-Key": "governance-owner-key"},
+        ).status_code == 200
 
 
 def test_graph_and_source_capacity_contract() -> None:
@@ -313,10 +444,34 @@ def test_revised_assessment_contract_exposes_na_masks_and_non_precise_strength()
         assert queue["items"][0]["assessment"]["decisionReason"]["drivers"]
         coverage = http.get("/api/v1/coverage").json()
         assert coverage["connectors"]
-        assert coverage["budget"] == {"currency": "CNY", "spent": 0, "limit": 2000, "remaining": 2000}
+        assert coverage["budget"] == {
+            "currency": "CNY", "spent": 0, "limit": 2000, "remaining": 2000,
+            "connectorLimits": [], "signalFamilyLimits": [],
+        }
         youtube = next(item for item in coverage["connectors"] if item["id"] == "youtube")
         assert youtube["quotaUsed"] == 7200
         assert youtube["rightsStatus"] == "blocked"
+
+
+def test_coverage_exposes_connector_and_signal_family_budget_ledgers(monkeypatch) -> None:
+    repository = InMemoryRepository()
+    app = create_app(repository)
+    now = datetime.now(timezone.utc)
+    repository.record_connector_run(
+        "youtube", now, now, "healthy", 0, 0, 90, estimated_cost_rmb=12
+    )
+    monkeypatch.setenv("CONNECTOR_BUDGETS_RMB_JSON", '{"youtube":50}')
+    monkeypatch.setenv("SIGNAL_FAMILY_BUDGETS_RMB_JSON", '{"behavior":100}')
+    with TestClient(app) as http:
+        budget = http.get("/api/v1/coverage").json()["budget"]
+    assert budget["connectorLimits"] == [{
+        "scope": "youtube", "spent": 12, "limit": 50,
+        "remaining": 38, "hardPaused": False,
+    }]
+    assert budget["signalFamilyLimits"] == [{
+        "scope": "behavior", "spent": 12, "limit": 100,
+        "remaining": 88, "hardPaused": False,
+    }]
 
 
 def test_analyst_can_explicitly_mark_research_behavior_not_applicable() -> None:

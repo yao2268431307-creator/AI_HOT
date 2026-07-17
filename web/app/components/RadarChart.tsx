@@ -26,13 +26,15 @@ export function RadarChart({ events, onSelect }: { events: RadarEvent[]; onSelec
   useEffect(() => {
     if (!host.current) return;
     const chart = init(host.current, undefined, { renderer: "canvas" });
-    const points = events.filter((event) => event.evidence.some((item) => item.kind === "discussion") && event.evidence.some((item) => item.kind === "behavior")).map((event) => ({
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const points = events.map((event) => ({
       value: [event.attention, event.behavior, event.evidenceScore, event.id, event.evidenceStrength],
       name: event.title,
       itemStyle: { color: stateColor[event.state] ?? "#41b8ff" },
     }));
     chart.setOption({
-      animationDuration: 500,
+      animation: !reducedMotion,
+      animationDuration: reducedMotion ? 0 : 500,
       grid: { left: 54, right: 22, top: 26, bottom: 46 },
       tooltip: {
         trigger: "item",

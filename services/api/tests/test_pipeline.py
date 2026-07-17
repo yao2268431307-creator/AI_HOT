@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import json
@@ -7,6 +8,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from radar import alerts as alert_module
 from radar import runner as runner_module
@@ -23,18 +26,19 @@ from radar.connectors.huggingface import HuggingFaceConnector
 from radar.connectors.research import OpenAlexConnector
 from radar.connectors.rss import RSSConnector
 from radar.connectors.youtube import YouTubeConnector
-from radar.contracts import BehaviorApplicabilityRequest, ClusterEditRequest, FeedbackRequest, Observation, StoredScore
+from radar.contracts import BehaviorApplicabilityRequest, ClusterEditRequest, EventType, FeedbackRequest, LifecycleState, MetricPoint, Observation, StoredScore
 from radar.embeddings import BgeM3Provider, cosine_similarity
 from radar.evidence_store import LocalEvidenceStore, evidence_key
 from radar.deletion import SourceDeletionConsumer
 from radar.facts import split_observation
-from radar.fixtures import seed_repository
+from radar.fixtures import demo_events, seed_repository
 from radar.identities import SourceIdentity, SourceIdentityResolver
 from radar.normalize import canonical_text, content_fingerprint, normalize_url, sanitize_external_text
 from radar.processor import EventProcessor
 from radar.retention import RawEvidenceRetentionWorker, load_retention_days
 from radar.evidence_store import S3EvidenceStore
-from radar.storage import InMemoryRepository, PostgresRepository
+from radar.scoring import replay_score_payload
+from radar.storage import InMemoryRepository, PostgresRepository, utcnow
 from radar.source_discovery import load_source_score_policy, source_score_policy_digest
 from radar.worker import CollectorWorker
 from radar.budget import budget_guard
@@ -180,6 +184,24 @@ def test_rights_policy_excerpt_limit_is_enforced_during_fact_split() -> None:
     })
     content, _ = split_observation(item)
     assert len(content.text_excerpt) == 500
+
+
+def test_rights_policy_rejects_unregistered_and_unverified_metrics() -> None:
+    with pytest.raises(ValueError, match="unregistered metrics"):
+        split_observation(observation("rights-unregistered").model_copy(update={
+            "metrics": {"invented_engagement": 100},
+        }))
+    with pytest.raises(ValueError, match="before provider verification"):
+        split_observation(observation("rights-unverified").model_copy(update={
+            "rights_policy_id": "bluesky-appview-jetstream-experimental-v1",
+            "provenance_level": "unverified_discovery", "metrics": {"comments": 3},
+        }))
+    verified = observation("rights-verified").model_copy(update={
+        "rights_policy_id": "bluesky-appview-jetstream-experimental-v1",
+        "provenance_level": "provider_verified", "metrics": {"comments": 3},
+    })
+    _, metrics = split_observation(verified)
+    assert [item.metric_name for item in metrics] == ["comments"]
 
 
 def test_provenance_upgrade_is_durable_and_schedules_a_new_revision() -> None:
@@ -357,6 +379,59 @@ def test_score_run_persists_versions_input_window_digest_and_drivers() -> None:
     repository.save_score(score)
     assert repository.score_runs[0].input_digest == "sha256:abc"
     assert repository.outbox[-1]["kind"] == "score.created"
+
+
+def test_same_cycle_score_revisions_are_append_only_and_digest_idempotent() -> None:
+    repository = InMemoryRepository()
+    now = datetime(2026, 7, 17, 0, 7, tzinfo=timezone.utc)
+    first = StoredScore(
+        event_id="evt-revision", score_version="score-test", threshold_version="threshold-test",
+        input_from=now - timedelta(minutes=5), input_to=now, input_digest="sha256:first",
+        drivers=["first"], payload={"state": "detected"}, created_at=now,
+    )
+    second = first.model_copy(update={"input_digest": "sha256:second", "drivers": ["late revision"]})
+    repository.save_score(first)
+    repository.save_score(second)
+    repository.save_score(second)
+    assert [(row.input_digest, row.scoring_revision) for row in repository.score_runs] == [
+        ("sha256:first", 1), ("sha256:second", 2),
+    ]
+    assert sum(row["kind"] == "score.created" for row in repository.outbox) == 2
+
+
+@pytest.mark.asyncio
+async def test_processed_score_can_be_replayed_and_persistent_baseline_survives_restart() -> None:
+    repository = InMemoryRepository()
+    processor = EventProcessor(repository)
+    first = observation("replay-event").model_copy(update={
+        "external_id": "replay-event", "source_id": "replay-source",
+        "published_at": datetime(2026, 7, 17, 0, 0, tzinfo=timezone.utc),
+        "collected_at": datetime(2026, 7, 17, 0, 0, tzinfo=timezone.utc),
+        "metrics": {"comments": 10}, "signal_family": "discussion",
+    })
+    second = first.model_copy(update={
+        "collected_at": first.collected_at + timedelta(minutes=15), "metrics": {"comments": 40},
+        "raw_evidence_ref": "r2://raw/replay-event-second",
+    })
+    assert repository.save_observation_with_outbox(first)
+    await processor.process(first)
+    assert repository.save_observation_with_outbox(second)
+    await processor.process(second)
+    stored = repository.score_runs[-1]
+    replayed = replay_score_payload(stored.payload)
+    expected = stored.payload["_replay"]["expected"]
+    assert replayed.state.value == expected["state"]
+    assert [label.value for label in replayed.labels] == expected["labels"]
+    assert replayed.evidence_strength == expected["evidenceStrength"]
+    assert stored.feature_registry_version != "unknown"
+    assert stored.baseline_digest.startswith("sha256:")
+    assert stored.input_observation_ids == ["replay-event"]
+    history, digest, count = repository.load_baseline_history(EventType(stored.payload["eventType"]))
+    assert count == 1 and history["rss:comments"] == [30.0]
+    restarted = EventProcessor(repository)
+    restarted_history, restarted_digest, restarted_count = repository.load_baseline_history(EventType(stored.payload["eventType"]))
+    assert (restarted_history, restarted_digest, restarted_count) == (history, digest, count)
+    assert restarted.repository is repository
 
 
 def test_postgres_feedback_and_applicability_paths_bind_their_own_request_fields() -> None:
@@ -618,7 +693,7 @@ async def test_bluesky_appview_failure_degrades_run_without_advancing_checkpoint
                 json.dumps(jetstream_event(text="AI launch", time_us=event_time)),
             ]), max_messages=1, idle_timeout_seconds=.1, max_attempts=1,
         )
-        result = await CollectorWorker(repository, [connector]).run_connector(connector)
+        result = await CollectorWorker(repository, [connector], allow_unapproved_rights_for_nonproduction=True).run_connector(connector)
     assert result.failed is True
     assert repository.get_connector_checkpoint(connector.id) == {}
     assert repository.observations == {}
@@ -725,6 +800,26 @@ async def test_runner_keeps_bluesky_disabled_by_default(monkeypatch, tmp_path) -
     finally:
         for connector in enabled_connectors:
             await connector.close()
+
+
+@pytest.mark.asyncio
+async def test_default_runner_connectors_cannot_collect_while_registry_rights_are_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+    monkeypatch.delenv("BLUESKY_JETSTREAM_ENABLED", raising=False)
+    monkeypatch.setenv("RSS_FEEDS_FILE", str(tmp_path / "missing-feeds.json"))
+    connectors = runner_module.build_connectors(LocalEvidenceStore(tmp_path / "raw"))
+    repository = InMemoryRepository()
+    worker = CollectorWorker(repository, connectors)
+    try:
+        runs = await worker.run_once()
+    finally:
+        await worker.close()
+    assert runs
+    assert all(run.skipped and not run.failed for run in runs)
+    assert repository.observations == {}
+    assert all(repository.get_connector(run.connector_id).status == "paused" for run in runs)
 
 
 @pytest.mark.asyncio
@@ -923,6 +1018,105 @@ class StaticConnector(BaseConnector):
         return self.items
 
 
+def test_production_runner_configuration_requires_scoped_budgets_and_image_digests(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    identity_path = tmp_path / "identities.json"
+    identity_path.write_text(
+        json.dumps([{"sourceId": "rss:lab", "accountId": "rss:lab", "entityId": "org:lab"}]),
+        encoding="utf-8",
+    )
+    public_pem = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    required = {
+        "DEMO_MODE": "false", "DATABASE_URL": "postgresql://example",
+        "REDIS_URL": "redis://example", "R2_ENDPOINT_URL": "https://r2.example",
+        "R2_ACCESS_KEY_ID": "access", "R2_SECRET_ACCESS_KEY": "secret",
+        "RADAR_INSTANCE_ID": "stable-instance", "SOURCE_IDENTITIES_FILE": str(identity_path),
+        "RADAR_JWT_PUBLIC_KEYS": json.dumps({"key": public_pem}), "RADAR_JWT_ISSUER": "issuer",
+        "RADAR_JWT_AUDIENCE": "audience", "AUTH_REQUIRED": "true", "RADAR_AUTH_MODE": "jwt",
+        "RAW_EVIDENCE_BUCKET": "raw",
+        "CONNECTOR_BUDGETS_RMB_JSON": '{"youtube":500}',
+        "SIGNAL_FAMILY_BUDGETS_RMB_JSON": '{"discussion":900}',
+        "RADAR_RELEASE_IMAGE_DIGESTS": json.dumps({
+            "api": "sha256:" + "a" * 64, "web": "sha256:" + "b" * 64,
+        }),
+        "RADAR_ACTUAL_IMAGE_DIGESTS": json.dumps({
+            "api": "sha256:" + "a" * 64, "web": "sha256:" + "b" * 64,
+        }),
+    }
+    for key, value in required.items():
+        monkeypatch.setenv(key, value)
+    assert runner_module.validate_runtime_configuration() is True
+    monkeypatch.setenv("CONNECTOR_BUDGETS_RMB_JSON", '{"youtube":0}')
+    with pytest.raises(RuntimeError, match="positive finite"):
+        runner_module.validate_runtime_configuration()
+    monkeypatch.setenv("CONNECTOR_BUDGETS_RMB_JSON", '{"youtube":500}')
+    monkeypatch.setenv("RADAR_RELEASE_IMAGE_DIGESTS", '{"api":"latest","web":"latest"}')
+    with pytest.raises(RuntimeError, match="sha256"):
+        runner_module.validate_runtime_configuration()
+
+
+def test_production_budget_coverage_requires_every_metered_connector_and_family() -> None:
+    github = GitHubConnector(max_attempts=1)
+    huggingface = HuggingFaceConnector(max_attempts=1)
+    try:
+        with pytest.raises(RuntimeError, match="github.*huggingface.*behavior"):
+            runner_module.validate_budget_coverage([github, huggingface], {}, {})
+        with pytest.raises(RuntimeError, match="signalFamilies=behavior"):
+            runner_module.validate_budget_coverage(
+                [github, huggingface], {"github": 100, "huggingface": 100}, {},
+            )
+        runner_module.validate_budget_coverage(
+            [github, huggingface],
+            {"github": 100, "huggingface": 100},
+            {"behavior": 200},
+        )
+    finally:
+        asyncio.run(github.close())
+        asyncio.run(huggingface.close())
+
+
+def test_fixed_scheduler_cadence_does_not_add_cycle_duration() -> None:
+    target, delay = runner_module.next_scheduled_cycle(1000.0, 900, 1025.0)
+    assert target == 1900.0
+    assert delay == 875.0
+    skipped_target, skipped_delay = runner_module.next_scheduled_cycle(1000.0, 900, 2920.0)
+    assert skipped_target == 3700.0
+    assert skipped_delay == 780.0
+
+
+@pytest.mark.asyncio
+async def test_runtime_dependency_probe_rechecks_both_dependencies() -> None:
+    class RedisProbe:
+        async def ping(self) -> bool:
+            return True
+
+    class EvidenceProbe:
+        def __init__(self, fails: bool = False) -> None:
+            self.fails = fails
+            self.calls = 0
+
+        async def probe(self, bucket: str) -> None:
+            assert bucket == "raw"
+            self.calls += 1
+            if self.fails:
+                raise RuntimeError("unavailable")
+
+    healthy_store = EvidenceProbe()
+    assert await runner_module.probe_runtime_dependencies(  # type: ignore[arg-type]
+        RedisProbe(), healthy_store, "raw",  # type: ignore[arg-type]
+    ) == (True, True, [])
+    failing_store = EvidenceProbe(True)
+    redis_ok, r2_ok, failures = await runner_module.probe_runtime_dependencies(  # type: ignore[arg-type]
+        RedisProbe(), failing_store, "raw",  # type: ignore[arg-type]
+    )
+    assert redis_ok is True and r2_ok is False
+    assert failures == ["r2:RuntimeError"]
+    assert healthy_store.calls == failing_store.calls == 1
+
+
 @pytest.mark.asyncio
 async def test_failed_processing_is_retried_even_when_content_has_no_new_metric_snapshot() -> None:
     repository = InMemoryRepository()
@@ -938,7 +1132,7 @@ async def test_failed_processing_is_retried_even_when_content_has_no_new_metric_
             return await real.process(item)
 
     processor = FlakyProcessor()
-    worker = CollectorWorker(repository, [StaticConnector([observation("retry-once")])], processor)  # type: ignore[arg-type]
+    worker = CollectorWorker(repository, [StaticConnector([observation("retry-once")])], processor, allow_unapproved_rights_for_nonproduction=True)  # type: ignore[arg-type]
     first = await worker.run_once()
     second = await worker.run_once()
     await worker.close()
@@ -949,6 +1143,25 @@ async def test_failed_processing_is_retried_even_when_content_has_no_new_metric_
     assert len(repository.events) == 1
     assert len(repository.score_runs) == 1
     assert repository.observation_processing["retry-once"]["processedRevision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_observation_is_not_retried_after_its_rights_policy_is_blocked() -> None:
+    repository = InMemoryRepository()
+    item = observation("rights-revoked-before-retry").model_copy(update={
+        "rights_policy_id": "youtube-api-review-required-v1",
+    })
+    assert repository.save_observation_with_outbox(item)
+
+    class MustNotRunProcessor:
+        async def process(self, _item: Observation):
+            raise AssertionError("blocked stored evidence must not enter processing")
+
+    worker = CollectorWorker(repository, [], MustNotRunProcessor())  # type: ignore[arg-type]
+    assert await worker.retry_pending() == 0
+    state = repository.observation_processing[item.id]
+    assert state["attempts"] == 0
+    assert state["processedRevision"] == 0
 
 
 @pytest.mark.asyncio
@@ -968,7 +1181,7 @@ async def test_lost_processing_ack_does_not_append_duplicate_score_or_timeline_p
 @pytest.mark.asyncio
 async def test_connector_failure_degrades_coverage_instead_of_emitting_zero_heat() -> None:
     repository = InMemoryRepository()
-    worker = CollectorWorker(repository, [FailingConnector(max_attempts=1)])
+    worker = CollectorWorker(repository, [FailingConnector(max_attempts=1)], allow_unapproved_rights_for_nonproduction=True)
     result = await worker.run_once()
     await worker.close()
     assert result[0].failed is True
@@ -981,7 +1194,7 @@ async def test_runtime_budget_guard_pauses_metered_connector_without_collecting(
     connector = StaticConnector([observation("must-not-run")])
     connector.metered = True
     repository = InMemoryRepository()
-    worker = CollectorWorker(repository, [connector], budget_decision=budget_guard(2100, 2000))
+    worker = CollectorWorker(repository, [connector], budget_decision=budget_guard(2100, 2000), allow_unapproved_rights_for_nonproduction=True)
     result = await worker.run_once()
     assert result[0].skipped is True
     assert repository.observations == {}
@@ -997,7 +1210,7 @@ async def test_runtime_budget_guard_pauses_metered_connector_without_collecting(
 async def test_connector_24h_observations_are_rolling_not_the_latest_run_count() -> None:
     repository = InMemoryRepository()
     connector = StaticConnector([observation("rolling")])
-    worker = CollectorWorker(repository, [connector])
+    worker = CollectorWorker(repository, [connector], allow_unapproved_rights_for_nonproduction=True)
     await worker.run_once()
     first_checkpoint = repository.get_connector_checkpoint("static")
     assert first_checkpoint["latestExternalId"] == "rolling"
@@ -1012,7 +1225,7 @@ async def test_connector_24h_observations_are_rolling_not_the_latest_run_count()
 async def test_failed_connector_does_not_advance_durable_checkpoint() -> None:
     repository = InMemoryRepository()
     repository.save_connector_checkpoint("broken", {"cursor": "keep-me"})
-    worker = CollectorWorker(repository, [FailingConnector(max_attempts=1)])
+    worker = CollectorWorker(repository, [FailingConnector(max_attempts=1)], allow_unapproved_rights_for_nonproduction=True)
     result = await worker.run_once()
     await worker.close()
     assert result[0].failed is True
@@ -1028,12 +1241,127 @@ async def test_dynamic_cost_ledger_prevents_a_run_whose_worst_case_crosses_budge
     connector.metered = True
     connector.estimated_cost_per_request_rmb = 10
     connector.expected_requests_per_collect = 1
-    worker = CollectorWorker(repository, [connector], monthly_budget_limit=100)
+    worker = CollectorWorker(repository, [connector], monthly_budget_limit=100, allow_unapproved_rights_for_nonproduction=True)
     result = await worker.run_once()
     await worker.close()
     assert result[0].skipped is True
     assert repository.observations == {}
     assert repository.connectors["static"].status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_metered_worker_reserves_budget_before_provider_collection_and_confirms_it() -> None:
+    repository = InMemoryRepository()
+
+    class ReservationAwareConnector(StaticConnector):
+        async def collect(self) -> list[Observation]:
+            assert any(
+                row["connectorId"] == self.id and row["status"] == "reserved"
+                for row in repository.connector_budget_reservations.values()
+            )
+            return await super().collect()
+
+    connector = ReservationAwareConnector([observation("atomically-reserved")])
+    connector.metered = True
+    connector.estimated_cost_per_request_rmb = 1
+    worker = CollectorWorker(
+        repository,
+        [connector],
+        monthly_budget_limit=100,
+        connector_budget_limits={"static": 100},
+        signal_family_budget_limits={"mixed": 100},
+        allow_unapproved_rights_for_nonproduction=True,
+    )
+    runs = await worker.run_once()
+    await worker.close()
+    assert runs[0].failed is False
+    reservations = list(repository.connector_budget_reservations.values())
+    assert len(reservations) == 1
+    assert reservations[0]["status"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_expired_budget_reservation_enters_visible_reconciliation_without_releasing_credit() -> None:
+    repository = InMemoryRepository()
+    owner_token = repository.reserve_connector_budget(
+        "metered", "behavior", 60, 100, 100, 100, {"metered"}, 0,
+    )
+    assert owner_token is not None
+    repository.connector_budget_reservations[owner_token]["leaseUntil"] = utcnow() - timedelta(seconds=1)
+    worker = CollectorWorker(repository, [], monthly_budget_limit=100)
+    await worker.run_once()
+    assert repository.connector_budget_reconciliation_count() == 1
+    assert repository.monthly_connector_spend() == 60
+    assert repository.connector_budget_reservations[owner_token]["status"] == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_connector_budget_gate_pauses_only_the_connector_that_would_overspend() -> None:
+    class SecondMeteredConnector(StaticConnector):
+        id = "other-metered"
+        platform = "Other Metered"
+        signal_family = "research"
+
+    repository = InMemoryRepository()
+    now = datetime.now(timezone.utc)
+    repository.record_connector_run(
+        "static", now, now, "healthy", 0, 0, 90, estimated_cost_rmb=45
+    )
+    limited = StaticConnector([observation("connector-limited")])
+    allowed = SecondMeteredConnector([observation("connector-allowed")])
+    for connector in (limited, allowed):
+        connector.metered = True
+        connector.estimated_cost_per_request_rmb = 1
+        connector.expected_requests_per_collect = 1
+    worker = CollectorWorker(
+        repository,
+        [limited, allowed],
+        monthly_budget_limit=500,
+        connector_budget_limits={"static": 50, "other-metered": 100},
+        allow_unapproved_rights_for_nonproduction=True,
+    )
+    runs = await worker.run_once()
+    await worker.close()
+    assert runs[0].skipped is True
+    assert runs[1].skipped is False
+    assert "连接器 static" in repository.connectors["static"].note
+    assert "connector-allowed" in repository.observations
+    assert "connector-limited" not in repository.observations
+
+
+@pytest.mark.asyncio
+async def test_signal_family_budget_gate_uses_the_family_ledger() -> None:
+    class SameFamilyConnector(StaticConnector):
+        id = "same-family"
+
+    repository = InMemoryRepository()
+    now = datetime.now(timezone.utc)
+    repository.record_connector_run(
+        "same-family", now, now, "healthy", 0, 0, 90, estimated_cost_rmb=55
+    )
+    connector = SameFamilyConnector([observation("family-limited")])
+    connector.metered = True
+    connector.estimated_cost_per_request_rmb = 1
+    connector.expected_requests_per_collect = 1
+    worker = CollectorWorker(
+        repository,
+        [connector],
+        monthly_budget_limit=500,
+        signal_family_budget_limits={"mixed": 60},
+        allow_unapproved_rights_for_nonproduction=True,
+    )
+    runs = await worker.run_once()
+    await worker.close()
+    assert runs[0].skipped is True
+    assert "信号族 mixed" in repository.connectors["same-family"].note
+    assert repository.observations == {}
+
+
+def test_budget_scope_configuration_rejects_non_positive_values() -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        CollectorWorker(
+            InMemoryRepository(), [], connector_budget_limits={"youtube": 0}
+        )
 
 
 @pytest.mark.asyncio
@@ -1047,7 +1375,7 @@ async def test_real_worker_closes_collection_cluster_score_event_and_outbox_loop
     repository = InMemoryRepository()
     connector = StaticConnector(items)
     processor = EventProcessor(repository)
-    worker = CollectorWorker(repository, [connector], processor)
+    worker = CollectorWorker(repository, [connector], processor, allow_unapproved_rights_for_nonproduction=True)
     runs = await worker.run_once()
     await worker.close()
     assert runs[0].inserted == 3
@@ -1055,8 +1383,9 @@ async def test_real_worker_closes_collection_cluster_score_event_and_outbox_loop
     event = next(iter(repository.events.values()))
     assert event.independent_sources == 3
     assert {item.kind for item in event.evidence} == {"official", "discussion", "behavior"}
-    assert len(repository.score_runs) == 1
-    assert any(item["kind"] == "score.created" for item in repository.outbox)
+    assert len(repository.score_runs) == 3
+    assert [item.scoring_revision for item in repository.score_runs] == [1, 2, 3]
+    assert sum(item["kind"] == "score.created" for item in repository.outbox) == 3
     assert repository.purge_source("qwen-lab") == 1
     redacted = next(iter(repository.events.values()))
     assert all(item.source != "qwen-lab" for item in redacted.evidence)
@@ -1066,7 +1395,7 @@ async def test_real_worker_closes_collection_cluster_score_event_and_outbox_loop
     assert repository.list_pending_observation_ids()
     # Rescoring is driven by the durable processing revision; no connector has
     # to emit another metric snapshot after the deletion.
-    retry_worker = CollectorWorker(repository, [], processor)
+    retry_worker = CollectorWorker(repository, [], processor, allow_unapproved_rights_for_nonproduction=True)
     assert await retry_worker.retry_pending() >= 1
     rescored = repository.get_event(event.id)
     assert rescored is not None
@@ -1075,6 +1404,124 @@ async def test_real_worker_closes_collection_cluster_score_event_and_outbox_loop
     # evidence combination for a strong state.
     assert rescored.state == "insufficient_data"
     assert all(item.source != "qwen-lab" for item in rescored.evidence)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", [
+    "AI startup closes Series C funding round",
+    "Government publishes new AI regulation proposal",
+])
+async def test_unsupported_financing_and_policy_candidates_never_enter_scoring_or_alert_outbox(title: str) -> None:
+    now = datetime.now(timezone.utc)
+    shared_url = "https://example.com/unsupported-candidate"
+    rows = [
+        Observation(
+            id="unsupported-official", platform="RSS", externalId="unsupported-official",
+            sourceId="media", publishedAt=now, collectedAt=now, language="en",
+            title=title, text=title, url=shared_url, metrics={},
+            rawEvidenceRef="r2://raw/unsupported-official", contentFingerprint="unsupported-official",
+            signalFamily="official", relation="original",
+        ),
+        Observation(
+            id="unsupported-discussion", platform="HN", externalId="unsupported-discussion",
+            sourceId="commenter", publishedAt=now, collectedAt=now + timedelta(minutes=1), language="en",
+            title=title, text=f"Discussion: {title}", url=shared_url, metrics={"comments": 200},
+            rawEvidenceRef="r2://raw/unsupported-discussion", contentFingerprint="unsupported-discussion",
+            signalFamily="discussion", relation="original",
+        ),
+        Observation(
+            id="unsupported-behavior", platform="GitHub", externalId="unsupported-behavior",
+            sourceId="repository", publishedAt=now, collectedAt=now + timedelta(minutes=2), language="en",
+            title=title, text=title, url=shared_url, metrics={"stars": 50_000},
+            rawEvidenceRef="r2://raw/unsupported-behavior", contentFingerprint="unsupported-behavior",
+            signalFamily="behavior", relation="original",
+        ),
+    ]
+    repository = InMemoryRepository()
+    processor = EventProcessor(repository)
+    for item in rows:
+        assert repository.save_observation_with_outbox(item)
+        result = await processor.process(item)
+        assert result.classification_status == "unsupported"
+        assert result.state == "insufficient_data"
+    assert len(repository.events) == 1
+    assert repository.score_runs == []
+    assert not any(item["kind"] == "score.created" for item in repository.outbox)
+    event = next(iter(repository.events.values()))
+    assert "不进入数值评分或强告警" in event.driver
+
+
+@pytest.mark.asyncio
+async def test_time_driven_refresh_cools_and_dormants_event_without_new_observations() -> None:
+    repository = seed_repository(InMemoryRepository())
+    signal_at = datetime(2026, 7, 17, 0, 0, tzinfo=timezone.utc)
+    current = repository.get_event("evt-open-model")
+    assert current is not None
+    current = current.model_copy(update={
+        "state": LifecycleState.ESTABLISHED, "first_seen": signal_at - timedelta(hours=12),
+        "updated_at": signal_at, "attention": 84, "behavior": 78,
+        "coverage": 86, "evidence_score": 90, "evidence_strength": "high",
+        "timeline": [
+            MetricPoint(at=signal_at - timedelta(minutes=15), attention=82, behavior=76),
+            MetricPoint(at=signal_at, attention=84, behavior=78),
+        ],
+    })
+    repository.upsert_event(current)
+
+    def item(
+        item_id: str, source: str, platform: str, family: str,
+        collected_at: datetime, metrics: dict[str, float],
+    ) -> Observation:
+        return Observation(
+            id=item_id, platform=platform, externalId=item_id, sourceId=source,
+            publishedAt=signal_at - timedelta(hours=12), collectedAt=collected_at,
+            language="en", title="Open model release", text="Open model release",
+            url=f"https://example.com/{item_id}", metrics=metrics,
+            rawEvidenceRef=f"r2://raw/{item_id}-{int(collected_at.timestamp())}",
+            contentFingerprint=item_id, signalFamily=family, relation="original",
+        )
+
+    official = item("quiet-official", "lab", "RSS", "official", signal_at, {})
+    assert repository.save_observation_with_outbox(official)
+    repository.assign_observation(current.id, official.id, 1, "test")
+
+    discussion_first = item("quiet-discussion", "person", "HN", "discussion", signal_at - timedelta(minutes=15), {"comments": 50})
+    discussion_second = item("quiet-discussion", "person", "HN", "discussion", signal_at, {"comments": 150})
+    assert repository.save_observation_with_outbox(discussion_first)
+    assert repository.save_observation_with_outbox(discussion_second)
+    repository.assign_observation(current.id, discussion_second.id, 1, "test")
+
+    for index in range(5):
+        first = item(
+            f"quiet-behavior-{index}", f"owner-{index}", "Hugging Face", "behavior",
+            signal_at - timedelta(minutes=15), {"downloads": 1_000},
+        )
+        second = item(
+            f"quiet-behavior-{index}", f"owner-{index}", "Hugging Face", "behavior",
+            signal_at, {"downloads": 20_000},
+        )
+        assert repository.save_observation_with_outbox(first)
+        assert repository.save_observation_with_outbox(second)
+        repository.assign_observation(current.id, second.id, 1, "test")
+
+    processor = EventProcessor(repository)
+    assert await processor.refresh_time_driven(signal_at + timedelta(hours=6, minutes=15)) == 1
+    after_one_decline = repository.get_event(current.id)
+    assert after_one_decline is not None
+    assert after_one_decline.state == "established"
+
+    assert await processor.refresh_time_driven(signal_at + timedelta(hours=6, minutes=30)) == 1
+    cooling = repository.get_event(current.id)
+    assert cooling is not None
+    assert cooling.state == "cooling"
+
+    assert await processor.refresh_time_driven(signal_at + timedelta(hours=24)) == 1
+    dormant = repository.get_event(current.id)
+    assert dormant is not None
+    assert dormant.state == "dormant"
+    assert dormant.attention == 0
+    assert dormant.behavior == 0
+    assert dormant.timeline[-1].at == signal_at + timedelta(hours=24)
 
 
 @pytest.mark.asyncio
@@ -1092,6 +1539,12 @@ async def test_new_valid_behavior_evidence_overrides_manual_na_in_same_score_cyc
         metrics={"reproductions": 1}, rawEvidenceRef="r2://raw/benchmark-behavior.json",
         contentFingerprint="benchmark-behavior-fingerprint", signalFamily="behavior", relation="original",
     )
+    baseline = incoming.model_copy(update={
+        "collected_at": current.updated_at,
+        "metrics": {"reproductions": 0},
+        "raw_evidence_ref": "r2://raw/benchmark-behavior-baseline.json",
+    })
+    repository.save_observation_with_outbox(baseline)
     repository.save_observation_with_outbox(incoming)
     captured: dict[str, object] = {}
     actual_score_event = processor_module.score_event
@@ -1180,9 +1633,13 @@ async def test_bge_m3_provider_preserves_input_order_and_shape() -> None:
 async def test_event_processor_uses_cached_cross_language_embeddings_for_cluster_candidates() -> None:
     class SameVectorProvider:
         calls = 0
+        model = "test-cross-language"
+        dimensions = 2
+        batch_sizes: list[int] = []
 
         async def embed(self, texts: list[str]) -> list[list[float]]:
             self.calls += 1
+            self.batch_sizes.append(len(texts))
             return [[1.0, 0.0] for _ in texts]
 
     now = datetime.now(timezone.utc)
@@ -1206,10 +1663,67 @@ async def test_event_processor_uses_cached_cross_language_embeddings_for_cluster
         await processor.process(item)
     assert len(repository.events) == 1
     assert provider.calls == 2
+    event_id = next(iter(repository.events))
+    assert repository.load_event_embeddings(
+        {event_id: processor._event_embedding_titles[event_id]},
+        "test-cross-language:2", 2,
+    )[event_id] == [1.0, 0.0]
+    third = second.model_copy(update={
+        "id": "qwen-third", "external_id": "qwen-third", "source_id": "hn:bob",
+        "collected_at": now + timedelta(minutes=10), "published_at": now + timedelta(minutes=10),
+        "raw_evidence_ref": "r2://raw/qwen-third", "content_fingerprint": "qwen-third",
+    })
+    restarted = EventProcessor(repository, provider)  # type: ignore[arg-type]
+    repository.save_observation_with_outbox(third)
+    await restarted.process(third)
+    assert len(repository.events) == 1
+    assert provider.batch_sizes[-1] == 1
+    restarted.invalidate_events([event_id])
+    assert repository.load_event_embeddings(
+        {event_id: processor._event_embedding_titles[event_id]},
+        "test-cross-language:2", 2,
+    ) == {}
 
 
 @pytest.mark.asyncio
-async def test_same_15_minute_batch_is_one_lifecycle_cycle_and_does_not_self_calibrate() -> None:
+async def test_event_processor_embedding_cache_is_bounded_to_hnsw_and_priority_shortlists() -> None:
+    class FixedProvider:
+        model = "bounded-cache"
+        dimensions = 2
+
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[1.0, 0.0] for _ in texts]
+
+    repository = InMemoryRepository()
+    template = demo_events()[0]
+    for index in range(100):
+        event = template.model_copy(update={
+            "id": f"bounded-event-{index:03d}",
+            "title": f"Candidate {index:03d}",
+            "title_en": f"Candidate {index:03d}",
+            "storage_revision": 0,
+        })
+        repository.upsert_event(event)
+        title = f"{event.title} {event.title_en}"
+        repository.save_event_embedding(event.id, "bounded-cache:2", title, [1.0, 0.0])
+    now = datetime.now(timezone.utc)
+    incoming = Observation(
+        id="bounded-incoming", platform="RSS", externalId="bounded-incoming",
+        sourceId="bounded-source", publishedAt=now, collectedAt=now, language="en",
+        title="Novel bounded cache release", text="Novel bounded cache release",
+        url="https://example.com/bounded-incoming", metrics={},
+        rawEvidenceRef="r2://raw/bounded-incoming", contentFingerprint="bounded-incoming",
+        signalFamily="official", relation="original",
+    )
+    assert repository.save_observation_with_outbox(incoming)
+    processor = EventProcessor(repository, FixedProvider())  # type: ignore[arg-type]
+    await processor.process(incoming)
+    assert len(processor._event_embeddings) <= 76
+    assert len(processor._event_embedding_titles) == len(processor._event_embeddings)
+
+
+@pytest.mark.asyncio
+async def test_same_15_minute_batch_has_one_timeline_cycle_append_only_score_revisions_and_no_self_calibration() -> None:
     now = datetime(2026, 7, 16, 8, 7, tzinfo=timezone.utc)
     shared_url = "https://example.com/model-batch"
     rows = [
@@ -1232,8 +1746,10 @@ async def test_same_15_minute_batch_is_one_lifecycle_cycle_and_does_not_self_cal
     assert event.timeline[0].at == datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
     assert event.behavior == behavior_before_research
     assert event.velocity == 0
-    assert len(repository.score_runs) == 1
-    assert sum(entry["kind"] == "score.created" for entry in repository.outbox) == 1
+    assert len(repository.score_runs) == len(rows)
+    assert [item.scoring_revision for item in repository.score_runs] == list(range(1, len(rows) + 1))
+    assert len({item.input_digest for item in repository.score_runs}) == len(rows)
+    assert sum(entry["kind"] == "score.created" for entry in repository.outbox) == len(rows)
 
 
 @pytest.mark.asyncio

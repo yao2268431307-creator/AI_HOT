@@ -53,7 +53,7 @@ class OpenAlexConnector(BaseConnector):
                 id=f"openalex:{work_id}", platform=self.platform, externalId=work_id,
                 sourceId=f"openalex:{author_id}",
                 publishedAt=published, collectedAt=collected, language=language_hint(title), title=title, text=text, url=url,
-                metrics={"citations": float(work.get("cited_by_count", 0)), "readers": float(work.get("counts_by_year", [{}])[0].get("cited_by_count", 0) if work.get("counts_by_year") else 0)},
+                metrics={"citations": float(work.get("cited_by_count", 0))},
                 rawEvidenceRef=item_ref, relation="original",
                 contentFingerprint=content_fingerprint(title, text, url), signalFamily="research",
             ))

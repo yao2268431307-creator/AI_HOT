@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from pathlib import Path
 
 from .contracts import EventType
@@ -74,6 +75,13 @@ def load_feature_registry() -> dict[str, object]:
     return {**payload, "features": effective}
 
 
+def feature_registry_identity() -> tuple[str, str]:
+    """Return the frozen registry version and a digest of its effective rules."""
+    payload = load_feature_registry()
+    material = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return str(payload["registryVersion"]), f"sha256:{hashlib.sha256(material.encode()).hexdigest()}"
+
+
 def behavior_metric_roles() -> dict[EventType, dict[str, str]]:
     roles: dict[EventType, dict[str, str]] = {event_type: {} for event_type in EventType}
     for item in load_feature_registry()["features"]:
@@ -96,3 +104,25 @@ def behavior_feature_rules() -> dict[EventType, dict[str, dict[str, object]]]:
     if any(not values for values in rules.values()):
         raise ValueError("every supported event type requires registered behavior features")
     return rules
+
+
+def normal_behavior_delay_hours() -> dict[EventType, tuple[float, float]]:
+    """Return the effective min/max normal-delay window from the frozen registry."""
+    windows: dict[EventType, list[tuple[float, float]]] = {event_type: [] for event_type in EventType}
+    for item in load_feature_registry()["features"]:
+        if item["signalCategory"] != "behavior" or item["role"] == "attention_only":
+            continue
+        raw = item["normalDelayHours"]
+        if not isinstance(raw, list) or len(raw) != 2:
+            raise ValueError(f"feature {item['featureId']} has invalid normalDelayHours")
+        low, high = float(raw[0]), float(raw[1])
+        if low < 0 or high < low:
+            raise ValueError(f"feature {item['featureId']} has invalid normalDelayHours")
+        for raw_event_type in item["eventTypes"]:
+            windows[EventType(raw_event_type)].append((low, high))
+    if any(not values for values in windows.values()):
+        raise ValueError("every supported event type requires a normal behavior delay window")
+    return {
+        event_type: (min(value[0] for value in values), max(value[1] for value in values))
+        for event_type, values in windows.items()
+    }

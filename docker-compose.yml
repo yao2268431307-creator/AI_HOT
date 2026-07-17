@@ -6,9 +6,11 @@ services:
       POSTGRES_USER: radar
       POSTGRES_PASSWORD: radar-local-only
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
     volumes:
       - radar-postgres:/var/lib/postgresql/data
+      - ./infra/postgres/000_local_roles.sql:/docker-entrypoint-initdb.d/000_local_roles.sql:ro
       - ./infra/postgres/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U radar -d ai_hot"]
@@ -20,7 +22,8 @@ services:
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
     volumes:
       - radar-redis:/data
     healthcheck:
@@ -36,13 +39,18 @@ services:
       MINIO_ROOT_USER: radar
       MINIO_ROOT_PASSWORD: radar-local-object-store
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    restart: unless-stopped
     volumes:
       - radar-objects:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
 
 volumes:
   radar-postgres:
   radar-redis:
   radar-objects:
-

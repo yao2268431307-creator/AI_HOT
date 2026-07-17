@@ -13,6 +13,8 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from redis.asyncio import Redis
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from radar import stream_retention as retention_module
 from radar.alert_worker import AlertDispatcher, RedisAlertWorker
@@ -31,21 +33,25 @@ from radar.outbox import (
     xadd_as_stream_exclusive,
     xadd_as_stream_participant,
 )
-from radar.storage import InMemoryRepository, PostgresRepository
+from radar.processor import EventProcessor
+from radar.scoring import replay_score_payload
+from radar.storage import ConcurrentScoreConflict, InMemoryRepository, PostgresRepository
 from radar.stream_retention import (
     inspect_consumer_groups,
     maintain_stream_retention,
     trim_stream_at_verified_watermarks,
 )
 from tools.replay_outbox_to_redis import execute_replay, main as replay_main
+from tools.production_capacity_probe import dataset_counts
 
 
 APP_DSN = os.getenv("POSTGRES_INTEGRATION_DSN")
 ADMIN_DSN = os.getenv("POSTGRES_INTEGRATION_ADMIN_DSN")
 REDIS_URL = os.getenv("REDIS_INTEGRATION_URL")
+DELETION_DSN = os.getenv("POSTGRES_INTEGRATION_DELETION_DSN")
 pytestmark = pytest.mark.skipif(
-    not APP_DSN or not ADMIN_DSN,
-    reason="set POSTGRES_INTEGRATION_DSN and POSTGRES_INTEGRATION_ADMIN_DSN for destructive local integration tests",
+    not APP_DSN or not ADMIN_DSN or not DELETION_DSN,
+    reason="set PostgreSQL app/admin/deletion integration DSNs for destructive local integration tests",
 )
 
 
@@ -75,6 +81,7 @@ def _cleanup_event(prefix: str, workspace_id: str) -> None:
         cursor.execute("DELETE FROM alert_rules WHERE workspace_id=%s", (workspace_id,))
         cursor.execute("DELETE FROM review_queue_entries WHERE event_id LIKE %s", (f"{prefix}%",))
         cursor.execute("DELETE FROM lead_threshold_crossings WHERE event_id LIKE %s", (f"{prefix}%",))
+        cursor.execute("DELETE FROM baseline_samples WHERE source_event_id LIKE %s", (f"{prefix}%",))
         cursor.execute("DELETE FROM outbox WHERE aggregate_id LIKE %s", (f"{prefix}%",))
         cursor.execute("DELETE FROM events WHERE id LIKE %s", (f"{prefix}%",))
         cursor.execute("SET session_replication_role='origin'")
@@ -83,33 +90,377 @@ def _cleanup_event(prefix: str, workspace_id: str) -> None:
 
 def test_postgres_runtime_attestation_and_production_health(monkeypatch: pytest.MonkeyPatch) -> None:
     assert APP_DSN is not None
+    assert ADMIN_DSN is not None
     monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("RADAR_AUTH_MODE", "jwt")
+    public_pem = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    monkeypatch.setenv("RADAR_JWT_PUBLIC_KEYS", json.dumps({"integration-key": public_pem}))
+    monkeypatch.setenv("RADAR_JWT_ISSUER", "https://identity.integration")
+    monkeypatch.setenv("RADAR_JWT_AUDIENCE", "signal-ai-integration")
     monkeypatch.setenv("RADAR_INSTANCE_ID", "postgres-integration-rc24")
-    monkeypatch.setenv("RADAR_API_KEYS", json.dumps({
-        "integration-owner": {
-            "subject": "integration-owner", "role": "OWNER", "workspaceId": "system-governance",
-        },
+    # The API consumes fresh runtime proofs; service isolation means it must
+    # not hold the Scheduler/Alert Redis or R2 credentials itself.
+    for name in (
+        "REDIS_URL", "R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+        "RAW_EVIDENCE_BUCKET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RADAR_RELEASE_IMAGE_DIGESTS", json.dumps({
+        "api": "sha256:" + "a" * 64, "web": "sha256:" + "b" * 64,
     }))
-    repository = PostgresRepository(APP_DSN)
+    monkeypatch.setenv("RADAR_ACTUAL_IMAGE_DIGESTS", json.dumps({
+        "api": "sha256:" + "a" * 64, "web": "sha256:" + "b" * 64,
+    }))
+    now = datetime.now(timezone.utc)
+    with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+        for component in (
+            "scheduler", "collector-worker", "retention-worker", "outbox-publisher", "alert-consumer",
+        ):
+            details = {
+                **({
+                    "redisVerified": True, "r2ReadWriteVerified": True,
+                    "dependencyProbeAt": now.isoformat(),
+                } if component == "collector-worker" else {}),
+                **({"redisVerified": True} if component == "outbox-publisher" else {}),
+                **({
+                    "redisVerified": True, "r2DeleteVerified": True,
+                    "dependencyProbeAt": now.isoformat(),
+                } if component == "alert-consumer" else {}),
+            }
+            cursor.execute(
+                """INSERT INTO runtime_component_heartbeats (component_id,instance_id,last_seen_at,details)
+                VALUES (%s,'postgres-integration-rc24',%s,%s::jsonb)
+                ON CONFLICT (component_id) DO UPDATE SET instance_id=excluded.instance_id,
+                  last_seen_at=excluded.last_seen_at,details=excluded.details""",
+                (component, now, json.dumps(details)),
+            )
+        cursor.execute(
+            """INSERT INTO disaster_recovery_attestations
+            (performed_at,backup_reference,restored_instance_id,verification_digest,
+             measured_rpo_seconds,measured_rto_seconds,status,operator_subject)
+            VALUES (%s,'integration-backup','integration-restore',%s,300,900,'passed','integration-operator')""",
+            (now, "sha256:" + "c" * 64),
+        )
+        connection.commit()
+    repository = PostgresRepository(APP_DSN, DELETION_DSN)
     attestation = repository.runtime_attestation()
     expected = {
         "storageBackend": "postgresql",
         "rlsVerified": True,
-        "migrationVersion": "001_init_rc2.9",
+        "migrationVersion": "001_init_rc3.0",
         "auditTriggersVerified": True,
         "migrationMarkerReadOnly": True,
         "instanceId": "postgres-integration-rc24",
         "databaseUser": "radar_app",
         "databaseRoleSuperuser": False,
         "databaseRoleBypassRls": False,
+        "deletionRole": "radar_deletion_worker",
+        "deletionRoleReady": True,
     }
     for key, value in expected.items():
         assert attestation[key] == value
     assert float(attestation["databaseClockSkewSeconds"]) <= 5
     with TestClient(create_app(repository)) as client:
         health = client.get("/health")
+        ready = client.get("/health/ready")
     assert health.status_code == 200
-    assert health.json()["productionReady"] is True
+    assert "databaseUser" not in health.json()
+    assert ready.status_code == 200
+    assert ready.json()["productionReady"] is True
+
+
+def test_postgres_workspace_membership_and_jti_revocation() -> None:
+    assert APP_DSN is not None
+    assert ADMIN_DSN is not None
+    suffix = uuid.uuid4().hex
+    workspace_id = f"workspace-auth-{suffix}"
+    subject = f"subject-{suffix}"
+    jti = f"jti-{suffix}"
+    try:
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO workspace_memberships (workspace_id,subject,role,status) VALUES (%s,%s,'ANALYST','active')",
+                (workspace_id, subject),
+            )
+            cursor.execute(
+                "INSERT INTO jwt_revocations (jti,expires_at,reason) VALUES (%s,clock_timestamp()+interval '5 minutes','integration')",
+                (jti,),
+            )
+            connection.commit()
+        repository = PostgresRepository(APP_DSN)
+        assert repository.resolve_workspace_membership(subject, workspace_id) == "ANALYST"
+        assert repository.resolve_workspace_membership(subject, f"other-{workspace_id}") is None
+        assert repository.is_token_revoked(jti) is True
+        assert repository.is_token_revoked(f"other-{jti}") is False
+    finally:
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute("DELETE FROM jwt_revocations WHERE jti=%s", (jti,))
+            cursor.execute(
+                "DELETE FROM workspace_memberships WHERE workspace_id=%s AND subject=%s",
+                (workspace_id, subject),
+            )
+            connection.commit()
+
+
+def test_postgres_event_compare_and_swap_prevents_stale_overwrite_and_uses_vector_knn() -> None:
+    assert APP_DSN is not None
+    prefix = f"it-cas-{uuid.uuid4().hex[:10]}"
+    workspace_id = f"workspace-{prefix}"
+    repository = PostgresRepository(APP_DSN)
+    first_id = f"{prefix}-near"
+    second_id = f"{prefix}-far"
+    try:
+        template = demo_events()[0]
+        first = template.model_copy(update={"id": first_id, "title": f"Near {prefix}"})
+        second = template.model_copy(update={"id": second_id, "title": f"Far {prefix}"})
+        repository.upsert_event(first)
+        repository.upsert_event(second)
+        fresh = repository.get_event(first_id)
+        stale = repository.get_event(first_id)
+        assert fresh is not None and stale is not None
+        repository.upsert_event(fresh.model_copy(update={"driver": "winner"}))
+        with pytest.raises(ConcurrentScoreConflict):
+            repository.upsert_event(stale.model_copy(update={"driver": "stale-loser"}))
+        assert repository.get_event(first_id).driver == "winner"  # type: ignore[union-attr]
+
+        near_vector = [1.0, *([0.0] * 1023)]
+        far_vector = [0.0, 1.0, *([0.0] * 1022)]
+        repository.save_event_embedding(first_id, "integration-vector:1024", first.title, near_vector)
+        repository.save_event_embedding(second_id, "integration-vector:1024", second.title, far_vector)
+        nearest = repository.nearest_event_embeddings(
+            near_vector,
+            {first_id: first.title, second_id: second.title},
+            "integration-vector:1024",
+            limit=1,
+        )
+        assert list(nearest) == [first_id]
+
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT has_function_privilege(current_user,'erase_source_score_history(text)','EXECUTE')"
+            )
+            assert cursor.fetchone()[0] is False
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+                cursor.execute("DELETE FROM events WHERE id=%s", (first_id,))
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO score_history_erasure_audit
+                    (source_id,event_ids,reason,erased_score_runs,erased_baseline_samples,actor)
+                    VALUES ('forged',%s,'source_erasure',0,0,'forged')""",
+                    ([first_id],),
+                )
+    finally:
+        _cleanup_event(prefix, workspace_id)
+
+
+@pytest.mark.asyncio
+async def test_postgres_source_erasure_uses_isolated_role_and_hides_empty_tombstone() -> None:
+    assert APP_DSN is not None and ADMIN_DSN is not None and DELETION_DSN is not None
+    prefix = f"it-erasure-{uuid.uuid4().hex[:10]}"
+    workspace_id = f"workspace-{prefix}"
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    first = Observation(
+        id=f"{prefix}-a-observation", platform="RSS", externalId=f"{prefix}-a",
+        sourceId=f"{prefix}-source-a", publishedAt=now, collectedAt=now,
+        language="en", title=f"Shared release {prefix}", text=f"Shared release {prefix}",
+        url=f"https://example.com/{prefix}/a", metrics={"mentions": 10},
+        rawEvidenceRef=f"r2://raw/{prefix}-a.json", contentFingerprint=f"{prefix}-a-fp",
+        signalFamily="discussion", relation="original",
+    )
+    second = first.model_copy(update={
+        "id": f"{prefix}-b-observation", "external_id": f"{prefix}-b",
+        "source_id": f"{prefix}-source-b", "url": f"https://example.com/{prefix}/b",
+        "raw_evidence_ref": f"r2://raw/{prefix}-b.json",
+        "content_fingerprint": f"{prefix}-b-fp", "signal_family": "official",
+    })
+    repository = PostgresRepository(APP_DSN, DELETION_DSN)
+    event_id: str | None = None
+    try:
+        assert repository.save_observation_with_outbox(first)
+        event_id = (await EventProcessor(repository).process(first)).id
+        assert repository.save_observation_with_outbox(second)
+        await EventProcessor(repository).process(second)
+        assert repository.list_score_runs(event_id)
+
+        assert repository.purge_source(first.source_id) == 1
+        retained = repository.get_event(event_id)
+        assert retained is not None and retained.state.value == "insufficient_data"
+        assert repository.list_score_runs(event_id) == []
+        assert all(item.source != first.source_id for item in retained.evidence)
+
+        assert repository.purge_source(second.source_id) == 1
+        tombstone = repository.get_event(event_id)
+        assert tombstone is not None and tombstone.superseded_by
+        assert tombstone.title == "已删除事件"
+        assert all(item.id != event_id for item in repository.list_events())
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT source_id,actor FROM score_history_erasure_audit
+                WHERE source_id LIKE %s ORDER BY created_at""",
+                (f"{prefix}%",),
+            )
+            rows = cursor.fetchall()
+        assert rows == [
+            (first.source_id, "radar_deletion_worker"),
+            (second.source_id, "radar_deletion_worker"),
+        ]
+    finally:
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute("SET session_replication_role='replica'")
+            cursor.execute(
+                "DELETE FROM score_history_erasure_audit WHERE source_id LIKE %s",
+                (f"{prefix}%",),
+            )
+            cursor.execute("SET session_replication_role='origin'")
+            connection.commit()
+        _cleanup_source(prefix)
+        _cleanup_event(prefix, workspace_id)
+
+
+def test_postgres_atomic_budget_reservations_cannot_jointly_exceed_scope() -> None:
+    assert APP_DSN is not None
+    assert ADMIN_DSN is not None
+    connector_id = f"it-budget-{uuid.uuid4().hex[:10]}"
+    family = f"family-{connector_id}"
+
+    def reserve() -> str | None:
+        return PostgresRepository(APP_DSN).reserve_connector_budget(
+            connector_id, family, 60, 1_000_000_000, 100, 100, {connector_id}, 0,
+        )
+
+    reservation_id: str | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reservations = list(pool.map(lambda _: reserve(), range(2)))
+        assert sum(value is not None for value in reservations) == 1
+        reservation_id = next(value for value in reservations if value is not None)
+        repository = PostgresRepository(APP_DSN)
+        assert repository.monthly_connector_spend(
+            connector_ids={connector_id},
+        ) == 60
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE connector_budget_reservations SET lease_until=clock_timestamp()-interval '1 second' WHERE owner_token=%s",
+                (reservation_id,),
+            )
+            connection.commit()
+        assert repository.reconcile_expired_connector_budget_reservations() == 1
+        assert repository.connector_budget_reconciliation_count() == 1
+        assert repository.monthly_connector_spend(connector_ids={connector_id}) == 60
+        with psycopg.connect(APP_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT has_function_privilege(current_user,'resolve_connector_budget_reservation(uuid,text,numeric,text)','EXECUTE')"
+            )
+            assert cursor.fetchone()[0] is False
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT resolve_connector_budget_reservation(%s,'released',0,'integration verified no provider request')",
+                (reservation_id,),
+            )
+            assert cursor.fetchone()[0] == "released"
+            connection.commit()
+        assert repository.connector_budget_reconciliation_count() == 0
+        assert repository.monthly_connector_spend(connector_ids={connector_id}) == 0
+    finally:
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute("SET session_replication_role='replica'")
+            cursor.execute(
+                "DELETE FROM connector_budget_reconciliation_audit WHERE connector_id=%s",
+                (connector_id,),
+            )
+            cursor.execute(
+                "DELETE FROM connector_budget_reservations WHERE connector_id=%s",
+                (connector_id,),
+            )
+            cursor.execute("SET session_replication_role='origin'")
+            connection.commit()
+
+
+def test_production_capacity_counts_only_non_superseded_events() -> None:
+    assert APP_DSN is not None
+    assert ADMIN_DSN is not None
+    prefix = f"it-capacity-{uuid.uuid4().hex[:10]}"
+    workspace_id = f"workspace-{prefix}"
+    repository = PostgresRepository(APP_DSN)
+    try:
+        before = dataset_counts(APP_DSN)
+        template = demo_events()[0]
+        active_id = f"{prefix}-active"
+        superseded_id = f"{prefix}-superseded"
+        repository.upsert_event(template.model_copy(update={"id": active_id}))
+        repository.upsert_event(template.model_copy(update={"id": superseded_id}))
+        with psycopg.connect(ADMIN_DSN) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE events SET superseded_by=%s WHERE id=%s",
+                ([active_id], superseded_id),
+            )
+            connection.commit()
+        after = dataset_counts(APP_DSN)
+        assert after["activeEvents"] == before["activeEvents"] + 1
+    finally:
+        _cleanup_event(prefix, workspace_id)
+
+
+@pytest.mark.asyncio
+async def test_postgres_score_revisions_are_append_only_replayable_and_bind_availability() -> None:
+    assert APP_DSN is not None
+    prefix = f"it-score-{uuid.uuid4().hex[:10]}"
+    current = datetime.now(timezone.utc)
+    now = current.replace(minute=(current.minute // 15) * 15 + 5, second=0, microsecond=0)
+    first = Observation(
+        id=f"{prefix}-observation", platform="RSS", externalId=prefix,
+        sourceId=f"{prefix}-source", publishedAt=now - timedelta(minutes=2),
+        availableAt=now - timedelta(minutes=1), availabilityBasis="provider_timestamp",
+        collectedAt=now, language="en", title=f"Unique replay release {prefix}",
+        text=f"Official unique replay release {prefix}", url=f"https://example.com/{prefix}",
+        metrics={"mentions": 10}, rawEvidenceRef=f"r2://raw/{prefix}-1.json",
+        contentFingerprint=f"{prefix}-fingerprint", signalFamily="discussion", relation="original",
+    )
+    second = first.model_copy(update={
+        "collected_at": now + timedelta(minutes=1), "metrics": {"mentions": 40},
+        "raw_evidence_ref": f"r2://raw/{prefix}-2.json",
+    })
+    repository = PostgresRepository(APP_DSN)
+    event_id: str | None = None
+    try:
+        assert repository.save_observation_with_outbox(first)
+        event = await EventProcessor(repository).process(first)
+        event_id = event.id
+        assert repository.save_observation_with_outbox(second)
+        event = await EventProcessor(repository).process(second)
+        runs = repository.list_score_runs(event.id)
+        assert len(runs) == 2
+        assert [run.scoring_revision for run in runs] == [1, 2]
+        assert len({run.input_digest for run in runs}) == 2
+        expected = runs[-1].payload["_replay"]["expected"]
+        replayed = replay_score_payload(runs[-1].payload)
+        assert replayed.state.value == expected["state"]
+        assert [label.value for label in replayed.labels] == expected["labels"]
+        assert runs[-1].baseline_digest.startswith("sha256:")
+        assert runs[-1].feature_registry_digest.startswith("sha256:")
+        priority = repository.review_priority_context({event.id: first.collected_at})[event.id]
+        assert len(priority["scoreRuns"]) == 2
+        embedding = [1.0, *([0.0] * 1023)]
+        repository.save_event_embedding(event.id, "integration-bge:1024", event.title, embedding)
+        loaded_embeddings = repository.load_event_embeddings(
+            {event.id: event.title}, "integration-bge:1024", 1024,
+        )
+        assert loaded_embeddings[event.id][:2] == [1.0, 0.0]
+        assert repository.load_event_embeddings(
+            {event.id: event.title + " changed"}, "integration-bge:1024", 1024,
+        ) == {}
+        loaded = repository.get_latest_observation(first.id)
+        assert loaded is not None
+        assert loaded.available_at == first.available_at
+        assert loaded.availability_basis == "provider_timestamp"
+    finally:
+        if event_id:
+            _cleanup_event(event_id, "integration-score-workspace")
+        _cleanup_source(prefix)
 
 
 def test_postgres_rls_append_only_trigger_and_read_only_marker() -> None:

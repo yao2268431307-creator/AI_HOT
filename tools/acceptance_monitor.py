@@ -235,10 +235,17 @@ def validated_api_url(value: str) -> str:
     return value.rstrip("/")
 
 
-def fetch_json(api_url: str, path: str, api_key: str | None, timeout: float) -> dict[str, Any]:
+def fetch_json(
+    api_url: str, path: str, api_key: str | None, timeout: float,
+    bearer_token: str | None = None,
+) -> dict[str, Any]:
     headers = {"Accept": "application/json"}
+    if api_key and bearer_token:
+        raise ValueError("configure either an API key or a bearer token, not both")
     if api_key:
         headers["X-API-Key"] = api_key
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
     request = Request(f"{api_url.rstrip('/')}{path}", headers=headers)
     try:
         with urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied internal endpoint
@@ -254,6 +261,7 @@ def collect_sample(
     api_url: str,
     api_key: str | None = None,
     *,
+    bearer_token: str | None = None,
     timeout: float = 10,
     evidence_window_hours: int = 72,
     manual_preregistration: dict[str, Any] | None = None,
@@ -263,7 +271,7 @@ def collect_sample(
     if not 24 <= evidence_window_hours <= 2160:
         raise ValueError("evidence window must be between 24 and 2160 hours")
     endpoints = {
-        "health": "/health",
+        "health": "/api/v1/operations/runtime-health",
         "coverage": "/api/v1/coverage",
         "connectorRuns": "/api/v1/operations/connector-runs?hours=2",
         "pipelineSla": f"/api/v1/operations/pipeline-sla?hours={evidence_window_hours}",
@@ -296,8 +304,10 @@ def collect_sample(
         sample["collectorRunId"] = run_id
     for name, path in endpoints.items():
         try:
-            sample["responses"][name] = fetch_json(api_url, path, api_key, timeout)
-        except RuntimeError as exc:
+            sample["responses"][name] = fetch_json(
+                api_url, path, api_key, timeout, bearer_token=bearer_token,
+            )
+        except (RuntimeError, ValueError) as exc:
             sample["errors"][name] = str(exc)
     sample["sampleHealthy"] = not sample["errors"]
     return sample
@@ -980,12 +990,23 @@ def evaluate_samples(
             and row.get("rlsVerified") is True
             and row.get("authRequired") is True
             and row.get("productionReady") is True
-            and row.get("migrationVersion") == "001_init_rc2.9"
+            and row.get("migrationVersion") == "001_init_rc3.0"
             and row.get("auditTriggersVerified") is True
             and row.get("migrationMarkerReadOnly") is True
+            and row.get("authMode") == "jwt"
+            and row.get("jwtConfigurationReady") is True
+            and row.get("redisConfigured") is True
+            and row.get("r2Configured") is True
+            and row.get("runtimeComponentsReady") is True
+            and row.get("dependencyProbesReady") is True
+            and row.get("disasterRecoveryReady") is True
+            and row.get("releaseImagesPinned") is True
             and row.get("databaseUser") == "radar_app"
             and row.get("databaseRoleSuperuser") is False
             and row.get("databaseRoleBypassRls") is False
+            and row.get("deletionRole") == "radar_deletion_worker"
+            and row.get("deletionRoleReady") is True
+            and row.get("budgetReconciliationPending") == 0
             and isinstance(row.get("instanceId"), str) and len(str(row["instanceId"])) >= 8
             and _is_number(row.get("databaseClockSkewSeconds"))
             and float(row["databaseClockSkewSeconds"]) <= 5
@@ -1143,7 +1164,7 @@ def evaluate_samples(
     manual_policy = beta.get("manualEvaluationPolicy") if isinstance(beta.get("manualEvaluationPolicy"), dict) else {}
     local_monitor_digest = "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     monitor_implementation_ok = (
-        monitoring_policy.get("monitorVersion") == "acceptance-monitor-v1.1"
+        monitoring_policy.get("monitorVersion") == "acceptance-monitor-v1.3"
         and monitoring_policy.get("monitorDigest") == local_monitor_digest
     )
     collection_from_values = {
@@ -1362,12 +1383,16 @@ def evaluate_samples(
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Collect and evaluate rc2 soak/shadow acceptance evidence")
+    root = argparse.ArgumentParser(description="Collect and evaluate rc3 soak/shadow acceptance evidence")
     commands = root.add_subparsers(dest="command", required=True)
     collect = commands.add_parser("collect", help="append one immutable monitoring sample")
     collect.add_argument("--api-url", required=True)
     collect.add_argument("--output", type=Path, required=True)
     collect.add_argument("--api-key", default=os.getenv("RADAR_API_KEY"))
+    collect.add_argument(
+        "--bearer-token", default=os.getenv("ACCEPTANCE_MONITOR_BEARER_TOKEN"),
+        help="short-lived Owner JWT; preferred in production",
+    )
     collect.add_argument("--timeout", type=float, default=10)
     collect.add_argument("--evidence-window-hours", type=int, default=72)
     collect.add_argument(
@@ -1400,7 +1425,8 @@ def main() -> int:
             if args.manual_snapshot else None
         )
         sample = collect_sample(
-            args.api_url, args.api_key, timeout=args.timeout, evidence_window_hours=args.evidence_window_hours,
+            args.api_url, args.api_key, bearer_token=args.bearer_token,
+            timeout=args.timeout, evidence_window_hours=args.evidence_window_hours,
             manual_preregistration=preregistration,
             manual_snapshot=manual_snapshot,
         )

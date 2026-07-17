@@ -29,3 +29,21 @@ def connector_rights_status(connector_id: str) -> str:
     if any(value == "experimental" for value in statuses):
         return "experimental"
     return "pending"
+
+
+def rights_policy_status(rights_policy_id: str) -> str:
+    """Resolve a stored policy to the registry decision; unknown policies fail closed."""
+    rows = [
+        row for row in connector_registry().values()
+        if row.get("rightsPolicyId") == rights_policy_id
+    ]
+    if not rows:
+        return "blocked"
+    statuses = [row.get("rightsStatus") for row in rows]
+    if all(value == "active" for value in statuses):
+        return "active"
+    if any(value == "blocked" for value in statuses) or any(value is None for value in statuses):
+        return "blocked"
+    if any(value == "experimental" for value in statuses):
+        return "experimental"
+    return "pending"

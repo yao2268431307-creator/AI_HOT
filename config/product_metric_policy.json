@@ -1,7 +1,7 @@
 {
-  "version": "product-metrics-2026-07-rc2.12",
+  "version": "product-metrics-2026-07-rc3.2",
   "status": "frozen_for_beta_collection",
-  "frozenAt": "2026-07-17T08:38:00+08:00",
+  "frozenAt": "2026-07-17T13:05:00+08:00",
   "timezone": "Asia/Shanghai",
   "dutyWindows": [
     {
@@ -46,7 +46,7 @@
     "snapshotTimezone": "Asia/Shanghai",
     "snapshotLocalTime": "09:00",
     "snapshotTimeToleranceMinutes": 5,
-    "requiredThresholdVersion": "thresholds-2026-07-rc2",
+    "requiredThresholdVersion": "thresholds-2026-07-rc3",
     "precisionAt5Target": 0.7,
     "precisionAt5MinimumCiLow": 0.7,
     "minimumSnapshots": 7,
@@ -62,8 +62,8 @@
     "leadLifecycleStates": ["emerging", "accelerating", "established"]
   },
   "acceptanceMonitoring": {
-    "monitorVersion": "acceptance-monitor-v1.1",
-    "monitorDigest": "sha256:42d6eb0402d713e7d5dce1f9e8b8d022771d1ad6ac66e51c73f8ac5bee53507a",
+    "monitorVersion": "acceptance-monitor-v1.3",
+    "monitorDigest": "sha256:a9cfe544c7625cc7304f0dbfc5a4dc449aec2a85fcbd9499f40cfa9e141d56cb",
     "keyringVersion": "acceptance-keys-2026-07-rc2.3",
     "keyringDigest": "sha256:17fe0368defef907375ac86dfb9a721ece1eef7a8acb5cf27b920d7109d5826a",
     "keyringFrozenAt": "2026-07-17T03:23:00+08:00",
@@ -78,7 +78,7 @@
     "out_of_scope"
   ],
   "notes": [
-    "Policy rc2.12 was re-frozen after Bluesky was fenced to discovery-only, rights-policy excerpt limits became executable, concurrent provenance-upgrade coverage was added, the migration attestation advanced to rc2.9, and the bound acceptance monitor digest changed; no earlier sample may enter this evidence window.",
+    "Policy rc3.2 was re-frozen after every-cycle Redis/R2 probes, isolated source-erasure authority, crash-safe budget reconciliation and bounded HNSW candidate loading became release gates; the bound acceptance monitor digest changed and no earlier sample may enter this evidence window.",
     "Frozen before collection of a real Beta outcome set; demo and synthetic test rows are not acceptance evidence.",
     "System-fault duplicate exclusions require an immutable Owner-authored exclusion record and are always reported separately.",
     "Active review time is counted from authenticated, server-received heartbeat states only when a durable feedbackId is linked; client duration totals are ignored.",
