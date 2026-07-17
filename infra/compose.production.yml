@@ -35,8 +35,10 @@ services:
       RADAR_ACTUAL_IMAGE_DIGESTS: '{"api":"${RADAR_API_IMAGE_DIGEST}","web":"${RADAR_WEB_IMAGE_DIGEST}"}'
       DELETION_DATABASE_URL: ""
       SOURCE_IDENTITIES_FILE: /run/config/source_identities.json
+      RSS_FEEDS_FILE: /run/config/feeds.json
     volumes:
       - "${RADAR_SOURCE_IDENTITIES_FILE:?RADAR_SOURCE_IDENTITIES_FILE is required}:/run/config/source_identities.json:ro"
+      - "${RADAR_RSS_FEEDS_FILE:?RADAR_RSS_FEEDS_FILE is required}:/run/config/feeds.json:ro"
     stop_grace_period: 45s
 
   alert-consumer:

@@ -35,6 +35,12 @@ class VerifiedToken:
     jti: str
 
 
+def _supported_public_key(public_key: object) -> bool:
+    return isinstance(public_key, ed25519.Ed25519PublicKey) or (
+        isinstance(public_key, rsa.RSAPublicKey) and public_key.key_size >= 2048
+    )
+
+
 def _keys() -> dict[str, dict[str, str]]:
     raw = os.getenv("RADAR_API_KEYS", "{}")
     try:
@@ -62,7 +68,7 @@ def jwt_configuration_ready() -> bool:
             if not isinstance(key_id, str) or not key_id or not isinstance(pem, str):
                 return False
             public_key = serialization.load_pem_public_key(pem.encode())
-            if not isinstance(public_key, (rsa.RSAPublicKey, ed25519.Ed25519PublicKey)):
+            if not _supported_public_key(public_key):
                 return False
     except (ValueError, TypeError, json.JSONDecodeError, UnsupportedAlgorithm):
         return False
@@ -91,7 +97,11 @@ def _verified_jwt(authorization: str | None) -> VerifiedToken:
             raise ValueError("unknown key ID")
         public_key = serialization.load_pem_public_key(pem.encode())
         signed = f"{parts[0]}.{parts[1]}".encode()
-        if algorithm == "RS256" and isinstance(public_key, rsa.RSAPublicKey):
+        if (
+            algorithm == "RS256"
+            and isinstance(public_key, rsa.RSAPublicKey)
+            and public_key.key_size >= 2048
+        ):
             public_key.verify(signature, signed, padding.PKCS1v15(), hashes.SHA256())
         elif algorithm == "EdDSA" and isinstance(public_key, ed25519.Ed25519PublicKey):
             public_key.verify(signature, signed)

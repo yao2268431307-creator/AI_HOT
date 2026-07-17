@@ -1,0 +1,12 @@
+[
+  {
+    "sourceId": "approved-lab-feed",
+    "accountId": "rss:approved-lab",
+    "entityId": "org:approved-lab"
+  },
+  {
+    "sourceId": "github:approved-lab",
+    "accountId": "github:approved-lab",
+    "entityId": "org:approved-lab"
+  }
+]

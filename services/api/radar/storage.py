@@ -1502,7 +1502,10 @@ class PostgresRepository:
                 with self.deletion_connection() as deletion_connection:
                     with deletion_connection.cursor() as deletion_cursor:
                         deletion_cursor.execute(
-                            """SELECT current_user,roles.rolsuper,roles.rolbypassrls,
+                            """SELECT current_user,roles.rolsuper,roles.rolcreatedb,
+                            roles.rolcreaterole,roles.rolinherit,roles.rolreplication,roles.rolbypassrls,
+                            (SELECT count(*) FROM pg_auth_members membership
+                             WHERE membership.roleid=roles.oid OR membership.member=roles.oid),
                             has_function_privilege(current_user,'erase_source_score_history(text)','EXECUTE'),
                             has_table_privilege(current_user,'events','DELETE'),
                             has_table_privilege(current_user,'score_history_erasure_audit','INSERT')
@@ -1512,19 +1515,27 @@ class PostgresRepository:
                 deletion_role_name = str(deletion_row[0]) if deletion_row else None
                 deletion_role_ready = bool(
                     deletion_row and deletion_row[0] == "radar_deletion_worker"
-                    and deletion_row[1] is False and deletion_row[2] is False
-                    and deletion_row[3] is True and deletion_row[4] is False
-                    and deletion_row[5] is False
+                    and all(value is False for value in deletion_row[1:7])
+                    and deletion_row[7] == 0
+                    and deletion_row[8] is True and deletion_row[9] is False
+                    and deletion_row[10] is False
                 )
             except Exception:
                 deletion_role_ready = False
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """SELECT clock_timestamp(),current_user,roles.rolsuper,roles.rolbypassrls
+                    """SELECT clock_timestamp(),current_user,roles.rolsuper,roles.rolcreatedb,
+                    roles.rolcreaterole,roles.rolinherit,roles.rolreplication,roles.rolbypassrls,
+                    (SELECT count(*) FROM pg_auth_members membership
+                     WHERE membership.roleid=roles.oid OR membership.member=roles.oid)
                     FROM pg_roles roles WHERE roles.rolname=current_user"""
                 )
-                database_time, database_user, role_superuser, role_bypass_rls = cursor.fetchone()
+                (
+                    database_time, database_user, role_superuser, role_create_db,
+                    role_create_role, role_inherit, role_replication, role_bypass_rls,
+                    role_memberships,
+                ) = cursor.fetchone()
                 cursor.execute("SELECT value FROM schema_attestations WHERE key='migration_version'")
                 migration_row = cursor.fetchone()
                 cursor.execute(
@@ -1588,6 +1599,10 @@ class PostgresRepository:
             "databaseUser": str(database_user),
             "databaseRoleSuperuser": bool(role_superuser),
             "databaseRoleBypassRls": bool(role_bypass_rls),
+            "databaseRoleLeastPrivilege": not any((
+                role_superuser, role_create_db, role_create_role, role_inherit,
+                role_replication, role_bypass_rls, role_memberships,
+            )),
             "deletionRole": deletion_role_name,
             "deletionRoleReady": deletion_role_ready,
             "databaseClockSkewSeconds": abs((utcnow() - database_time).total_seconds()),

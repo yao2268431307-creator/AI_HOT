@@ -1,0 +1,16 @@
+[
+  {
+    "sourceId": "approved-lab-feed",
+    "url": "https://approved-publisher.invalid/feed.xml",
+    "signalFamily": "official",
+    "approvalReference": "approved-<feed-ticket-id>",
+    "approvalEvidenceDigest": "sha256:<signed-approval-file-digest>"
+  },
+  {
+    "sourceId": "approved-media-feed",
+    "url": "https://approved-media.invalid/ai/rss.xml",
+    "signalFamily": "discussion",
+    "approvalReference": "approved-<feed-ticket-id>",
+    "approvalEvidenceDigest": "sha256:<signed-approval-file-digest>"
+  }
+]

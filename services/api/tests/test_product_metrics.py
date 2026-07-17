@@ -86,7 +86,7 @@ def test_frozen_policy_and_duty_clock_exclude_nights_and_weekends() -> None:
     policy = load_product_metric_policy()
     friday_1700 = datetime(2026, 7, 17, 9, 0, tzinfo=UTC)
     monday_1000 = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    assert policy.version == "product-metrics-2026-07-rc3.2"
+    assert policy.version == "product-metrics-2026-07-rc3.3"
     assert policy.status == "frozen_for_beta_collection"
     assert is_in_duty_window(friday_1700, policy)
     assert duty_seconds_between(friday_1700, monday_1000, policy) == 2 * 3600
@@ -638,7 +638,7 @@ def test_postgres_migration_contains_queue_facts_and_formal_interaction_kinds() 
     assert "CREATE TABLE IF NOT EXISTS metric_incidents" in sql
     assert "policy_digest text NOT NULL" in sql
     assert "CREATE TABLE IF NOT EXISTS schema_attestations" in sql
-    assert "migration_version','001_init_rc3.0'" in sql
+    assert "migration_version','001_init_rc3.1'" in sql
     assert "REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON schema_attestations FROM radar_app" in sql
     assert "'feedback','product_interactions','review_queue_entries','lead_threshold_crossings','content_ingest_history','connector_runs','metric_incidents','source_promotion_facts'" in sql
     assert "%I_append_only" in sql

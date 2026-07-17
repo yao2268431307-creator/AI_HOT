@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect AI Hot Radar acceptance evidence every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,15,30,45:00 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=ai-hot-acceptance-collect.service
+
+[Install]
+WantedBy=timers.target

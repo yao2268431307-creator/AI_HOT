@@ -77,7 +77,7 @@ def ranking_ledger(at: datetime) -> dict[str, object]:
     ]
     artifact: dict[str, object] = {
         "schemaVersion": "signed-score-ledger-v1",
-        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
+        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.3",
         "thresholdVersion": "thresholds-2026-07-rc3",
         "selectionRuleVersion": "daily-top5-score-v2",
         "generatedAt": at.isoformat(), "rows": rows,
@@ -85,19 +85,19 @@ def ranking_ledger(at: datetime) -> dict[str, object]:
             {
                 "eventId": f"event-ledger-{rank:02d}", "crossedAt": SERIES_START.isoformat(),
                 "scoreRunId": f"score-run-ledger-{rank:02d}", "thresholdVersion": "thresholds-2026-07-rc3",
-                "policyVersion": "product-metrics-2026-07-rc3.2",
+                "policyVersion": "product-metrics-2026-07-rc3.3",
             }
             for rank in range(1, 36)
         ] + [
             {
                 "eventId": "event-pre-window-crossing", "crossedAt": (SERIES_START - timedelta(days=1)).isoformat(),
                 "scoreRunId": "score-run-pre-window", "thresholdVersion": "thresholds-2026-07-rc3",
-                "policyVersion": "product-metrics-2026-07-rc3.2",
+                "policyVersion": "product-metrics-2026-07-rc3.3",
             },
             {
                 "eventId": "event-crossed-then-superseded", "crossedAt": SERIES_START.isoformat(),
                 "scoreRunId": "score-run-superseded", "thresholdVersion": "thresholds-2026-07-rc3",
-                "policyVersion": "product-metrics-2026-07-rc3.2",
+                "policyVersion": "product-metrics-2026-07-rc3.3",
             },
         ],
         "ledgerKeyId": LEDGER_KEY_ID,
@@ -125,7 +125,7 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
                 "status": "ok", "storageBackend": "postgresql", "rlsVerified": True,
                 "authRequired": True, "authMode": "jwt", "productionReady": True,
                 "jwtConfigurationReady": True,
-                "migrationVersion": "001_init_rc3.0", "redisConfigured": True,
+                "migrationVersion": "001_init_rc3.1", "redisConfigured": True,
                 "r2Configured": True, "runtimeComponentsReady": True,
                 "dependencyProbesReady": True,
                 "disasterRecoveryReady": True, "releaseImagesPinned": True,
@@ -149,7 +149,7 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
             "betaMetrics": {
                 "evidenceStatus": "eligible" if beta_passes else "insufficient",
                 "passesMeasuredGates": True if beta_passes else None,
-                "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
+                "productMetricPolicyVersion": "product-metrics-2026-07-rc3.3",
                 "productMetricPolicyDigest": POLICY_DIGEST,
                 "policyStatus": "frozen_for_beta_collection",
                 "policyFrozenAt": POLICY_FROZEN_AT.isoformat(),
@@ -175,7 +175,7 @@ def sample(at: datetime, *, beta_passes: bool = False) -> dict[str, object]:
                 },
                 "acceptanceMonitoringPolicy": {
                     **TEST_KEYRING_IDENTITY,
-                    "monitorVersion": "acceptance-monitor-v1.3", "monitorDigest": MONITOR_DIGEST,
+                    "monitorVersion": "acceptance-monitor-v1.4", "monitorDigest": MONITOR_DIGEST,
                     "cadenceSeconds": 900, "minimumDistinctConnectorFamilies": 4,
                     "requiredSignalFamilies": ["discussion", "behavior"],
                     "requireNonzeroConnectorObservations": True,
@@ -243,6 +243,12 @@ def test_canary_never_becomes_duration_acceptance_evidence() -> None:
         assert "HTTPS" in str(exc)
     else:
         raise AssertionError("remote cleartext monitoring must be rejected")
+    try:
+        monitor.validated_api_url("https://radar.example.test?token=must-not-be-in-url")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("monitoring credentials or query state must not be accepted in the base URL")
 
 
 def test_72_hour_soak_requires_full_span_connector_continuity_and_pipeline_sla() -> None:
@@ -308,7 +314,7 @@ def test_shadow_gate_requires_real_product_samples_and_independent_manual_evalua
     preregistered_at = (snapshot_start - timedelta(days=1)).isoformat()
     preregistration = {
         "schemaVersion": "manual-product-preregistration-v2",
-        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
+        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.3",
         "productMetricPolicyDigest": POLICY_DIGEST,
         "selectionRuleVersion": "daily-top5-score-v2",
         "inclusionRules": ["top five eligible radar candidates at each scheduled snapshot"],
@@ -359,7 +365,7 @@ def test_shadow_gate_requires_real_product_samples_and_independent_manual_evalua
     monitor.seal_baseline_artifact(baseline_artifact, BASELINE_PRIVATE_BYTES, BASELINE_KEY_ID)
     manual = {
         "schemaVersion": "manual-product-evaluation-v1.3",
-        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.2",
+        "productMetricPolicyVersion": "product-metrics-2026-07-rc3.3",
         "productMetricPolicyDigest": POLICY_DIGEST,
         "precisionCandidateEventSetDigest": "sha256:" + hashlib.sha256(
             __import__("json").dumps(precision_candidate_event_ids, ensure_ascii=False, separators=(",", ":")).encode()

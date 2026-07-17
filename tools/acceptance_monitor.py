@@ -13,7 +13,7 @@ from statistics import median
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -23,6 +23,14 @@ MODES = {
     "soak72h": {"minimumSpanHours": 72, "requiresProductEvidence": False},
     "shadow7d": {"minimumSpanHours": 168, "requiresProductEvidence": True},
 }
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+NO_REDIRECT_OPENER = build_opener(NoRedirect)
 DEFAULT_CONNECTORS = ["rss", "hackernews", "github", "huggingface", "arxiv", "openalex"]
 REQUIRED_RESPONSE_KEYS = {"health", "coverage", "connectorRuns", "pipelineSla", "dataQuality", "betaMetrics", "rankingLedger"}
 
@@ -222,7 +230,10 @@ def seal_baseline_artifact(artifact: dict[str, Any], private_key: bytes, key_id:
 
 def validated_api_url(value: str) -> str:
     parts = urlsplit(value)
-    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+    if (
+        parts.scheme not in {"http", "https"} or not parts.hostname
+        or parts.username or parts.password or parts.query or parts.fragment
+    ):
         raise ValueError("API URL must be a credential-free absolute HTTP(S) URL")
     host = parts.hostname.lower()
     try:
@@ -248,7 +259,7 @@ def fetch_json(
         headers["Authorization"] = f"Bearer {bearer_token}"
     request = Request(f"{api_url.rstrip('/')}{path}", headers=headers)
     try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied internal endpoint
+        with NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"{path}: {exc}") from exc
@@ -990,7 +1001,7 @@ def evaluate_samples(
             and row.get("rlsVerified") is True
             and row.get("authRequired") is True
             and row.get("productionReady") is True
-            and row.get("migrationVersion") == "001_init_rc3.0"
+            and row.get("migrationVersion") == "001_init_rc3.1"
             and row.get("auditTriggersVerified") is True
             and row.get("migrationMarkerReadOnly") is True
             and row.get("authMode") == "jwt"
@@ -1164,7 +1175,7 @@ def evaluate_samples(
     manual_policy = beta.get("manualEvaluationPolicy") if isinstance(beta.get("manualEvaluationPolicy"), dict) else {}
     local_monitor_digest = "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     monitor_implementation_ok = (
-        monitoring_policy.get("monitorVersion") == "acceptance-monitor-v1.3"
+        monitoring_policy.get("monitorVersion") == "acceptance-monitor-v1.4"
         and monitoring_policy.get("monitorDigest") == local_monitor_digest
     )
     collection_from_values = {

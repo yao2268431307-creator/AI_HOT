@@ -10,13 +10,30 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
+from pathlib import Path
 import statistics
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import psycopg
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+NO_REDIRECT_OPENER = build_opener(NoRedirect)
+
+
+def evidence_digest(payload: dict[str, object]) -> str:
+    material = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(material).hexdigest()
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -31,7 +48,7 @@ def get_json(base_url: str, path: str, token: str, timeout: float) -> dict[str, 
         f"{base_url.rstrip('/')}{path}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    with urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied target
+    with NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
         return json.loads(response.read())
 
 
@@ -60,6 +77,16 @@ def latest_collector_cycle(dsn: str) -> dict[str, object] | None:
     return {"lastSeenAt": row[0].isoformat(), **details}
 
 
+def secret_value(direct: str | None, path: Path | None, env_name: str) -> str:
+    configured = direct or os.getenv(env_name)
+    if configured and path:
+        raise ValueError(f"provide only one direct/{env_name} value or secret file")
+    value = path.read_text(encoding="utf-8").strip() if path else configured
+    if not value:
+        raise ValueError(f"missing {env_name} or corresponding secret file")
+    return value
+
+
 def run(
     *, dsn: str, base_url: str, token: str, requests: int, timeout: float,
     minimum_sources: int, minimum_observations: int, minimum_events: int,
@@ -67,6 +94,12 @@ def run(
 ) -> dict[str, object]:
     if requests < 20:
         raise ValueError("at least 20 HTTP requests are required")
+    target = urlsplit(base_url)
+    if (
+        target.scheme != "https" or not target.hostname or target.username
+        or target.password or target.query or target.fragment
+    ):
+        raise ValueError("capacity target must be a credential-free HTTPS base URL")
     health = get_json(base_url, "/api/v1/operations/runtime-health", token, timeout)
     counts = dataset_counts(dsn)
     cycle = latest_collector_cycle(dsn)
@@ -87,7 +120,7 @@ def run(
         "cycleWithinTarget": isinstance(cycle_duration, (int, float)) and float(cycle_duration) <= maximum_cycle_seconds,
         "radarP95WithinTarget": p95_ms <= maximum_p95_ms,
     }
-    return {
+    payload: dict[str, object] = {
         "evidenceType": "production-capacity-probe-v1",
         "measuredAt": datetime.now(timezone.utc).isoformat(),
         "target": base_url, "dataset": counts, "collectorCycle": cycle,
@@ -102,13 +135,17 @@ def run(
         },
         "gates": gates, "qualifies": all(gates.values()),
     }
+    payload["evidenceDigest"] = evidence_digest(payload)
+    return payload
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dsn", required=True)
+    parser.add_argument("--dsn", help="prefer --dsn-file to avoid process-list exposure")
+    parser.add_argument("--dsn-file", type=Path)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--token", required=True)
+    parser.add_argument("--token", help="prefer --token-file to avoid process-list exposure")
+    parser.add_argument("--token-file", type=Path)
     parser.add_argument("--requests", type=int, default=120)
     parser.add_argument("--timeout", type=float, default=10)
     parser.add_argument("--minimum-sources", type=int, default=10_000)
@@ -116,19 +153,27 @@ if __name__ == "__main__":
     parser.add_argument("--minimum-events", type=int, default=2_000)
     parser.add_argument("--maximum-cycle-seconds", type=float, default=300)
     parser.add_argument("--maximum-p95-ms", type=float, default=500)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
+        dsn = secret_value(args.dsn, args.dsn_file, "POSTGRES_READONLY_DSN")
+        token = secret_value(args.token, args.token_file, "RADAR_OWNER_JWT")
         result = run(
-            dsn=args.dsn, base_url=args.base_url, token=args.token,
+            dsn=dsn, base_url=args.base_url, token=token,
             requests=args.requests, timeout=args.timeout,
             minimum_sources=args.minimum_sources, minimum_observations=args.minimum_observations,
             minimum_events=args.minimum_events, maximum_cycle_seconds=args.maximum_cycle_seconds,
             maximum_p95_ms=args.maximum_p95_ms,
         )
-    except (HTTPError, URLError, psycopg.Error, ValueError) as exc:
+    except (HTTPError, URLError, OSError, psycopg.Error, ValueError) as exc:
         result = {
             "evidenceType": "production-capacity-probe-v1", "qualifies": False,
             "error": str(exc), "measuredAt": datetime.now(timezone.utc).isoformat(),
         }
-    print(json.dumps(result, ensure_ascii=False))
+        result["evidenceDigest"] = evidence_digest(result)
+    rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
     raise SystemExit(0 if result.get("qualifies") is True else 1)

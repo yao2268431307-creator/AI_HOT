@@ -606,12 +606,12 @@ INSERT INTO review_queue_entries
   (event_id,eligibility_key,eligible_at,lifecycle_state,cluster_version,score_version,policy_version,entry_kind)
 SELECT e.id,'qe-backfill-'||gen_random_uuid()::text,clock_timestamp(),e.lifecycle_state,e.cluster_version,
        COALESCE(NULLIF(e.current_score->>'scoreVersion',''),'unknown'),
-       'product-metrics-2026-07-rc3.2','deployment_backfill'
+       'product-metrics-2026-07-rc3.3','deployment_backfill'
 FROM events e
 WHERE e.lifecycle_state IN ('detected','emerging','accelerating','established','cooling')
   AND NOT EXISTS (
     SELECT 1 FROM review_queue_entries q
-    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc3.2'
+    WHERE q.event_id=e.id AND q.policy_version='product-metrics-2026-07-rc3.3'
   );
 
 CREATE TABLE IF NOT EXISTS cluster_edit_requests (
@@ -895,5 +895,5 @@ REVOKE ALL ON FUNCTION resolve_connector_budget_reservation(uuid,text,numeric,te
 
 -- Written last: an interrupted migration must never attest the target schema.
 INSERT INTO schema_attestations (key,value,updated_at)
-VALUES ('migration_version','001_init_rc3.0',clock_timestamp())
+VALUES ('migration_version','001_init_rc3.1',clock_timestamp())
 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,updated_at=EXCLUDED.updated_at;

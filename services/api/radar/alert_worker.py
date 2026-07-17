@@ -418,7 +418,12 @@ async def run() -> None:
         raise RuntimeError("production alert worker requires RAW_EVIDENCE_BUCKET")
     bucket = bucket or "raw-evidence"
     if os.getenv("R2_ENDPOINT_URL") and os.getenv("R2_ACCESS_KEY_ID") and os.getenv("R2_SECRET_ACCESS_KEY"):
-        objects = S3EvidenceStore(os.environ["R2_ENDPOINT_URL"], os.environ["R2_ACCESS_KEY_ID"], os.environ["R2_SECRET_ACCESS_KEY"])
+        objects = S3EvidenceStore(
+            os.environ["R2_ENDPOINT_URL"],
+            os.environ["R2_ACCESS_KEY_ID"],
+            os.environ["R2_SECRET_ACCESS_KEY"],
+            os.getenv("R2_SESSION_TOKEN") or None,
+        )
     else:
         if production:
             raise RuntimeError("production alert worker requires R2 credentials and cannot use local evidence")

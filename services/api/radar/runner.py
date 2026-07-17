@@ -166,7 +166,12 @@ def validate_runtime_configuration() -> bool:
 
 def build_evidence_store() -> RawEvidenceStore:
     if os.getenv("R2_ENDPOINT_URL") and os.getenv("R2_ACCESS_KEY_ID") and os.getenv("R2_SECRET_ACCESS_KEY"):
-        return S3EvidenceStore(os.environ["R2_ENDPOINT_URL"], os.environ["R2_ACCESS_KEY_ID"], os.environ["R2_SECRET_ACCESS_KEY"])
+        return S3EvidenceStore(
+            os.environ["R2_ENDPOINT_URL"],
+            os.environ["R2_ACCESS_KEY_ID"],
+            os.environ["R2_SECRET_ACCESS_KEY"],
+            os.getenv("R2_SESSION_TOKEN") or None,
+        )
     return LocalEvidenceStore(os.getenv("RAW_EVIDENCE_LOCAL_DIR", ".data/evidence"))
 
 

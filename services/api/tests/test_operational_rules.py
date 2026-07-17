@@ -21,6 +21,7 @@ from radar.budget import budget_guard
 from radar.contracts import AlertRuleRequest, EventType, EvidenceStrength, Observation
 from radar.connectors.base import BaseConnector
 from radar.evaluation import EvaluationExample, LabeledPrediction, bcubed_cluster_precision_recall, bootstrap_confidence_interval, cohen_kappa, macro_f1, median_lead_minutes, pairwise_cluster_precision, pairwise_cluster_recall, precision_at_k, temporal_entity_holdout
+from radar.evidence_store import S3EvidenceStore
 from radar.metrics import Baseline, SignalSnapshot, aggregate_metrics, to_score_input
 from radar.outbox import outbox_recovery_keys
 from radar.source_discovery import SourceCandidate, candidate_score, load_source_score_policy, promote_candidates, source_score_policy_digest
@@ -40,6 +41,25 @@ from tools.replay_outbox_to_redis import execute_replay
 
 
 NOW = datetime.now(timezone.utc)
+
+
+def test_s3_evidence_store_forwards_optional_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_client(service: str, **options: object) -> object:
+        captured.update({"service": service, **options})
+        return object()
+
+    monkeypatch.setattr("boto3.client", fake_client)
+    S3EvidenceStore("https://r2.example", "access", "secret", "session")
+    assert captured == {
+        "service": "s3",
+        "endpoint_url": "https://r2.example",
+        "aws_access_key_id": "access",
+        "aws_secret_access_key": "secret",
+        "aws_session_token": "session",
+        "region_name": "auto",
+    }
 
 
 @pytest.mark.asyncio
@@ -680,6 +700,8 @@ def test_production_compose_and_examples_keep_service_secrets_isolated() -> None
     assert "RADAR_SCHEDULER_ENV_FILE" in compose
     assert "RADAR_ALERT_ENV_FILE" in compose
     assert "RADAR_SOURCE_IDENTITIES_FILE" in compose
+    assert "RADAR_RSS_FEEDS_FILE" in compose
+    assert "RSS_FEEDS_FILE: /run/config/feeds.json" in compose
     assert "build:" not in compose
 
     api = (root / ".env.api.example").read_text(encoding="utf-8")

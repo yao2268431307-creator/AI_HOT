@@ -12,16 +12,16 @@
 
 - `DEMO_MODE=false`、`AUTH_REQUIRED=true`、`RADAR_AUTH_MODE=jwt`。
 - JWT issuer、audience 和只读公钥 keyring 已登记；API 不持有身份提供方私钥。
-- PostgreSQL 迁移标记精确为 `001_init_rc3.0`；`radar_app` 与隔离的 `radar_deletion_worker` 都无超级权限、无 `BYPASSRLS`。应用角色不能执行评分历史清除函数、删除事件或伪造清除审计。
-- Redis、R2、稳定实例 ID、来源身份文件已配置。
+- PostgreSQL 迁移标记精确为 `001_init_rc3.1`；`radar_app` 与隔离的 `radar_deletion_worker` 都无超级权限、无 `BYPASSRLS`。应用角色不能执行评分历史清除函数、删除事件或伪造清除审计。
+- Redis、R2、稳定实例 ID、来源身份文件和已审批 RSS 清单已配置。
 - 总预算、连接器预算、信号族预算均为正数 JSON 映射；计量连接器的 RMB/request 成本明确。未知成本直接暂停。
 - API/Web 最终镜像和 Python/Node 基础镜像均以 digest 固定；运行时 `RADAR_RELEASE_IMAGE_DIGESTS` 与发布登记一致。
 - 五个运行组件心跳正常，最近一次真实恢复演练 RPO ≤ 1 小时、RTO ≤ 4 小时且不超过 90 天。
 - 所有启用连接器的权利状态已由数据负责人改为 `active`；仓库默认的 pending/blocked 状态不能晋级。
 
-生产 Compose 文件是 [compose.production.yml](../infra/compose.production.yml)。它强制使用 API、Scheduler、Alert 三份独立环境文件和单独挂载的已复核来源身份表；示例边界见 [API](../.env.api.example)、[Scheduler](../.env.scheduler.example) 与 [Alert](../.env.alert.example)。API 不持有 Redis、R2 或平台采集凭据；Scheduler 不持有删除角色、Webhook 或评分账本私钥；Alert 不持有平台令牌、删除数据库或评分账本私钥。正式密钥由部署平台 Secret Manager 按工作负载身份注入，不得提交生产环境文件。Compose 只绑定宿主机 loopback 端口，需要组织网关负责 TLS、访问控制和限流。运行服务需要出站访问各自获准的托管依赖、官方数据提供方和 Webhook；不能把网络标记为 Docker internal 后又声称连接器可用。
+生产 Compose 文件是 [compose.production.yml](../infra/compose.production.yml)。它强制使用 API、Scheduler、Alert 三份独立环境文件，并分别挂载已复核来源身份表和 RSS 清单；示例边界见 [API](../.env.api.example)、[Scheduler](../.env.scheduler.example) 与 [Alert](../.env.alert.example)。API 不持有 Redis、R2 或平台采集凭据；Scheduler 不持有删除角色、Webhook 或评分账本私钥；Alert 不持有平台令牌、删除数据库或评分账本私钥。正式密钥由部署平台 Secret Manager 按工作负载身份注入，不得提交生产环境文件。Compose 只绑定宿主机 loopback 端口，需要组织网关负责 TLS、访问控制和限流。运行服务需要出站访问各自获准的托管依赖、官方数据提供方和 Webhook；不能把网络标记为 Docker internal 后又声称连接器可用。完整配置和正式验收步骤见 [生产配置与验收手册](PRODUCTION_CONFIGURATION.md)。
 
-`GET /health` 仅公开版本和时钟；`GET /health/ready` 是最小化的编排 readiness。完整依赖、数据库角色和发布证明仅由 Owner 通过 `GET /api/v1/operations/runtime-health` 读取。生产任一证明缺失时 readiness 返回 503。15 分钟调度组件的心跳容忍窗口按声明周期计算，而不是错误地固定为 3 分钟。采集 Worker 在每轮采集前重新执行 Redis ping 与目标 R2 bucket 写/读/删探针；Alert 消费者每轮消费前以自身独立身份执行 Redis ping 和专用 canary 前缀的删除权限探针，不需要为该身份授予 R2 写或读权限。任一探针失败时对应 Worker 不得继续处理，并写入失败心跳。readiness 同时要求两类 R2 权限证明，且不接受超过 30 分钟的旧探针结果。
+`GET /health` 仅公开版本和时钟；`GET /health/ready` 是最小化的编排 readiness。完整依赖、数据库角色和发布证明仅由 Owner 通过 `GET /api/v1/operations/runtime-health` 读取。生产任一证明缺失时 readiness 返回 503。15 分钟调度组件的心跳容忍窗口按声明周期计算，而不是错误地固定为 3 分钟。采集 Worker 在每轮采集前重新执行 Redis ping 与目标 R2 bucket 写/读/删探针；Alert 消费者每轮消费前以自身独立身份执行 Redis ping 和专用 canary 前缀的删除权限探针，代码不会主动执行写或读。任一探针失败时对应 Worker 不得继续处理，并写入失败心跳。readiness 同时要求两类 R2 权限证明，且不接受超过 30 分钟的旧探针结果。若对象存储供应商不能签发严格 delete-only 的长期凭据，应为 Alert 使用短时、受策略约束的会话凭据并注入 `R2_SESSION_TOKEN`；不得把供应商控制台的宽权限长期令牌描述为 delete-only。
 
 ## 监控与告警
 
@@ -84,9 +84,10 @@ SELECT resolve_connector_budget_reservation(
 
 ```powershell
 python tools/production_capacity_probe.py `
-  --dsn $env:POSTGRES_READONLY_DSN `
+  --dsn-file C:\secure\radar-capacity-reader-dsn `
   --base-url https://radar.example `
-  --token $env:RADAR_OWNER_JWT
+  --token-file C:\secure\radar-owner-jwt `
+  --output C:\secure\capacity-evidence.json
 ```
 
 工具只有在生产 readiness 通过、真实库达到 10,000 信源/5,000,000 观测/2,000 活跃事件、最近完整采集评分周期 ≤ 300 秒、120 次雷达请求 P95 ≤ 500ms 时才输出 `qualifies=true`。它不写数据库，也不生成伪造容量数据。

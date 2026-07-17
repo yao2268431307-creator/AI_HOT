@@ -8,9 +8,9 @@
 
 阈值版本：`thresholds-2026-07-rc3`
 
-数据库迁移：`001_init_rc3.0`
+数据库迁移：`001_init_rc3.1`
 
-产品指标策略：`product-metrics-2026-07-rc3.2`
+产品指标策略：`product-metrics-2026-07-rc3.3`
 
 ## 当前结论
 
@@ -56,7 +56,7 @@
 - 采集器在请求前按最坏重试与重定向成本执行数据库原子预留；总月度、逐连接器、逐信号家族三层预算在同一锁域校验和记账。进程崩溃留下的过期预留进入继续占额的显式对账状态，阻断 readiness，只有管理员可依据提供方账单释放或确认费用。
 - `/metrics` 为 Owner-only Prometheus 文本；覆盖 HTTP 状态与 P95、连接器运行/失败/延迟/覆盖、处理与 Outbox 积压、运行组件心跳、预算利用率和待对账预留数。
 - `/health/ready` 在生产模式下对数据库权限、RLS/trigger/marker、隔离删除角色、JWT、采集 Worker 每轮 Redis/R2 读写删除实探、Alert 每轮 Redis/R2 删除权限实探、五个运行组件心跳、DR 证明、预算对账和 API/Web 镜像摘要 fail-closed；公开 `/health` 与 readiness 都是最小披露，完整诊断仅限 Owner 的 `/api/v1/operations/runtime-health`。
-- 生产 Compose 只接受 API/Web 的 `repository@sha256` 不可变镜像，不含本地 `build` 回退，并配置只读文件系统、loopback 端口、资源限制和 readiness healthcheck。Dockerfile 构建基座可由发布流水线参数注入；目标镜像的构建、签名和登记仍是外部发布闸门。
+- 生产 Compose 只接受 API/Web 的 `repository@sha256` 不可变镜像，不含本地 `build` 回退，并配置只读文件系统、loopback 端口、资源限制和 readiness healthcheck。发布流水线强制不可变基础镜像，生成 BuildKit provenance/SBOM、Cosign 镜像签名和签名 release manifest；部署工具会验证批准 commit、仓库、manifest 与两份镜像签名。流水线在目标仓库的真实执行和摘要登记仍是外部发布闸门。
 
 ### 身份、安全与治理
 
@@ -70,7 +70,7 @@
 
 | 验证 | 结果 |
 |---|---:|
-| 默认 Python 套件 | `213 passed, 20 skipped in 23.42s` |
+| 默认 Python 套件 | `227 passed, 20 skipped in 23.86s` |
 | 显式本地 PostgreSQL/Redis/MinIO 套件 | `231 passed, 2 skipped, 8 warnings in 27.27s` |
 | Ruff | 通过 |
 | Python compileall | 通过 |
@@ -87,12 +87,14 @@
 
 完整的本轮证据边界见 [RC3 本地验证记录](evidence/RC3_LOCAL_VERIFICATION_2026-07-17.md)。旧 evidence 文件保持为对应 rc2 时点的历史记录，不应用来证明 rc3 正式验收。
 
+生产配置、签名发布、灾备/容量和 72H 调度工具的追加验证见 [生产配置自动化本地验证记录](evidence/PRODUCTION_CONFIGURATION_LOCAL_VERIFICATION_2026-07-17.md)。
+
 独立终审结论与代码完成度/正式发布资格的拆分口径见 [完成度审计](COMPLETION_AUDIT.md)。
 
 ## 尚未完成的发布闸门
 
 1. 数据权利负责人批准正式连接器；X、Bilibili 等仍需合法凭证，Bluesky 仍为 discovery-only。
-2. 在目标部署环境构建并登记 API/Web 不可变镜像摘要，配置真实 JWT、Redis、R2 和密钥保管。
+2. 在目标 GitHub 仓库实际运行已配置的签名发布流水线，在部署机复验 API/Web、manifest 和批准 commit，并配置真实 JWT、Redis、R2 和密钥保管。
 3. PostgreSQL PITR、RPO ≤ 1 小时、RTO ≤ 4 小时、跨节点恢复、网络分区和进程硬终止演练。
 4. 10,000 信源、500 万历史观测、2,000 活跃事件的真实数据库/网络/向量容量验证；单轮 ≤ 5 分钟、雷达缓存命中 P95 < 500ms。
 5. 至少四个独立信号家族的 72 小时连续采集；95% 正常数据在 15 分钟内完成评分，重复率 < 5%。

@@ -54,10 +54,24 @@ class LocalEvidenceStore:
 class S3EvidenceStore:
     """S3-compatible writer for Cloudflare R2; boto3 is imported only in production."""
 
-    def __init__(self, endpoint_url: str, access_key_id: str, secret_access_key: str) -> None:
+    def __init__(
+        self,
+        endpoint_url: str,
+        access_key_id: str,
+        secret_access_key: str,
+        session_token: str | None = None,
+    ) -> None:
         import boto3
 
-        self.client = boto3.client("s3", endpoint_url=endpoint_url, aws_access_key_id=access_key_id, aws_secret_access_key=secret_access_key, region_name="auto")
+        client_options = {
+            "endpoint_url": endpoint_url,
+            "aws_access_key_id": access_key_id,
+            "aws_secret_access_key": secret_access_key,
+            "region_name": "auto",
+        }
+        if session_token:
+            client_options["aws_session_token"] = session_token
+        self.client = boto3.client("s3", **client_options)
 
     async def put(self, reference: str, body: bytes, content_type: str) -> None:
         parts = urlsplit(reference)

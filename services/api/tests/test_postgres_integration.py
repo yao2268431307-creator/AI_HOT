@@ -149,13 +149,14 @@ def test_postgres_runtime_attestation_and_production_health(monkeypatch: pytest.
     expected = {
         "storageBackend": "postgresql",
         "rlsVerified": True,
-        "migrationVersion": "001_init_rc3.0",
+        "migrationVersion": "001_init_rc3.1",
         "auditTriggersVerified": True,
         "migrationMarkerReadOnly": True,
         "instanceId": "postgres-integration-rc24",
         "databaseUser": "radar_app",
         "databaseRoleSuperuser": False,
         "databaseRoleBypassRls": False,
+        "databaseRoleLeastPrivilege": True,
         "deletionRole": "radar_deletion_worker",
         "deletionRoleReady": True,
     }

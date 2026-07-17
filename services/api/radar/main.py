@@ -255,12 +255,13 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         production_ready = (
             attestation.get("storageBackend") == "postgresql"
             and attestation.get("rlsVerified") is True
-            and attestation.get("migrationVersion") == "001_init_rc3.0"
+            and attestation.get("migrationVersion") == "001_init_rc3.1"
             and attestation.get("auditTriggersVerified") is True
             and attestation.get("migrationMarkerReadOnly") is True
             and attestation.get("databaseUser") == "radar_app"
             and attestation.get("databaseRoleSuperuser") is False
             and attestation.get("databaseRoleBypassRls") is False
+            and attestation.get("databaseRoleLeastPrivilege") is True
             and attestation.get("deletionRoleReady") is True
             and isinstance(attestation.get("instanceId"), str) and len(str(attestation["instanceId"])) >= 8
             and isinstance(attestation.get("databaseClockSkewSeconds"), (int, float))

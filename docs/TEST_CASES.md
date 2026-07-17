@@ -117,7 +117,7 @@
 
 | 编号 | 场景 | 预期 |
 |---|---|---|
-| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc3.0`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过；完整 ready 还要求 JWT、Redis/R2、组件心跳、DR 与镜像摘要 |
+| I-01 | 用受限 `radar_app` 连接真实 PostgreSQL 并请求 production health | 迁移为 `001_init_rc3.1`；RLS、审计 trigger、只读 marker、非超级用户、非 BYPASSRLS 和时钟偏差全部通过；完整 ready 还要求 JWT、Redis/R2、组件心跳、DR 与镜像摘要 |
 | I-02 | 跨 workspace 查询告警规则，尝试修改 append-only 晋级事实和迁移 marker | workspace-b 看不到 workspace-a 行；晋级事实 UPDATE 被 trigger 拒绝；应用角色不能改迁移 marker |
 | I-03 | 两线程并发写同一 source+fingerprint | 两条 Observation 均可审计，信源有效观测只增加一次，并记录重复发现原因 |
 | I-04 | 插入真实 PG Outbox 后发布到真实 Redis Stream | 流中字段和 payload 一致；Outbox 标记已发布、尝试次数为 1、无错误 |

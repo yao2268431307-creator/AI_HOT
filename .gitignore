@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+*.private-key-base64
+private-keys/
+secrets/
+infra/deploy/release.env
+config/feeds.production.json
+config/source_identities.production.json
 *.log
 .data/
 web/node_modules/

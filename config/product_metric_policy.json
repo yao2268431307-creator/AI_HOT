@@ -1,7 +1,7 @@
 {
-  "version": "product-metrics-2026-07-rc3.2",
+  "version": "product-metrics-2026-07-rc3.3",
   "status": "frozen_for_beta_collection",
-  "frozenAt": "2026-07-17T13:05:00+08:00",
+  "frozenAt": "2026-07-17T15:20:00+08:00",
   "timezone": "Asia/Shanghai",
   "dutyWindows": [
     {
@@ -62,8 +62,8 @@
     "leadLifecycleStates": ["emerging", "accelerating", "established"]
   },
   "acceptanceMonitoring": {
-    "monitorVersion": "acceptance-monitor-v1.3",
-    "monitorDigest": "sha256:a9cfe544c7625cc7304f0dbfc5a4dc449aec2a85fcbd9499f40cfa9e141d56cb",
+    "monitorVersion": "acceptance-monitor-v1.4",
+    "monitorDigest": "sha256:7227a340bea83ea1cbc6915624c83db2b80973caf19058a9a08e1bec4db50b41",
     "keyringVersion": "acceptance-keys-2026-07-rc2.3",
     "keyringDigest": "sha256:17fe0368defef907375ac86dfb9a721ece1eef7a8acb5cf27b920d7109d5826a",
     "keyringFrozenAt": "2026-07-17T03:23:00+08:00",
@@ -78,6 +78,7 @@
     "out_of_scope"
   ],
   "notes": [
+    "Policy rc3.3 was re-frozen before formal collection because the acceptance collector now rejects HTTP redirects for every authenticated request; no earlier sample may enter this evidence window.",
     "Policy rc3.2 was re-frozen after every-cycle Redis/R2 probes, isolated source-erasure authority, crash-safe budget reconciliation and bounded HNSW candidate loading became release gates; the bound acceptance monitor digest changed and no earlier sample may enter this evidence window.",
     "Frozen before collection of a real Beta outcome set; demo and synthetic test rows are not acceptance evidence.",
     "System-fault duplicate exclusions require an immutable Owner-authored exclusion record and are always reported separately.",

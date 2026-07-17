@@ -1,0 +1,30 @@
+[Unit]
+Description=AI Hot Radar immutable acceptance sample
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ai-hot-monitor
+Group=ai-hot-monitor
+WorkingDirectory=/opt/ai-hot-radar
+EnvironmentFile=/etc/ai-hot/acceptance-monitor.env
+ExecStart=/opt/ai-hot-radar/.venv/bin/python tools/run_scheduled_acceptance.py
+NoNewPrivileges=true
+UMask=0077
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/ai-hot-acceptance
+ReadOnlyPaths=/etc/ai-hot /run/secrets
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
