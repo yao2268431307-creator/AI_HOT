@@ -10,6 +10,7 @@ from .base import BaseConnector, ConnectorError, utcnow
 
 class YouTubeConnector(BaseConnector):
     id = "youtube"
+    access_class = "metered"
     rights_policy_id = "youtube-api-review-required-v1"
     platform = "YouTube"
     signal_family = "behavior"

@@ -783,6 +783,32 @@ def test_bluesky_configuration_and_checkpoint_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bluesky_fails_over_between_official_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempted: list[str] = []
+
+    def connect_factory(url: str, **_kwargs: object) -> FakeJetstreamContext:
+        attempted.append(url)
+        if len(attempted) == 1:
+            raise OSError("first region unavailable")
+        return FakeJetstreamContext([])
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("radar.connectors.bluesky.asyncio.sleep", no_sleep)
+    connector = BlueskyJetstreamConnector(
+        endpoint="wss://jetstream2.us-west.bsky.network/subscribe",
+        fallback_endpoints=("wss://jetstream2.us-east.bsky.network/subscribe",),
+        connect_factory=connect_factory,
+        max_attempts=2,
+        idle_timeout_seconds=.1,
+    )
+    assert await connector.collect() == []
+    assert attempted[0].startswith("wss://jetstream2.us-west.bsky.network/")
+    assert attempted[1].startswith("wss://jetstream2.us-east.bsky.network/")
+
+
+@pytest.mark.asyncio
 async def test_runner_keeps_bluesky_disabled_by_default(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("BLUESKY_JETSTREAM_ENABLED", raising=False)
     default_connectors = runner_module.build_connectors(LocalEvidenceStore(tmp_path / "default"))

@@ -24,7 +24,12 @@ from .base import (
 )
 
 
-DEFAULT_JETSTREAM_ENDPOINT = "wss://jetstream2.us-east.bsky.network/subscribe"
+DEFAULT_JETSTREAM_ENDPOINT = "wss://jetstream2.us-west.bsky.network/subscribe"
+DEFAULT_JETSTREAM_FALLBACK_ENDPOINTS = (
+    "wss://jetstream1.us-west.bsky.network/subscribe",
+    "wss://jetstream2.us-east.bsky.network/subscribe",
+    "wss://jetstream1.us-east.bsky.network/subscribe",
+)
 DEFAULT_APPVIEW_ENDPOINT = "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts"
 DEFAULT_AI_KEYWORDS = (
     "ai",
@@ -95,6 +100,7 @@ class BlueskyJetstreamConnector(BaseConnector):
     """
 
     id = "bluesky"
+    access_class = "public_no_billing"
     rights_policy_id = "bluesky-appview-jetstream-experimental-v1"
     platform = "Bluesky"
     signal_family = "discussion"
@@ -104,6 +110,7 @@ class BlueskyJetstreamConnector(BaseConnector):
         self,
         *args: object,
         endpoint: str = DEFAULT_JETSTREAM_ENDPOINT,
+        fallback_endpoints: tuple[str, ...] = DEFAULT_JETSTREAM_FALLBACK_ENDPOINTS,
         appview_endpoint: str = DEFAULT_APPVIEW_ENDPOINT,
         keywords: tuple[str, ...] = DEFAULT_AI_KEYWORDS,
         max_messages: int = 500,
@@ -115,6 +122,11 @@ class BlueskyJetstreamConnector(BaseConnector):
     ) -> None:
         super().__init__(*args, **kwargs)
         ensure_safe_public_websocket_url(endpoint)
+        endpoints = tuple(dict.fromkeys((endpoint, *fallback_endpoints)))
+        for candidate_endpoint in endpoints:
+            ensure_safe_public_websocket_url(candidate_endpoint)
+            if urlsplit(candidate_endpoint).scheme != "wss":
+                raise ConnectorError("Bluesky Jetstream must use wss://")
         ensure_safe_public_url(appview_endpoint)
         if urlsplit(endpoint).scheme != "wss":
             raise ConnectorError("Bluesky Jetstream must use wss://")
@@ -129,6 +141,7 @@ class BlueskyJetstreamConnector(BaseConnector):
         if not normalized_keywords or any(len(value) > 80 for value in normalized_keywords):
             raise ConnectorError("Bluesky keywords must be non-empty and at most 80 characters")
         self.endpoint = endpoint
+        self.endpoints = endpoints
         self.appview_endpoint = appview_endpoint
         self.keywords = tuple(dict.fromkeys(normalized_keywords))
         self.max_messages = _bounded_integer(max_messages, name="max_messages", minimum=1, maximum=5_000)
@@ -176,7 +189,7 @@ class BlueskyJetstreamConnector(BaseConnector):
             "completedAt": utcnow().isoformat(),
         }
 
-    def subscription_url(self, *, replay_overlap: bool = True) -> str:
+    def subscription_url(self, *, replay_overlap: bool = True, endpoint: str | None = None) -> str:
         params: list[tuple[str, str]] = [
             ("wantedCollections", JETSTREAM_COLLECTION),
             ("maxMessageSizeBytes", str(self.max_message_size_bytes)),
@@ -184,8 +197,9 @@ class BlueskyJetstreamConnector(BaseConnector):
         if self._cursor_us:
             cursor = self._cursor_us - self.replay_overlap_us if replay_overlap else self._cursor_us
             params.append(("cursor", str(max(0, cursor))))
-        separator = "&" if "?" in self.endpoint else "?"
-        return f"{self.endpoint}{separator}{urlencode(params)}"
+        active_endpoint = endpoint or self.endpoint
+        separator = "&" if "?" in active_endpoint else "?"
+        return f"{active_endpoint}{separator}{urlencode(params)}"
 
     def _matches_keywords(self, text: str) -> bool:
         normalized = sanitize_external_text(text).casefold()
@@ -218,11 +232,12 @@ class BlueskyJetstreamConnector(BaseConnector):
         return {"event": event, "did": did, "rkey": rkey, "cid": cid, "uri": uri, "record": record}
 
     async def _read_candidates(self) -> list[dict[str, object]]:
-        if self._validate_dns:
-            await ensure_safe_public_websocket_url_resolved(self.endpoint)
         last_error: Exception | None = None
         for attempt in range(self.max_attempts):
+            active_endpoint = self.endpoints[attempt % len(self.endpoints)]
             try:
+                if self._validate_dns:
+                    await ensure_safe_public_websocket_url_resolved(active_endpoint)
                 # First reconnect with a small overlap. If that entire bounded
                 # read contains only already-checkpointed events, reconnect once
                 # at the exact cursor so a dense replay window cannot livelock.
@@ -238,7 +253,7 @@ class BlueskyJetstreamConnector(BaseConnector):
                     candidate_keys: set[tuple[str, str]] = set()
                     self._request_count += 1
                     async with self._connect_factory(
-                        self.subscription_url(replay_overlap=replay_overlap),
+                        self.subscription_url(replay_overlap=replay_overlap, endpoint=active_endpoint),
                         open_timeout=10,
                         close_timeout=5,
                         ping_interval=20,

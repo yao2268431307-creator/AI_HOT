@@ -1,7 +1,7 @@
 {
-  "version": "source-score-2026-07-rc2.2",
+  "version": "source-score-2026-07-local-v1",
   "status": "frozen_for_candidate_governance",
-  "frozenAt": "2026-07-17T04:08:00+08:00",
+  "frozenAt": "2026-07-21T16:00:00+08:00",
   "timezone": "Asia/Shanghai",
   "rankingEnabled": false,
   "autoPromotionEnabled": false,
@@ -11,9 +11,9 @@
   "dailyGrowthRate": 0.05,
   "dailyGrowthRounding": "floor",
   "allowAutomaticBootstrap": false,
-  "activeCapacity": 200,
+  "activeCapacity": 500,
   "candidateCapacity": 500,
-  "systemCapacity": 2000,
+  "systemCapacity": 1000,
   "weights": {
     "earlyHitRate": 0.30,
     "confirmedHitRate": 0.25,

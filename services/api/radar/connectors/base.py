@@ -83,13 +83,27 @@ class BaseConnector(ABC):
     id: str
     platform: str
     signal_family: str
+    access_class: str = "restricted"
     metered: bool = False
     expected_requests_per_collect: int = 1
     rights_policy_id: str = "metadata-and-excerpt"
 
-    def __init__(self, client: httpx.AsyncClient | None = None, *, max_attempts: int = 3, evidence_store: RawEvidenceStore | None = None) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        max_attempts: int = 3,
+        evidence_store: RawEvidenceStore | None = None,
+        request_timeout_seconds: float = 15,
+    ) -> None:
+        if not 1 <= request_timeout_seconds <= 120:
+            raise ConnectorError("request_timeout_seconds must be from 1 to 120")
         self._owned_client = client is None
-        self.client = client or httpx.AsyncClient(timeout=15, follow_redirects=True, headers={"User-Agent": "signal-ai-radar/0.3"})
+        self.client = client or httpx.AsyncClient(
+            timeout=request_timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "signal-ai-radar/0.3"},
+        )
         self.max_attempts = max_attempts
         self.evidence_store = evidence_store
         self.evidence_bucket = os.getenv("RAW_EVIDENCE_BUCKET", "raw")
@@ -132,7 +146,8 @@ class BaseConnector(ABC):
         """
         digest = hashlib.sha256(external_id.encode("utf-8")).hexdigest()[:24]
         revision = int(collected_at.timestamp() * 1_000_000)
-        return self.raw_ref(f"{namespace}/items/{digest}/{revision}.{extension}")
+        date_path = collected_at.astimezone(timezone.utc).strftime("%Y/%m/%d")
+        return self.raw_ref(f"{namespace}/{date_path}/items/{digest}/{revision}.{extension}")
 
     async def archive(self, reference: str, body: bytes, content_type: str = "application/json") -> None:
         if self.evidence_store:

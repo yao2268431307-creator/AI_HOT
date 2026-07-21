@@ -20,6 +20,7 @@ def _text(entry: ElementTree.Element, name: str) -> str:
 
 class ArxivConnector(BaseConnector):
     id = "arxiv"
+    access_class = "public_no_billing"
     rights_policy_id = "arxiv-metadata-v1"
     platform = "arXiv"
     signal_family = "research"

@@ -14,6 +14,12 @@ def load_retention_days() -> dict[str, int]:
     path = Path(configured) if configured else Path(__file__).resolve().parents[3] / "config" / "rights_policies.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     values = {policy_id: int(policy["rawRetentionDays"]) for policy_id, policy in payload["policies"].items()}
+    configured_cap = os.getenv("RAW_EVIDENCE_RETENTION_DAYS", "").strip()
+    if configured_cap:
+        cap = int(configured_cap)
+        if cap < 0:
+            raise ValueError("RAW_EVIDENCE_RETENTION_DAYS must be non-negative")
+        values = {policy_id: min(days, cap) for policy_id, days in values.items()}
     if not values or any(days < 0 for days in values.values()):
         raise ValueError("rights policy retention must be non-negative")
     return values

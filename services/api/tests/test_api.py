@@ -381,7 +381,7 @@ def test_graph_and_source_capacity_contract() -> None:
         assert all(link["target"] == "event:evt-open-model" for link in graph["links"])
         sources = http.get("/api/v1/sources").json()
         assert sources["candidateCapacity"] == 500
-        assert sources["systemCapacity"] == 2000
+        assert sources["systemCapacity"] == 1000
         assert sources["counts"]["candidate"] > 0
         assert sources["sourceScorePolicy"]["rankingEnabled"] is False
         assert sources["sourceScorePolicy"]["autoPromotionEnabled"] is False

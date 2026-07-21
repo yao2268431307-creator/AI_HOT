@@ -10,6 +10,7 @@
   "connectors": [
     {
       "id": "rss",
+      "accessClass": "public_no_billing",
       "priority": "P0",
       "signalFamilies": ["official", "discussion"],
       "discovery": "registered feed list and sitemap/feed hints",
@@ -27,6 +28,7 @@
     },
     {
       "id": "hackernews",
+      "accessClass": "public_no_billing",
       "priority": "P0",
       "signalFamilies": ["discussion"],
       "discovery": "official top/new/best item identifiers",
@@ -44,6 +46,7 @@
     },
     {
       "id": "github",
+      "accessClass": "user_token_no_billing",
       "priority": "P0",
       "signalFamilies": ["behavior", "official"],
       "discovery": "search for configured topics plus followed repositories; prefer webhooks for followed repositories",
@@ -61,6 +64,7 @@
     },
     {
       "id": "huggingface",
+      "accessClass": "public_no_billing",
       "priority": "P0",
       "signalFamilies": ["behavior", "official"],
       "discovery": "Hub search plus explicitly followed model/repository IDs",
@@ -78,6 +82,7 @@
     },
     {
       "id": "arxiv",
+      "accessClass": "public_no_billing",
       "priority": "P0",
       "signalFamilies": ["research", "official"],
       "discovery": "configured cs.AI/cs.CL/cs.LG query",
@@ -95,6 +100,7 @@
     },
     {
       "id": "openalex",
+      "accessClass": "metered",
       "priority": "P0",
       "signalFamilies": ["research", "behavior"],
       "discovery": "configured works query and entity IDs",
@@ -112,6 +118,7 @@
     },
     {
       "id": "youtube",
+      "accessClass": "metered",
       "priority": "P1",
       "signalFamilies": ["discussion"],
       "discovery": "configured Data API search only after quota and compliance approval",
@@ -129,6 +136,7 @@
     },
     {
       "id": "bluesky",
+      "accessClass": "public_no_billing",
       "priority": "experimental",
       "signalFamilies": ["discussion"],
       "discovery": "legacy Jetstream filtered public post stream; AppView rechecks exact AT URI, CID and author DID for analyst context, but V1 keeps every Bluesky item discovery-only",
@@ -146,6 +154,7 @@
     },
     {
       "id": "x",
+      "accessClass": "restricted",
       "priority": "experimental",
       "signalFamilies": ["discussion"],
       "discovery": "official Recent Search only",

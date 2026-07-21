@@ -10,6 +10,7 @@ from .base import BaseConnector, utcnow
 
 class GitHubConnector(BaseConnector):
     id = "github"
+    access_class = "user_token_no_billing"
     rights_policy_id = "github-api-metadata-v1"
     platform = "GitHub"
     signal_family = "behavior"

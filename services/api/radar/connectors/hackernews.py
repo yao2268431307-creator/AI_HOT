@@ -10,6 +10,7 @@ from .base import BaseConnector, utcnow
 
 class HackerNewsConnector(BaseConnector):
     id = "hackernews"
+    access_class = "public_no_billing"
     rights_policy_id = "hn-official-api-v1"
     platform = "HN"
     signal_family = "discussion"
@@ -32,7 +33,8 @@ class HackerNewsConnector(BaseConnector):
             text = item.get("text", "") or title
             url = normalize_url(item.get("url") or f"https://news.ycombinator.com/item?id={item_id}")
             published = datetime.fromtimestamp(item.get("time", collected.timestamp()), tz=timezone.utc)
-            raw_ref = self.raw_ref(f"hn/{item_id}/{int(collected.timestamp())}.json")
+            date_path = collected.strftime("%Y/%m/%d")
+            raw_ref = self.raw_ref(f"hn/{date_path}/{item_id}/{int(collected.timestamp())}.json")
             await self.archive(raw_ref, json.dumps(item, ensure_ascii=False).encode())
             observations.append(Observation(
                 id=f"hn:{item_id}", platform=self.platform, externalId=str(item_id), sourceId=f"hn:{item.get('by','unknown')}",

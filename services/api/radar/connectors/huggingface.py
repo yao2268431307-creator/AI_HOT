@@ -11,6 +11,7 @@ from .base import BaseConnector, utcnow
 
 class HuggingFaceConnector(BaseConnector):
     id = "huggingface"
+    access_class = "public_no_billing"
     rights_policy_id = "hf-hub-metadata-v1"
     platform = "Hugging Face"
     signal_family = "behavior"

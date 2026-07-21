@@ -360,6 +360,36 @@ class InMemoryRepository:
                 "policyVersion": policy.version, "autoPromotionEnabled": policy.auto_promotion_enabled,
             }
 
+    def review_source_status(
+        self, source_id: str, status: str, actor_id: str, reason: str,
+    ) -> MutationReceipt:
+        policy = load_source_score_policy()
+        reviewed_at = utcnow()
+        with self._lock:
+            profile = self.source_profiles.get(source_id)
+            if profile is None:
+                raise KeyError(source_id)
+            previous = str(profile["status"])
+            if previous == status:
+                raise ValueError(f"source is already {status}")
+            if status == "active":
+                active_count = sum(item["status"] == "active" for item in self.source_profiles.values())
+                if active_count >= policy.active_capacity:
+                    raise ValueError("active source capacity reached")
+            profile["status"] = status
+            if status == "active":
+                profile["activatedAt"] = reviewed_at
+            self.source_promotion_facts.append({
+                "id": str(uuid.uuid4()), "sourceId": source_id,
+                "fromStatus": previous, "toStatus": status, "score": 0.0,
+                "policyVersion": policy.version, "policyDigest": source_score_policy_digest(policy),
+                "promotedAt": reviewed_at, "reviewedBy": actor_id,
+                "reviewReason": reason, "transitionKind": "manual_review",
+            })
+        return MutationReceipt(
+            id=source_id, status="completed", operation=f"source.review.{status}", createdAt=reviewed_at,
+        )
+
     def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
         with self._lock:
             state = self.observation_processing.get(observation_id)
@@ -1911,6 +1941,50 @@ class PostgresRepository:
             "activeBefore": active_count, "promotedEarlierToday": promoted_today,
             "policyVersion": policy.version, "autoPromotionEnabled": policy.auto_promotion_enabled,
         }
+
+    def review_source_status(
+        self, source_id: str, status: str, actor_id: str, reason: str,
+    ) -> MutationReceipt:
+        policy = load_source_score_policy()
+        if status not in {"candidate", "active", "paused", "blocked"}:
+            raise ValueError("unsupported source status")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT status,lead_score FROM sources WHERE id=%s FOR UPDATE",
+                    (source_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise KeyError(source_id)
+                previous, score = str(row[0]), float(row[1])
+                if previous == status:
+                    raise ValueError(f"source is already {status}")
+                if status == "active":
+                    cursor.execute("SELECT count(*) FROM sources WHERE status='active'")
+                    if int(cursor.fetchone()[0]) >= policy.active_capacity:
+                        raise ValueError("active source capacity reached")
+                cursor.execute(
+                    """UPDATE sources SET status=%s,
+                    activated_at=CASE WHEN %s='active' THEN clock_timestamp() ELSE activated_at END,
+                    updated_at=clock_timestamp() WHERE id=%s RETURNING updated_at""",
+                    (status, status, source_id),
+                )
+                reviewed_at = cursor.fetchone()[0]
+                cursor.execute(
+                    """INSERT INTO source_promotion_facts
+                    (source_id,from_status,to_status,score,policy_version,policy_digest,promoted_at,
+                     reviewed_by,review_reason,transition_kind)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'manual_review')""",
+                    (
+                        source_id, previous, status, score, policy.version,
+                        source_score_policy_digest(policy), reviewed_at, actor_id, reason,
+                    ),
+                )
+            connection.commit()
+        return MutationReceipt(
+            id=source_id, status="completed", operation=f"source.review.{status}", createdAt=reviewed_at,
+        )
 
     def claim_observation_processing(self, observation_id: str, lease_seconds: int = 300) -> int | None:
         with self.connection() as connection:
@@ -3608,7 +3682,7 @@ class PostgresRepository:
                       CROSS JOIN LATERAL unnest(events.superseded_by) AS successor(event_id)
                     )
                     INSERT INTO watchlists (id,workspace_id,actor_id,event_id,note,created_at)
-                    SELECT gen_random_uuid(),%s,actor_id,event_id,note,created_at FROM watched
+                    SELECT gen_random_uuid(),%s,watched.actor_id,watched.event_id,watched.note,watched.created_at FROM watched
                     JOIN events ON events.id=watched.event_id
                     WHERE cardinality(events.superseded_by)=0
                     ON CONFLICT (workspace_id,event_id) DO NOTHING""",

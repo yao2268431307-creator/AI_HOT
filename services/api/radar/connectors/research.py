@@ -11,6 +11,7 @@ from .base import BaseConnector, utcnow
 
 class OpenAlexConnector(BaseConnector):
     id = "openalex"
+    access_class = "metered"
     rights_policy_id = "openalex-metadata-v1"
     platform = "OpenAlex"
     signal_family = "research"

@@ -32,6 +32,7 @@ def _published(value: str) -> datetime:
 
 class RSSConnector(BaseConnector):
     id = "rss"
+    access_class = "public_no_billing"
     rights_policy_id = "rss-public-metadata-v1"
     platform = "RSS"
     signal_family = "official"
@@ -52,7 +53,8 @@ class RSSConnector(BaseConnector):
                 response = await self.get(feed_url)
                 if len(response.content) > 5_000_000:
                     raise ConnectorError("RSS document exceeds the 5 MB safety limit")
-                batch_ref = self.raw_ref(f"rss/{source_id}/{int(collected_at.timestamp())}.xml")
+                date_path = collected_at.strftime("%Y/%m/%d")
+                batch_ref = self.raw_ref(f"rss/{date_path}/{source_id}/{int(collected_at.timestamp())}.xml")
                 await self.archive(batch_ref, response.content, response.headers.get("content-type", "application/xml"))
                 root = ElementTree.fromstring(response.content)
             except Exception as exc:

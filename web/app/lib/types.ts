@@ -172,6 +172,33 @@ export interface RadarPayload {
   hasMore: boolean;
 }
 
+export interface RuntimeHealth {
+  status: "ok";
+  runtimeProfile: "demo" | "local" | "production";
+  localReady: boolean;
+  freeOnlyMode: boolean;
+  redisConfigured: boolean;
+  r2Configured: boolean;
+  enabledConnectors: string[];
+  lastCollectionStartedAt?: string | null;
+  lastCollectionFinishedAt?: string | null;
+  lastCollectionDurationSeconds?: number | null;
+  embedding: {
+    backend?: string;
+    model?: string;
+    state: "not_started" | "not_loaded" | "ready" | "degraded" | "disabled";
+    device?: string;
+    lastError?: string | null;
+  };
+  evidenceStorage?: {
+    backend?: string;
+    root?: string;
+    usedBytes?: number;
+    maxBytes?: number;
+    capacityState?: "healthy" | "limited";
+  } | null;
+}
+
 export type SourceStatus = "candidate" | "active" | "paused" | "blocked";
 
 export interface SourceProfile {

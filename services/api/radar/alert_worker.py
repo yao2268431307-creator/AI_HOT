@@ -44,11 +44,13 @@ class AlertDispatcher:
         signing_secret: str,
         signing_key_id: str = "primary",
         client: httpx.AsyncClient | None = None,
+        allow_webhooks: bool = True,
     ) -> None:
         self.repository = repository
         self.signing_secret = signing_secret
         self.signing_key_id = signing_key_id
         self.client = client
+        self.allow_webhooks = allow_webhooks
 
     @staticmethod
     def _verified_evidence(event: RadarEvent) -> list[Evidence]:
@@ -77,7 +79,7 @@ class AlertDispatcher:
         rule: AlertRuleRequest,
         idempotency_key: str,
     ) -> None:
-        if not rule.webhook_url:
+        if not rule.webhook_url or not self.allow_webhooks:
             return
         if not self.signing_secret:
             raise RuntimeError("WEBHOOK_SIGNING_SECRET is required for webhook rules")
@@ -191,14 +193,14 @@ class AlertDispatcher:
                 # Low-evidence events stay in the review queue even when a
                 # workspace rule was configured too permissively.
                 verified_evidence = self._verified_evidence(event)
-                if event.evidence_strength.value == "low" or len(verified_evidence) < 3:
+                if event.evidence_strength.value == "low" or event.coverage < 60 or len(verified_evidence) < 3:
                     skipped += 1
                     continue
                 decision: AlertDecision = policy.evaluate(candidate)
                 if not decision.allowed:
                     skipped += 1
                     continue
-                channel = "webhook" if rule.webhook_url else "in_app"
+                channel = "webhook" if rule.webhook_url and self.allow_webhooks else "in_app"
                 delivery = {
                     "ruleId": rule_id, "workspaceId": workspace_id, "eventId": event.id,
                     "domain": event.event_type.value, "lifecycleState": event.state.value,
@@ -249,6 +251,99 @@ class AlertDispatcher:
                 )
                 aborted += 1
         return aborted
+
+
+@dataclass(frozen=True, slots=True)
+class LocalDispatchResult:
+    processed: int
+    failed: int
+
+
+class PostgresOutboxDispatcher:
+    """Consume the durable outbox directly for the single-node local profile."""
+
+    def __init__(
+        self,
+        dsn: str,
+        dispatcher: AlertDispatcher,
+        workspace_ids: list[str],
+        *,
+        deletion_consumer: SourceDeletionConsumer | None = None,
+    ) -> None:
+        self.dsn = dsn
+        self.dispatcher = dispatcher
+        self.workspace_ids = workspace_ids
+        self.deletion_consumer = deletion_consumer
+
+    async def dispatch_batch(self, limit: int = 200) -> LocalDispatchResult:
+        import psycopg
+
+        if limit < 1 or limit > 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        processed = failed = attempted = 0
+        with psycopg.connect(self.dsn) as connection:
+            # Observation/metric outbox rows do not have local subscribers.
+            # Score rows also become no-ops until the user creates an in-app
+            # rule. A single durable update avoids thousands of one-row
+            # transactions on a new local database with historical backlog.
+            has_alert_rules = any(
+                self.dispatcher.repository.list_alert_rules(workspace_id)
+                for workspace_id in self.workspace_ids
+            )
+            actionable_kinds = ["source.erased"]
+            if has_alert_rules:
+                actionable_kinds.append("score.created")
+            with connection.transaction(), connection.cursor() as cursor:
+                cursor.execute(
+                    """WITH ignored AS (
+                        SELECT id FROM outbox
+                        WHERE published_at IS NULL AND NOT (kind = ANY(%s))
+                        ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT %s
+                    )
+                    UPDATE outbox SET published_at=now(),attempts=attempts+1,last_error=NULL
+                    FROM ignored WHERE outbox.id=ignored.id RETURNING outbox.id""",
+                    (actionable_kinds, limit),
+                )
+                ignored = len(cursor.fetchall())
+                processed += ignored
+                attempted += ignored
+            while attempted < limit:
+                with connection.transaction(), connection.cursor() as cursor:
+                    cursor.execute(
+                        """SELECT id,kind,aggregate_id,payload FROM outbox
+                        WHERE published_at IS NULL
+                        ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""",
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        break
+                    outbox_id, kind, aggregate_id, payload = row
+                    attempted += 1
+                    try:
+                        if kind == "score.created":
+                            await self.dispatcher.dispatch_event(
+                                str(aggregate_id), self.workspace_ids,
+                                delivery_key=str(outbox_id),
+                            )
+                        elif kind == "source.erased" and self.deletion_consumer:
+                            await self.deletion_consumer.handle(payload)
+                        cursor.execute(
+                            """UPDATE outbox SET published_at=now(),attempts=attempts+1,last_error=NULL
+                            WHERE id=%s AND published_at IS NULL""",
+                            (outbox_id,),
+                        )
+                        processed += 1
+                    except Exception as exc:  # durable retry on the next cycle
+                        cursor.execute(
+                            """UPDATE outbox SET attempts=attempts+1,last_error=%s
+                            WHERE id=%s AND published_at IS NULL""",
+                            (str(exc)[:1000], outbox_id),
+                        )
+                        failed += 1
+                        # Preserve ordering and retry this durable row once in
+                        # the next scheduler cycle instead of hot-looping it.
+                        break
+        return LocalDispatchResult(processed, failed)
 
 
 class RedisAlertWorker:

@@ -12,13 +12,13 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from . import __version__
 from .assessment import event_assessment
 from .auth import Principal, Role, current_principal, jwt_configuration_ready, require_role
-from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, EventType, FeedbackRequest, MetricIncidentRequest, MutationReceipt, ProductInteractionRequest, RadarPayload, WatchlistRequest
+from .contracts import AlertRuleRequest, BehaviorApplicabilityRequest, ClusterEditRequest, EventType, FeedbackRequest, MetricIncidentRequest, MutationReceipt, ProductInteractionRequest, RadarPayload, SourceReviewRequest, WatchlistRequest
 from .fixtures import seed_repository
 from .product_metrics import beta_product_metrics, load_product_metric_policy, review_funnel
 from .source_discovery import (
@@ -28,6 +28,8 @@ from .source_discovery import (
 from .scoring import replay_score_payload
 from .storage import InMemoryRepository, PostgresRepository, score_cycle
 from .connectors.base import ConnectorError, ensure_safe_public_url_resolved
+from .evidence_store import LocalEvidenceStore
+from .runtime import RuntimeProfile, free_only_mode, runtime_profile, validate_local_access_configuration
 
 
 def _prometheus_label(value: object) -> str:
@@ -84,8 +86,10 @@ def _image_digests(variable_name: str) -> dict[str, str]:
 
 
 def create_app(repository: InMemoryRepository | PostgresRepository | None = None) -> FastAPI:
+    profile = runtime_profile()
+    validate_local_access_configuration()
     if repository is None:
-        production_dsn = os.getenv("DATABASE_URL") if os.getenv("DEMO_MODE", "true").lower() == "false" else None
+        production_dsn = os.getenv("DATABASE_URL") if profile is not RuntimeProfile.DEMO else None
         repository = PostgresRepository(production_dsn) if production_dsn else InMemoryRepository()
     repo = seed_repository(repository) if isinstance(repository, InMemoryRepository) else repository
     app = FastAPI(title="SIGNAL//AI Radar API", version=__version__, docs_url="/docs")
@@ -94,6 +98,10 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
     app.state.repository = repo
     app.state.http_status_classes = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
     app.state.http_durations_seconds = deque(maxlen=2048)
+    app.state.local_evidence_store = (
+        LocalEvidenceStore(os.getenv("RAW_EVIDENCE_LOCAL_DIR", ".data/evidence"))
+        if profile is RuntimeProfile.LOCAL else None
+    )
 
     @app.middleware("http")
     async def observe_http(request: Request, call_next):
@@ -186,7 +194,11 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         auth_mode = os.getenv("RADAR_AUTH_MODE", "api_keys")
         jwt_ready = jwt_configuration_ready()
         now = datetime.now(timezone.utc)
-        required_components = {"scheduler", "collector-worker", "retention-worker", "outbox-publisher", "alert-consumer"}
+        required_components = (
+            {"scheduler", "collector-worker", "retention-worker", "local-outbox-dispatcher"}
+            if profile is RuntimeProfile.LOCAL
+            else {"scheduler", "collector-worker", "retention-worker", "outbox-publisher", "alert-consumer"}
+        )
         runtime_rows = attestation.get("runtimeComponents", [])
         fresh_components: set[str] = set()
         fresh_component_details: dict[str, dict[str, object]] = {}
@@ -210,6 +222,11 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         )
         collector_details = fresh_component_details.get("collector-worker", {})
         alert_details = fresh_component_details.get("alert-consumer", {})
+        local_evidence_status = (
+            app.state.local_evidence_store.status()
+            if isinstance(app.state.local_evidence_store, LocalEvidenceStore)
+            else None
+        )
 
         def dependency_probe_is_fresh(details: dict[str, object]) -> bool:
             try:
@@ -274,6 +291,11 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             and release_images_pinned
             and budget_reconciliation_pending == 0
         )
+        local_ready = (
+            profile is RuntimeProfile.LOCAL
+            and attestation.get("storageBackend") == "postgresql"
+            and required_components <= fresh_components
+        )
         return {
             "status": "ok", "version": __version__, "events": len(repo.list_events()),
             "time": datetime.now(timezone.utc).isoformat(), **attestation,
@@ -293,6 +315,15 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             "releaseImageDigests": release_image_digests,
             "actualImageDigests": actual_image_digests,
             "productionReady": production_ready,
+            "localReady": local_ready,
+            "runtimeProfile": profile.value,
+            "freeOnlyMode": free_only_mode(),
+            "enabledConnectors": collector_details.get("enabledConnectors", []),
+            "embedding": collector_details.get("embedding", {"state": "not_started"}),
+            "evidenceStorage": collector_details.get("evidenceStorage", local_evidence_status),
+            "lastCollectionStartedAt": collector_details.get("lastCycleStartedAt"),
+            "lastCollectionFinishedAt": collector_details.get("lastCycleFinishedAt"),
+            "lastCollectionDurationSeconds": collector_details.get("lastCycleDurationSeconds"),
         }
 
     @app.get("/health")
@@ -300,16 +331,18 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         return {
             "status": "ok", "version": __version__,
             "time": datetime.now(timezone.utc).isoformat(),
+            "runtimeProfile": profile.value,
         }
 
     @app.get("/health/ready")
     async def readiness() -> JSONResponse:
         payload = runtime_health_details()
-        production = os.getenv("DEMO_MODE", "true").lower() == "false"
+        production = profile is RuntimeProfile.PRODUCTION
         status_code = 200 if not production or payload["productionReady"] is True else 503
         return JSONResponse(status_code=status_code, content={
             "status": "ready" if status_code == 200 else "not_ready",
-            "version": __version__, "productionReady": payload["productionReady"],
+            "version": __version__, "runtimeProfile": profile.value,
+            "productionReady": payload["productionReady"], "localReady": payload["localReady"],
         })
 
     @app.get("/api/v1/operations/runtime-health")
@@ -548,6 +581,34 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         event = require_event(event_id)
         assessment_value = event_assessment(event)
         return {"eventId": event_id, "items": [item.model_dump(mode="json", by_alias=True) for item in event.evidence], "missingEvidence": [gap.model_dump(mode="json") for gap in assessment_value.missing_evidence], "evidenceMask": assessment_value.evidence_mask}
+
+    @app.get("/api/v1/events/{event_id}/evidence/{evidence_id}/raw", include_in_schema=False)
+    async def raw_event_evidence(
+        event_id: str,
+        evidence_id: str,
+        _: Principal = Depends(current_principal),
+    ) -> Response:
+        if profile is not RuntimeProfile.LOCAL or not isinstance(app.state.local_evidence_store, LocalEvidenceStore):
+            raise HTTPException(404, "local raw evidence is unavailable")
+        require_event(event_id)
+        observation = next(
+            (
+                item for item in repo.list_event_observations(event_id)
+                if f"{event_id}:{item.id}" == evidence_id
+            ),
+            None,
+        )
+        if observation is None or not observation.raw_evidence_ref:
+            raise HTTPException(404, "raw evidence not found")
+        try:
+            body = await app.state.local_evidence_store.get(observation.raw_evidence_ref)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(404, "raw evidence not found") from exc
+        suffix = observation.raw_evidence_ref.rsplit(".", 1)[-1].lower()
+        media_type = {
+            "json": "application/json", "xml": "application/xml", "txt": "text/plain",
+        }.get(suffix, "application/octet-stream")
+        return Response(body, media_type=media_type, headers={"Cache-Control": "private, no-store"})
 
     @app.get("/api/v1/events/{event_id}/members")
     async def event_members(event_id: str, principal: Principal = Depends(current_principal)):
@@ -831,6 +892,27 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         require_global_governance(principal)
         return repo.promote_source_candidates()
 
+    @app.post("/api/v1/sources/{source_id}/review", response_model=MutationReceipt, response_model_by_alias=True)
+    async def review_source(
+        source_id: str,
+        request: SourceReviewRequest,
+        principal: Principal = Depends(current_principal),
+    ) -> MutationReceipt:
+        require_role(principal, Role.OWNER)
+        if profile is RuntimeProfile.PRODUCTION:
+            require_global_governance(principal)
+        try:
+            return repo.review_source_status(
+                source_id,
+                request.status,
+                principal.subject,
+                request.reason,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "source not found") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.get("/api/v1/connectors")
     async def connectors(_: Principal = Depends(current_principal)):
         values = list(repo.connectors.values()) if isinstance(repo, InMemoryRepository) else repo.list_connectors()
@@ -984,6 +1066,8 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
     @app.post("/api/v1/alerts/rules", response_model=MutationReceipt, response_model_by_alias=True, status_code=201, include_in_schema=False)
     async def alerts(request: AlertRuleRequest, principal: Principal = Depends(current_principal)) -> MutationReceipt:
         require_role(principal, Role.ANALYST)
+        if profile is RuntimeProfile.LOCAL and request.webhook_url:
+            raise HTTPException(422, "local profile supports in-app alerts only")
         if request.webhook_url:
             try:
                 await ensure_safe_public_url_resolved(str(request.webhook_url))

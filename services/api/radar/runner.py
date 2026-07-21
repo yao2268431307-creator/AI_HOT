@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from redis.asyncio import Redis
 
@@ -17,12 +18,15 @@ from .connectors.bluesky import DEFAULT_AI_KEYWORDS
 from .outbox import RedisOutboxPublisher
 from .processor import EventProcessor
 from .evidence_store import LocalEvidenceStore, RawEvidenceStore, S3EvidenceStore
-from .embeddings import BgeM3Provider
+from .embeddings import BgeM3Provider, EmbeddingProvider, LocalBgeM3Provider
 from .storage import InMemoryRepository, PostgresRepository
 from .worker import CollectorWorker
 from .identities import SourceIdentityResolver
 from .retention import RawEvidenceRetentionWorker
 from .auth import jwt_configuration_ready
+from .alert_worker import AlertDispatcher, PostgresOutboxDispatcher
+from .deletion import SourceDeletionConsumer
+from .runtime import RuntimeProfile, free_only_mode, runtime_profile, validate_local_access_configuration
 
 
 def parse_budget_limits(variable_name: str) -> dict[str, float]:
@@ -127,7 +131,23 @@ async def probe_runtime_dependencies(
 
 def validate_runtime_configuration() -> bool:
     """Fail closed when a production runner would silently use local substitutes."""
-    production = os.getenv("DEMO_MODE", "true").lower() == "false"
+    profile = runtime_profile()
+    if profile is RuntimeProfile.LOCAL:
+        validate_local_access_configuration()
+        dsn = os.getenv("DATABASE_URL", "").strip()
+        if not dsn:
+            raise RuntimeError("local runner requires DATABASE_URL")
+        host = urlsplit(dsn).hostname
+        if host not in {"localhost", "127.0.0.1", "::1"}:
+            raise RuntimeError("local runner DATABASE_URL must use a loopback PostgreSQL host")
+        if os.getenv("AUTH_REQUIRED", "false").lower() == "true":
+            raise RuntimeError("local single-user profile requires AUTH_REQUIRED=false")
+        if float(os.getenv("EXTERNAL_DATA_BUDGET_RMB", "0")) != 0:
+            raise RuntimeError("local free-only profile requires EXTERNAL_DATA_BUDGET_RMB=0")
+        if any(os.getenv(name) for name in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")):
+            raise RuntimeError("local profile does not accept R2 credentials")
+        return False
+    production = profile is RuntimeProfile.PRODUCTION
     if not production:
         return False
     required = (
@@ -165,7 +185,12 @@ def validate_runtime_configuration() -> bool:
 
 
 def build_evidence_store() -> RawEvidenceStore:
-    if os.getenv("R2_ENDPOINT_URL") and os.getenv("R2_ACCESS_KEY_ID") and os.getenv("R2_SECRET_ACCESS_KEY"):
+    if (
+        runtime_profile() is not RuntimeProfile.LOCAL
+        and os.getenv("R2_ENDPOINT_URL")
+        and os.getenv("R2_ACCESS_KEY_ID")
+        and os.getenv("R2_SECRET_ACCESS_KEY")
+    ):
         return S3EvidenceStore(
             os.environ["R2_ENDPOINT_URL"],
             os.environ["R2_ACCESS_KEY_ID"],
@@ -177,50 +202,121 @@ def build_evidence_store() -> RawEvidenceStore:
 
 def build_connectors(evidence_store: RawEvidenceStore | None = None) -> list[BaseConnector]:
     evidence_store = evidence_store or build_evidence_store()
-    connectors: list[BaseConnector] = [
-        HackerNewsConnector(max_items=int(os.getenv("HN_MAX_ITEMS", "30")), evidence_store=evidence_store),
-        GitHubConnector(query=os.getenv("GITHUB_QUERY", "topic:artificial-intelligence"), token=os.getenv("GITHUB_TOKEN") or None, evidence_store=evidence_store),
-        HuggingFaceConnector(search=os.getenv("HF_SEARCH", ""), evidence_store=evidence_store),
-        ArxivConnector(query=os.getenv("ARXIV_QUERY", "cat:cs.AI OR cat:cs.CL OR cat:cs.LG"), evidence_store=evidence_store),
-        OpenAlexConnector(
+    default_ids = (
+        "rss,hackernews,github,huggingface,arxiv,bluesky"
+        if runtime_profile() is RuntimeProfile.LOCAL
+        else "rss,hackernews,github,huggingface,arxiv,openalex"
+    )
+    explicitly_enabled = os.getenv("ENABLED_CONNECTORS")
+    enabled = {
+        value.strip().lower()
+        for value in (explicitly_enabled or default_ids).split(",")
+        if value.strip()
+    }
+    if explicitly_enabled is None and runtime_profile() is not RuntimeProfile.LOCAL:
+        if os.getenv("BLUESKY_JETSTREAM_ENABLED", "false").lower() == "true":
+            enabled.add("bluesky")
+        if os.getenv("YOUTUBE_API_KEY"):
+            enabled.add("youtube")
+    supported = {"rss", "hackernews", "github", "huggingface", "arxiv", "bluesky", "openalex", "youtube"}
+    unknown = sorted(enabled - supported)
+    if unknown:
+        raise RuntimeError(f"unknown ENABLED_CONNECTORS values: {', '.join(unknown)}")
+    connectors: list[BaseConnector] = []
+    feeds_path = Path(os.getenv("RSS_FEEDS_FILE", "config/feeds.local.json"))
+    if "rss" in enabled and feeds_path.exists():
+        rows = json.loads(feeds_path.read_text(encoding="utf-8"))
+        feeds = [(row["sourceId"], row["url"], row.get("signalFamily", "official")) for row in rows]
+        connectors.append(RSSConnector(feeds, evidence_store=evidence_store))
+    if "hackernews" in enabled:
+        connectors.append(HackerNewsConnector(max_items=int(os.getenv("HN_MAX_ITEMS", "30")), evidence_store=evidence_store))
+    if "github" in enabled:
+        connectors.append(GitHubConnector(query=os.getenv("GITHUB_QUERY", "topic:artificial-intelligence"), token=os.getenv("GITHUB_TOKEN") or None, evidence_store=evidence_store))
+    if "huggingface" in enabled:
+        connectors.append(HuggingFaceConnector(
+            search=os.getenv("HF_SEARCH", ""),
+            max_attempts=int(os.getenv("HF_MAX_ATTEMPTS", "1" if runtime_profile() is RuntimeProfile.LOCAL else "3")),
+            request_timeout_seconds=float(os.getenv("HF_REQUEST_TIMEOUT_SECONDS", "8" if runtime_profile() is RuntimeProfile.LOCAL else "15")),
+            evidence_store=evidence_store,
+        ))
+    if "arxiv" in enabled:
+        connectors.append(ArxivConnector(query=os.getenv("ARXIV_QUERY", "cat:cs.AI OR cat:cs.CL OR cat:cs.LG"), evidence_store=evidence_store))
+    if "openalex" in enabled:
+        connectors.append(OpenAlexConnector(
             search=os.getenv("OPENALEX_SEARCH", "artificial intelligence"),
             api_key=os.getenv("OPENALEX_API_KEY") or None,
             mailto=os.getenv("OPENALEX_MAILTO") or None,
             evidence_store=evidence_store,
-        ),
-    ]
-    feeds_path = Path(os.getenv("RSS_FEEDS_FILE", "config/feeds.local.json"))
-    if feeds_path.exists():
-        rows = json.loads(feeds_path.read_text(encoding="utf-8"))
-        feeds = [(row["sourceId"], row["url"], row.get("signalFamily", "official")) for row in rows]
-        connectors.insert(0, RSSConnector(feeds, evidence_store=evidence_store))
-    if os.getenv("YOUTUBE_API_KEY"):
+        ))
+    if "youtube" in enabled and os.getenv("YOUTUBE_API_KEY"):
         connectors.append(YouTubeConnector(os.environ["YOUTUBE_API_KEY"], query=os.getenv("YOUTUBE_QUERY", "AI model"), evidence_store=evidence_store))
-    if os.getenv("BLUESKY_JETSTREAM_ENABLED", "false").lower() == "true":
+    if "bluesky" in enabled and os.getenv("BLUESKY_JETSTREAM_ENABLED", "false").lower() == "true":
         keywords = tuple(
             value.strip() for value in os.getenv("BLUESKY_AI_KEYWORDS", "").split(",") if value.strip()
         )
+        endpoints = tuple(value.strip() for value in os.getenv(
+            "BLUESKY_JETSTREAM_ENDPOINTS",
+            "wss://jetstream2.us-west.bsky.network/subscribe,wss://jetstream1.us-west.bsky.network/subscribe,"
+            "wss://jetstream2.us-east.bsky.network/subscribe,wss://jetstream1.us-east.bsky.network/subscribe",
+        ).split(",") if value.strip())
+        if not endpoints:
+            raise RuntimeError("BLUESKY_JETSTREAM_ENDPOINTS must include at least one public endpoint")
         connectors.append(BlueskyJetstreamConnector(
-            endpoint=os.getenv("BLUESKY_JETSTREAM_ENDPOINT", "wss://jetstream2.us-east.bsky.network/subscribe"),
+            endpoint=endpoints[0],
+            fallback_endpoints=endpoints[1:],
             appview_endpoint=os.getenv("BLUESKY_APPVIEW_ENDPOINT", "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts"),
             keywords=keywords or DEFAULT_AI_KEYWORDS,
+            max_attempts=len(endpoints),
             max_messages=int(os.getenv("BLUESKY_MAX_MESSAGES", "500")),
             idle_timeout_seconds=float(os.getenv("BLUESKY_IDLE_TIMEOUT_SECONDS", "3")),
             evidence_store=evidence_store,
         ))
+    if free_only_mode():
+        allowed = {"public_no_billing", "user_token_no_billing"}
+        blocked = sorted(connector.id for connector in connectors if connector.access_class not in allowed)
+        if blocked:
+            raise RuntimeError(
+                "FREE_ONLY_MODE blocks non-free connectors: " + ", ".join(blocked),
+            )
+        for connector in connectors:
+            connector.estimated_cost_per_request_rmb = 0.0
     return connectors
+
+
+def build_embedding_provider() -> EmbeddingProvider | None:
+    backend = os.getenv(
+        "EMBEDDING_BACKEND",
+        "local_bge_m3" if runtime_profile() is RuntimeProfile.LOCAL else "remote_http",
+    ).strip().lower()
+    if backend in {"", "none", "disabled"}:
+        return None
+    if backend == "local_bge_m3":
+        return LocalBgeM3Provider(
+            model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
+            dimensions=int(os.getenv("BGE_M3_DIMENSIONS", "1024")),
+            device=os.getenv("EMBEDDING_DEVICE", "auto"),
+            batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "8")),
+            cache_dir=os.getenv("EMBEDDING_CACHE_DIR", ".data/models/bge-m3"),
+            retry_cooldown_seconds=float(os.getenv("EMBEDDING_RETRY_COOLDOWN_SECONDS", "3600")),
+            local_files_only=os.getenv("EMBEDDING_LOCAL_FILES_ONLY", "true").lower() == "true",
+        )
+    if backend == "remote_http":
+        if not os.getenv("BGE_M3_BASE_URL"):
+            return None
+        return BgeM3Provider(
+            os.environ["BGE_M3_BASE_URL"], api_key=os.getenv("BGE_M3_API_KEY") or None,
+            model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
+            dimensions=int(os.getenv("BGE_M3_DIMENSIONS", "1024")),
+        )
+    raise RuntimeError("EMBEDDING_BACKEND must be local_bge_m3, remote_http, or disabled")
 
 
 async def run(*, once: bool, interval_seconds: int) -> None:
     production = validate_runtime_configuration()
+    profile = runtime_profile()
     dsn = os.getenv("DATABASE_URL")
-    repository = PostgresRepository(dsn) if dsn else InMemoryRepository()
-    embedding_provider = None
-    if os.getenv("BGE_M3_BASE_URL"):
-        embedding_provider = BgeM3Provider(
-            os.environ["BGE_M3_BASE_URL"], api_key=os.getenv("BGE_M3_API_KEY") or None,
-            dimensions=int(os.getenv("BGE_M3_DIMENSIONS", "1024")),
-        )
+    repository = PostgresRepository(dsn) if profile is not RuntimeProfile.DEMO and dsn else InMemoryRepository()
+    embedding_provider = build_embedding_provider()
     identities_path = Path(os.getenv("SOURCE_IDENTITIES_FILE", "config/source_identities.local.json"))
     identity_resolver = SourceIdentityResolver.from_json_file(identities_path) if identities_path.exists() else SourceIdentityResolver()
     processor = EventProcessor(repository, embedding_provider)
@@ -234,14 +330,36 @@ async def run(*, once: bool, interval_seconds: int) -> None:
         )
     worker = CollectorWorker(
         repository, connectors, processor, identity_resolver,
-        monthly_budget_limit=float(os.getenv("EXTERNAL_DATA_BUDGET_RMB", "2000")),
+        monthly_budget_limit=(
+            None if profile is RuntimeProfile.LOCAL and free_only_mode()
+            else float(os.getenv("EXTERNAL_DATA_BUDGET_RMB", "2000"))
+        ),
         connector_budget_limits=connector_budget_limits,
         signal_family_budget_limits=signal_family_budget_limits,
         base_external_spend=float(os.getenv("EXTERNAL_DATA_SPEND_RMB", "0")),
+        allow_unapproved_rights_for_nonproduction=profile is RuntimeProfile.LOCAL,
     )
     retention_worker = RawEvidenceRetentionWorker(repository, evidence_store)
-    redis: Redis | None = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True) if dsn and os.getenv("REDIS_URL") else None
+    redis: Redis | None = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True) if production and dsn and os.getenv("REDIS_URL") else None
     publisher = RedisOutboxPublisher(dsn, redis) if dsn and redis else None
+    local_dispatcher: PostgresOutboxDispatcher | None = None
+    if profile is RuntimeProfile.LOCAL and dsn and isinstance(repository, PostgresRepository):
+        class LocalCacheInvalidator:
+            async def invalidate(self, tags: list[str]) -> None:
+                processor.invalidate_events([
+                    tag.split(":", 1)[1] for tag in tags if tag.startswith("event:")
+                ])
+
+        workspace_ids = [
+            value.strip() for value in os.getenv("RADAR_WORKSPACE_IDS", "local-workspace").split(",")
+            if value.strip()
+        ]
+        local_dispatcher = PostgresOutboxDispatcher(
+            dsn,
+            AlertDispatcher(repository, signing_secret="", allow_webhooks=False),
+            workspace_ids,
+            deletion_consumer=SourceDeletionConsumer(evidence_store, LocalCacheInvalidator()),
+        )
     if production and (not isinstance(repository, PostgresRepository) or redis is None or publisher is None or isinstance(evidence_store, LocalEvidenceStore)):
         raise RuntimeError("production runner cannot use in-memory, local evidence, or publisher-less fallbacks")
     redis_verified = False
@@ -310,6 +428,11 @@ async def run(*, once: bool, interval_seconds: int) -> None:
                 "redisVerified": redis_verified, "r2ReadWriteVerified": r2_verified,
                 "dependencyProbeAt": dependency_probe_at.isoformat(),
                 "dependencyProbeFailures": dependency_failures,
+                "runtimeProfile": profile.value,
+                "embedding": embedding_provider.status() if embedding_provider else {"state": "disabled"},
+                "evidenceStorage": evidence_store.status() if isinstance(evidence_store, LocalEvidenceStore) else {"backend": "r2"},
+                "enabledConnectors": [connector.id for connector in connectors],
+                "freeOnlyMode": free_only_mode(),
             }
             repository.heartbeat_runtime_component("collector-worker", instance_id, cycle_details)
             print(json.dumps({
@@ -338,6 +461,22 @@ async def run(*, once: bool, interval_seconds: int) -> None:
                 )
                 print(json.dumps({
                     "level": "info", "event": "outbox_publish_completed", "published": published,
+                }, ensure_ascii=False))
+            if local_dispatcher:
+                dispatched = await local_dispatcher.dispatch_batch(
+                    limit=int(os.getenv("LOCAL_OUTBOX_BATCH_SIZE", "5000")),
+                )
+                repository.heartbeat_runtime_component(
+                    "local-outbox-dispatcher", instance_id,
+                    {
+                        "intervalSeconds": interval_seconds,
+                        "lastProcessed": dispatched.processed,
+                        "lastFailed": dispatched.failed,
+                    },
+                )
+                print(json.dumps({
+                    "level": "info", "event": "local_outbox_dispatch_completed",
+                    "processed": dispatched.processed, "failed": dispatched.failed,
                 }, ensure_ascii=False))
             if once:
                 break

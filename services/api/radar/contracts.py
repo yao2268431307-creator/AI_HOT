@@ -380,6 +380,11 @@ class AlertRuleRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SourceReviewRequest(BaseModel):
+    status: Literal["candidate", "active", "paused", "blocked"]
+    reason: str = Field(min_length=3, max_length=1000)
+
+
 class WatchlistRequest(BaseModel):
     event_id: str = Field(alias="eventId")
     note: str | None = Field(default=None, max_length=500)

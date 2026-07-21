@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from .clustering import ClusterCandidate, choose_cluster, entities
 from .contracts import Evidence, EvidenceState, EventType, LifecycleState, MetricPoint, Observation, RadarEvent, StoredScore, StructureLabel
-from .embeddings import BgeM3Provider
+from .embeddings import EmbeddingProvider
 from .feature_registry import feature_registry_identity
 from .metrics import Baseline, SignalSnapshot, aggregate_metrics, to_score_input
 from .normalize import canonical_text, normalize_url, sanitize_external_text
@@ -151,12 +151,24 @@ def _inactive_hours(points: list[MetricPoint], bucket_at: datetime, current_atte
 class EventProcessor:
     """Connect collected observations to clustering, metrics, scoring and persistence."""
 
-    def __init__(self, repository: InMemoryRepository | PostgresRepository, embedding_provider: BgeM3Provider | None = None) -> None:
+    def __init__(self, repository: InMemoryRepository | PostgresRepository, embedding_provider: EmbeddingProvider | None = None) -> None:
         self.repository = repository
         self.embedding_provider = embedding_provider
         self._event_embeddings: dict[str, list[float]] = {}
         self._event_embedding_titles: dict[str, str] = {}
         self._process_lock = asyncio.Lock()
+
+    def _embedding_status(self) -> dict[str, object]:
+        if self.embedding_provider is None:
+            return {"state": "disabled"}
+        status = getattr(self.embedding_provider, "status", None)
+        if callable(status):
+            return status()
+        return {
+            "state": "ready",
+            "model": self.embedding_provider.model,
+            "dimensions": self.embedding_provider.dimensions,
+        }
 
     def _record_baseline(self, event_id: str, event_type: EventType, snapshots: list[SignalSnapshot]) -> None:
         for snapshot in snapshots:
@@ -566,6 +578,9 @@ class EventProcessor:
             "evidencePolicyVersion": EVIDENCE_POLICY_VERSION,
             "labelPolicyVersion": LABEL_POLICY_VERSION,
             "identityVersion": "identity-account-fallback-v1",
+            "embedding": (
+                self._embedding_status()
+            ),
         }
         digest = hashlib.sha256(json.dumps(digest_material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         input_digest = f"sha256:{digest}"
@@ -605,6 +620,11 @@ class EventProcessor:
         result = score_event(score_input, hours_since_first_seen=hours_since_first_seen)
         stable_labels = self._stable_labels(event_id, current, result.labels, bucket_at)
 
+        embedding_status = self._embedding_status()
+        embedding_degraded = embedding_status.get("state") == "degraded"
+        effective_coverage = max(0, score_input.coverage - (15 if embedding_degraded else 0))
+        effective_uncertainty = min(100, result.uncertainty + (15 if embedding_degraded else 0))
+
         evidence_items = _evidence_items(event_id, observations)
         verified_evidence_count = sum(
             item.provenance_level != "unverified_discovery" for item in evidence_items
@@ -612,6 +632,8 @@ class EventProcessor:
         point = MetricPoint(at=bucket_at, attention=metrics.attention, behavior=metrics.behavior)
         timeline = sorted([item for item in current.timeline if item.at != bucket_at] + [point], key=lambda item: item.at)[-672:]
         drivers = result.drivers + metrics.drivers
+        if embedding_degraded:
+            drivers.append("本地多语模型暂时不可用；本周期使用链接、实体与词法规则聚类。")
         expected_families = 4 if behavior_applicable else 3
         coverage_suffix = "缺失会进入不确定性。" if behavior_applicable else "行为已明确标记为不适用并从覆盖分母移除。"
         updated = current.model_copy(update={
@@ -623,8 +645,8 @@ class EventProcessor:
             "first_seen": effective_first_seen,
             "state": result.state, "labels": stable_labels, "attention": metrics.attention,
             "behavior": metrics.behavior, "diversity": metrics.diversity, "authority": metrics.authority,
-            "coordination_risk": metrics.coordination_risk, "coverage": score_input.coverage,
-            "uncertainty": result.uncertainty, "evidence_strength": strength_tier(result.evidence_strength),
+            "coordination_risk": metrics.coordination_risk, "coverage": effective_coverage,
+            "uncertainty": effective_uncertainty, "evidence_strength": strength_tier(result.evidence_strength),
             "behavior_evidence_state": (
                 EvidenceState.OBSERVED if metrics.behavior_observed
                 else EvidenceState.NOT_APPLICABLE if current.behavior_evidence_state == EvidenceState.NOT_APPLICABLE
@@ -644,6 +666,7 @@ class EventProcessor:
             "driver": "；".join(drivers[:4]),
             "coverage_note": (
                 f"覆盖 {metrics.independent_signal_families}/{expected_families} 个适用的独立信号家族；{coverage_suffix}"
+                + ("；本地多语模型已降级，覆盖置信度扣减 15 分。" if embedding_degraded else "")
                 + (f"；另有 {unverified_count} 条未复核发现候选，不参与评分或告警。" if unverified_count else "")
             ),
             "timeline": timeline, "evidence": evidence_items[:30],

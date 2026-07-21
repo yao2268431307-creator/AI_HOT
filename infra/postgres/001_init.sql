@@ -99,6 +99,9 @@ CREATE TABLE IF NOT EXISTS source_promotion_facts (
   promoted_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 ALTER TABLE source_promotion_facts ADD COLUMN IF NOT EXISTS policy_digest text NOT NULL DEFAULT 'legacy:unavailable';
+ALTER TABLE source_promotion_facts ADD COLUMN IF NOT EXISTS reviewed_by text;
+ALTER TABLE source_promotion_facts ADD COLUMN IF NOT EXISTS review_reason text;
+ALTER TABLE source_promotion_facts ADD COLUMN IF NOT EXISTS transition_kind text NOT NULL DEFAULT 'automatic_promotion';
 CREATE INDEX IF NOT EXISTS source_promotion_facts_time_idx
   ON source_promotion_facts (promoted_at DESC,source_id);
 

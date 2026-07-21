@@ -19,6 +19,7 @@ services:
       retries: 15
 
   redis:
+    profiles: ["full"]
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes"]
     ports:
@@ -33,6 +34,7 @@ services:
       retries: 15
 
   object-store:
+    profiles: ["full"]
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
     environment:

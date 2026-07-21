@@ -6,7 +6,7 @@ import { Activity, Bell, BookOpenCheck, ChevronRight, CircleGauge, Database, Fil
 import type { FormEvent } from "react";
 import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { demoPayload } from "../lib/demo-data";
-import type { ConnectorStatus, CoverageBudget, EventAssessment, EventLineage, EventMember, LifecycleState, RadarEvent, RadarPayload, SourceCatalogResponse, SourceStatus, StructureLabel } from "../lib/types";
+import type { ConnectorStatus, CoverageBudget, EventAssessment, EventLineage, EventMember, LifecycleState, RadarEvent, RadarPayload, RuntimeHealth, SourceCatalogResponse, SourceStatus, StructureLabel } from "../lib/types";
 import { QueueTable } from "./QueueTable";
 
 const RadarChart = lazy(() => import("./RadarChart").then((module) => ({ default: module.RadarChart })));
@@ -402,7 +402,7 @@ function DetailPanel({ event, peers, assessment, decisionContext, lineage, windo
   );
 }
 
-function AlertRuleDialog() {
+function AlertRuleDialog({ localMode = false }: { localMode?: boolean }) {
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -413,7 +413,7 @@ function AlertRuleDialog() {
       name: String(form.get("name") || "AI 热点确认"),
       minimumAttention: Number(form.get("attention") || 70),
       minimumEvidenceStrength: Number(form.get("evidence") || 65),
-      webhookUrl: String(form.get("webhook") || "") || null,
+      webhookUrl: localMode ? null : (String(form.get("webhook") || "") || null),
     };
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
     try {
@@ -428,11 +428,11 @@ function AlertRuleDialog() {
     <Dialog.Trigger asChild><button className="alert-button"><Bell size={15} /> 新建预警</button></Dialog.Trigger>
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay" /><Dialog.Content className="dialog-content">
       <Dialog.Title>创建事件预警</Dialog.Title>
-      <Dialog.Description>事件进入加速阶段且证据强度达到阈值时，通过签名 Webhook 通知。</Dialog.Description>
+      <Dialog.Description>{localMode ? "事件达到阈值时写入本机站内告警，不连接任何外部消息服务。" : "事件进入加速阶段且证据强度达到阈值时，通过签名 Webhook 通知。"}</Dialog.Description>
       <form onSubmit={submit}>
         <label>规则名称<input name="name" defaultValue="AI 热点确认" /></label>
         <div className="dialog-grid"><label>最低讨论度<input name="attention" type="number" defaultValue="70" /></label><label>最低证据分（内部阈值）<input name="evidence" type="number" defaultValue="65" /></label></div>
-        <label>Webhook URL<input name="webhook" placeholder="https://hooks.example.com/…" /></label>
+        {!localMode && <label>Webhook URL<input name="webhook" placeholder="https://hooks.example.com/…" /></label>}
         {status === "saved" && <p className="form-status success" role="status">规则已保存</p>}
         {status === "error" && <p className="form-status error" role="alert">保存失败，未创建规则</p>}
         <div className="dialog-actions"><Dialog.Close asChild><button type="button" className="button-secondary">取消</button></Dialog.Close><button className="button-primary" type="submit" disabled={status === "saving"}><Send size={14} /> {status === "saving" ? "保存中…" : "保存规则"}</button></div>
@@ -464,10 +464,12 @@ const sourceStatusName: Record<SourceStatus, string> = {
   candidate: "候选", active: "活跃", paused: "暂停", blocked: "阻断",
 };
 
-function SourceView({ catalog, loading, query, status, onQueryChange, onStatusChange, onPageChange }: {
+function SourceView({ catalog, loading, query, status, reviewing, onQueryChange, onStatusChange, onPageChange, onReview }: {
   catalog: SourceCatalogResponse | null; loading: boolean; query: string; status: "all" | SourceStatus;
+  reviewing: string | null;
   onQueryChange: (value: string) => void; onStatusChange: (value: "all" | SourceStatus) => void;
   onPageChange: (offset: number) => void;
+  onReview: (sourceId: string, status: SourceStatus) => void;
 }) {
   const rows = catalog?.items ?? [];
   return (
@@ -483,12 +485,18 @@ function SourceView({ catalog, loading, query, status, onQueryChange, onStatusCh
         <div className="coverage-summary source-summary"><div><b>{catalog.counts.active ?? 0}/{catalog.activeCapacity}</b><span>活跃信源 / 容量</span></div><div><b>{catalog.counts.candidate ?? 0}/{catalog.candidateCapacity}</b><span>候选池 / 容量</span></div><div><b>{catalog.total}</b><span>当前查询匹配数</span></div><div><b>{catalog.systemCapacity}</b><span>系统容量上限</span></div></div>
         <section className="source-directory">
           <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input maxLength={200} value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索信源、平台、账号或实体…" aria-label="搜索信源" /></div><select aria-label="信源状态" value={status} onChange={(event) => onStatusChange(event.target.value as "all" | SourceStatus)}><option value="all">全部状态</option>{Object.entries(sourceStatusName).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><div className="queue-count">{catalog.total === 0 ? "0" : `${catalog.offset + 1}–${catalog.offset + rows.length}`} / {catalog.total}</div></div>
-          <div className="table-scroll"><table className="source-table"><thead><tr><th>信源</th><th>生命周期</th><th>证据历史</th><th>SourceScore</th><th>发现依据与阻断项</th></tr></thead><tbody>{rows.map((source) => <tr key={source.id}>
+          <div className="table-scroll"><table className="source-table"><thead><tr><th>信源</th><th>生命周期</th><th>证据历史</th><th>SourceScore</th><th>发现依据与阻断项</th><th>人工审核</th></tr></thead><tbody>{rows.map((source) => <tr key={source.id}>
             <td><b>{source.displayName}</b><small>{source.platform} · {source.language.toUpperCase()}</small><em>{source.id}</em></td>
             <td><span className={`source-status source-${source.status}`}>{sourceStatusName[source.status]}</span><small>最近观测 {timeAgo(source.lastObservedAt)}</small></td>
             <td><b className="mono">{source.validObservations}</b><small>有效观测 · {source.historyDays} 天历史</small><em>{source.accountIds.length} 账号 / {source.entityIds.length} 实体</em></td>
             <td><b className="mono">{source.candidateScore === null ? "N/A" : source.candidateScore.toFixed(2)}</b><small>{source.scoreEvidenceStatus === "eligible" ? "质量证据充分" : "质量证据不足"}</small><em>{source.rankEligible ? "可参与排序" : "不参与排序"}</em></td>
             <td><p>{source.discoveryReasons.join(" · ") || "尚无发现说明"}</p><small>{source.blockedReasons.join("；") || "没有晋级阻断项"}</small></td>
+            <td><div className="source-review-actions">
+              {source.status !== "active" && <button type="button" disabled={reviewing === source.id} onClick={() => onReview(source.id, "active")}>启用</button>}
+              {source.status !== "paused" && <button type="button" disabled={reviewing === source.id} onClick={() => onReview(source.id, "paused")}>暂停</button>}
+              {source.status !== "blocked" && <button type="button" disabled={reviewing === source.id} onClick={() => onReview(source.id, "blocked")}>阻断</button>}
+              {source.status !== "candidate" && <button type="button" disabled={reviewing === source.id} onClick={() => onReview(source.id, "candidate")}>退回候选</button>}
+            </div></td>
           </tr>)}</tbody></table>{rows.length === 0 && <p className="empty-directory">没有匹配的信源。</p>}</div>
           <div className="source-pagination"><button type="button" disabled={catalog.offset === 0} onClick={() => onPageChange(Math.max(0, catalog.offset - catalog.limit))}>上一页</button><span className="mono">PAGE {Math.floor(catalog.offset / catalog.limit) + 1}</span><button type="button" disabled={!catalog.hasMore} onClick={() => onPageChange(catalog.offset + catalog.limit)}>下一页</button></div>
         </section>
@@ -508,7 +516,7 @@ function CoverageView({ connectors, budget }: { connectors: ConnectorStatus[]; b
   return (
     <div className="content-view coverage-view">
       <div className="view-heading"><div><div className="eyebrow">DATA PLANE</div><h1>覆盖与连接器</h1><p>数据缺口会显式降低证据强度，不会被解释为热度下降。</p></div></div>
-      <div className="coverage-summary"><div><b>{healthy}/{connectors.length}</b><span>健康连接器</span></div><div><b>{observations.toLocaleString()}</b><span>24H 观测</span></div><div><b>{families}</b><span>独立信号家族</span></div><div><b>{p95Latency === null ? "N/A" : `${p95Latency}m`}</b><span>P95 采集轮次耗时</span></div><div><b>{budget ? `¥${budget.spent.toFixed(0)} / ¥${budget.limit.toFixed(0)}` : "N/A"}</b><span>{budget ? `本月剩余 ¥${budget.remaining.toFixed(0)}` : "预算接口未连接"}</span></div></div>
+      <div className="coverage-summary"><div><b>{healthy}/{connectors.length}</b><span>健康连接器</span></div><div><b>{observations.toLocaleString()}</b><span>24H 观测</span></div><div><b>{families}</b><span>独立信号家族</span></div><div><b>{p95Latency === null ? "N/A" : `${p95Latency}m`}</b><span>P95 采集轮次耗时</span></div><div><b>{budget ? `¥${budget.spent.toFixed(0)} / ¥${budget.limit.toFixed(0)}` : "N/A"}</b><span>{budget ? (budget.limit === 0 ? "零计费硬限制" : `本月剩余 ¥${budget.remaining.toFixed(0)}`) : "预算接口未连接"}</span></div></div>
       {budget && (connectorBudgetLimits.length > 0 || familyBudgetLimits.length > 0) && <section className="budget-scope-grid" aria-label="分类预算硬闸门">
         {[...connectorBudgetLimits.map((item) => ({ ...item, kind: "连接器" })), ...familyBudgetLimits.map((item) => ({ ...item, kind: "信号族" }))].map((item) => <article className={`budget-scope-card ${item.hardPaused ? "budget-paused" : ""}`} key={`${item.kind}-${item.scope}`}>
           <small>{item.kind}</small><b>{item.scope}</b><span className="mono">¥{item.spent.toFixed(1)} / ¥{item.limit.toFixed(1)}</span><em>{item.hardPaused ? "硬暂停" : `剩余 ¥${item.remaining.toFixed(1)}`}</em>
@@ -541,6 +549,7 @@ function MethodView() {
       </div>
       <section className="state-machine"><div className="section-kicker"><GitBranch size={15} /> 生命周期状态机</div><div className="state-flow"><span>发现</span><i /><span>萌发</span><i /><span>加速</span><i /><span>已建立</span><i /><span>降温</span><i /><span>休眠</span></div><p>状态至少连续两个评分周期确认；普通告警四小时冷却。任何结论均保存输入时间窗、评分版本、阈值版本与驱动因素。</p></section>
       <section className="formula-card"><div><small>ROBUST BASELINE</small><code>z = (x − median) / (1.4826 × MAD + ε)</code></div><div><small>EVIDENCE QUALITY</small><code>E = .30C + .20R + .20B + .15K + .15S</code></div><div><small>GAP RESIDUAL</small><code>G = observedGap − expectedGap(type, age, mix)</code></div></section>
+      <div className="boundary-card"><ShieldCheck size={22} /><div><h3>本地版覆盖边界</h3><p>V1 只启用 RSS、Hacker News、GitHub、Hugging Face、arXiv 与 Bluesky 公共入口。X、YouTube、OpenAlex、Bilibili、Reddit 和 Product Hunt 均不采集，因此相关平台缺口只会降低置信度，不会被解释为行业降温。</p></div></div>
     </div>
   );
 }
@@ -548,6 +557,7 @@ function MethodView() {
 export function RadarShell() {
   const [payload, setPayload] = useState<RadarPayload>(demoPayload);
   const [dataMode, setDataMode] = useState<"live" | "stale" | "demo">("demo");
+  const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
   const [view, setView] = useState<View>("queue");
   const [selectedId, setSelectedId] = useState(demoPayload.events[0].id);
   const [detailOpen, setDetailOpen] = useState(true);
@@ -561,6 +571,8 @@ export function RadarShell() {
   const deferredSourceQuery = useDeferredValue(sourceQuery);
   const [sourceStatus, setSourceStatus] = useState<"all" | SourceStatus>("all");
   const [sourceOffset, setSourceOffset] = useState(0);
+  const [sourceRefresh, setSourceRefresh] = useState(0);
+  const [sourceReviewing, setSourceReviewing] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [windowSize, setWindowSize] = useState("6H");
   const [mobileNav, setMobileNav] = useState(false);
@@ -642,6 +654,20 @@ export function RadarShell() {
   }, [windowSize]);
 
   useEffect(() => {
+    const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
+    let disposed = false;
+    const loadHealth = () => {
+      void fetch(`${base}/api/v1/operations/runtime-health`)
+        .then((response) => response.ok ? response.json() : Promise.reject(new Error("runtime health unavailable")))
+        .then((data: RuntimeHealth) => { if (!disposed) setRuntimeHealth(data); })
+        .catch(() => { if (!disposed) setRuntimeHealth(null); });
+    };
+    loadHealth();
+    const interval = window.setInterval(loadHealth, 30_000);
+    return () => { disposed = true; window.clearInterval(interval); };
+  }, []);
+
+  useEffect(() => {
     if (dataMode !== "live") return;
     const controller = new AbortController();
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
@@ -668,7 +694,31 @@ export function RadarShell() {
       .then((data: SourceCatalogResponse) => { setSourceCatalog(data); setSourceCatalogFailed(false); })
       .catch(() => { if (!controller.signal.aborted) { setSourceCatalog(null); setSourceCatalogFailed(true); } });
     return () => controller.abort();
-  }, [deferredSourceQuery, sourceOffset, sourceStatus, view]);
+  }, [deferredSourceQuery, sourceOffset, sourceStatus, sourceRefresh, view]);
+
+  const reviewSource = useCallback(async (sourceId: string, status: SourceStatus) => {
+    const action = sourceStatusName[status];
+    const reason = window.prompt(`请输入将 ${sourceId} 标记为“${action}”的审核依据：`, "本机用户已核对该信源的身份、内容范围与用途");
+    if (reason === null) return;
+    if (reason.trim().length < 3) {
+      window.alert("审核依据至少需要 3 个字符。");
+      return;
+    }
+    setSourceReviewing(sourceId);
+    const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
+    try {
+      const response = await fetch(`${base}/api/v1/sources/${encodeURIComponent(sourceId)}/review`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status, reason: reason.trim() }),
+      });
+      if (!response.ok) throw new Error("source review failed");
+      setSourceRefresh((value) => value + 1);
+    } catch {
+      window.alert("信源状态保存失败；原状态未改变。");
+    } finally {
+      setSourceReviewing(null);
+    }
+  }, []);
 
   useEffect(() => {
     if (!selectedId || dataMode !== "live") {
@@ -732,6 +782,9 @@ export function RadarShell() {
     discussionObserved(event) && behaviorObserved(event)
   ), [events]);
   const selected = events.find((event) => event.id === selectedId);
+  const localMode = runtimeHealth?.runtimeProfile === "local";
+  const embeddingDegraded = localMode && ["degraded", "disabled"].includes(runtimeHealth?.embedding.state ?? "not_started");
+  const storageLimited = runtimeHealth?.evidenceStorage?.capacityState === "limited";
   const strongLifecycle = payload.events.filter((e) => e.state === "accelerating" || e.state === "established").length;
   const gap = payload.events.filter((e) => e.labels.includes("attention_behavior_gap")).length;
   const concentrated = payload.events.filter((e) => e.labels.includes("platform_concentrated")).length;
@@ -768,12 +821,12 @@ export function RadarShell() {
         <header className="topbar">
           <button ref={menuButton} className="mobile-menu icon-button" onClick={() => setMobileNav((v) => !v)} aria-label={mobileNav ? "关闭导航" : "打开导航"} aria-expanded={mobileNav} aria-controls="mobile-navigation"><Menu size={19} /></button>
           <div className="brand"><span className="brand-mark"><Radar size={19} /></span><b>SIGNAL<span>{"//"}</span>AI</b><small>开发者与研究生态信号 Beta</small></div>
-          <div className="system-status"><i className={dataMode === "live" ? "pulse-live" : "pulse-demo"} /><span>{dataMode === "live" ? "LIVE PIPELINE" : dataMode === "stale" ? "POLLING / STALE" : "RECORDED DEMO"}</span><em>·</em><span>更新 {timeAgo(payload.generatedAt)}</span></div>
-          <span className="mobile-pipeline-status">{dataMode === "live" ? "LIVE" : dataMode === "stale" ? "STALE" : "DEMO"}</span>
+          <div className="system-status"><i className={dataMode === "live" ? "pulse-live" : "pulse-demo"} /><span>{dataMode === "live" ? (localMode ? "LOCAL PIPELINE" : "LIVE PIPELINE") : dataMode === "stale" ? "POLLING / STALE" : "RECORDED DEMO"}</span><em>·</em><span>更新 {timeAgo(payload.generatedAt)}</span></div>
+          <span className="mobile-pipeline-status">{dataMode === "live" ? (localMode ? "LOCAL" : "LIVE") : dataMode === "stale" ? "STALE" : "DEMO"}</span>
           <div className="top-actions">
             <Tooltip.Root><Tooltip.Trigger asChild><button className="icon-button" aria-label="搜索" onClick={() => { setView("queue"); window.setTimeout(() => searchInput.current?.focus(), 0); }}><Search size={17} /></button></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip">快捷搜索 <kbd>/</kbd><Tooltip.Arrow className="tooltip-arrow" /></Tooltip.Content></Tooltip.Portal></Tooltip.Root>
-            <AlertRuleDialog />
-            <div className="avatar">AN</div>
+            <AlertRuleDialog localMode={localMode} />
+            <div className="avatar">{localMode ? "本机" : "AN"}</div>
           </div>
         </header>
 
@@ -786,10 +839,19 @@ export function RadarShell() {
             ] as const).map(([id, Icon, label]) => <button key={id} className={view === id ? "active" : ""} aria-current={view === id ? "page" : undefined} onClick={() => { setView(id); setMobileNav(false); window.setTimeout(() => menuButton.current?.focus(), 0); }}><Icon size={17} /><span>{label}</span>{id === "queue" && <em>{events.length}</em>}</button>)}
           </nav>
           <div className="sidebar-section"><span>工作区</span><button type="button" disabled><Activity size={16} /><span>AI 行业雷达</span><i className="workspace-dot" /></button></div>
-          <div className="sidebar-foot"><div><b>V1 · RC2</b><span>评分引擎 0.6.0</span></div><small>预算守卫已启用 · 实时支出见覆盖页</small><i><em style={{ width: "0%" }} /></i></div>
+          <div className="sidebar-foot"><div><b>V1 · LOCAL</b><span>评分引擎 0.6.0</span></div><small>{localMode ? "零订阅保护 · 仅本机访问" : "预算守卫已启用 · 实时支出见覆盖页"}</small><i><em style={{ width: "0%" }} /></i></div>
         </aside>
 
         <main className={`main ${detailOpen && (view === "queue" || view === "radar") ? "with-detail" : ""}`}>
+          {localMode && <section className={`local-runtime-banner ${embeddingDegraded || storageLimited || dataMode === "stale" ? "local-runtime-warning" : ""}`} aria-live="polite">
+            <div><ShieldCheck size={16} /><b>本地零订阅模式</b><span>PostgreSQL + 本地证据 + 本地多语模型</span></div>
+            <div className="local-runtime-facts">
+              <span>外部预算 <b>¥0</b></span>
+              <span>模型 <b>{runtimeHealth?.embedding.state === "ready" ? `就绪 · ${runtimeHealth.embedding.device ?? "auto"}` : runtimeHealth?.embedding.state === "not_loaded" ? "等待首次采集" : "降级"}</b></span>
+              <span>采集 <b>{runtimeHealth?.lastCollectionFinishedAt ? timeAgo(runtimeHealth.lastCollectionFinishedAt) : "等待首轮"}</b></span>
+            </div>
+            {(embeddingDegraded || storageLimited || dataMode === "stale") && <p>{storageLimited ? "本地证据已达到容量上限；大体积正文将只保存占位记录。" : embeddingDegraded ? "多语模型暂不可用；系统已降低覆盖置信度，不会输出低证据强告警。" : "采集链路暂时失联，当前页面保留最后一次成功快照。"}</p>}
+          </section>}
           {view === "queue" && <div className="content-view queue-view">
             <div className="view-heading"><div><div className="eyebrow">REVIEW QUEUE / {windowSize}</div><h1>AI 热点研判队列</h1><p>优先处理高速度、高证据、状态刚发生变化的事件。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} aria-pressed={windowSize === item} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
             <div className="summary-grid">
@@ -809,7 +871,7 @@ export function RadarShell() {
             <section className="radar-card"><div className="radar-legend"><span><i className="state-accelerating-dot" />加速</span><span><i className="state-emerging-dot" />萌发</span><span><i className="state-detected-dot" />已发现</span></div><Suspense fallback={<div className="radar-chart" role="status">正在加载雷达图…</div>}><RadarChart events={radarEvents} onSelect={selectEvent} /></Suspense><details className="radar-data"><summary>查看图表数据表</summary><div className="table-scroll"><table><thead><tr><th>事件</th><th>阶段</th><th>结构标签</th><th>讨论</th><th>行为</th><th>证据</th></tr></thead><tbody>{radarEvents.map((event) => <tr key={event.id}><td>{event.title}</td><td>{stateName[event.state]}</td><td>{event.labels.map((label) => labelName[label]).join("、") || "无"}</td><td>{event.attention}</td><td>{event.behavior}</td><td>{({ low: "低", medium: "中", high: "高" })[event.evidenceStrength]}</td></tr>)}{radarEvents.length === 0 && <tr><td colSpan={6}>没有同时具备讨论与行为证据的事件。</td></tr>}</tbody></table></div></details></section>
             <div className="radar-insight"><Activity size={18} /><div><b>当前结构</b><p>{strongLifecycle} 个事件处于加速或已建立阶段，{gap} 个事件存在注意力与实际行为的显著偏离。</p></div></div>
           </div>}
-          {view === "sources" && <SourceView catalog={sourceCatalog} loading={!sourceCatalogFailed} query={sourceQuery} status={sourceStatus} onQueryChange={(value) => { setSourceQuery(value); setSourceOffset(0); }} onStatusChange={(value) => { setSourceStatus(value); setSourceOffset(0); }} onPageChange={setSourceOffset} />}
+          {view === "sources" && <SourceView catalog={sourceCatalog} loading={!sourceCatalogFailed} query={sourceQuery} status={sourceStatus} reviewing={sourceReviewing} onQueryChange={(value) => { setSourceQuery(value); setSourceOffset(0); }} onStatusChange={(value) => { setSourceStatus(value); setSourceOffset(0); }} onPageChange={setSourceOffset} onReview={reviewSource} />}
           {view === "coverage" && <CoverageView connectors={payload.connectors} budget={coverageBudget} />}
           {view === "method" && <MethodView />}
         </main>
