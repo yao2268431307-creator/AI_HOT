@@ -20,7 +20,7 @@ def configure_local(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AUTH_REQUIRED", "false")
     monkeypatch.setenv("RADAR_API_HOST", "127.0.0.1")
     monkeypatch.setenv("RADAR_WEB_HOST", "127.0.0.1")
-    monkeypatch.setenv("CORS_ORIGINS", "http://127.0.0.1:3000")
+    monkeypatch.setenv("CORS_ORIGINS", "http://127.0.0.1:3210")
     monkeypatch.setenv("DATABASE_URL", "postgresql://radar_app:secret@127.0.0.1:5432/ai_hot")
     monkeypatch.setenv("EXTERNAL_DATA_BUDGET_RMB", "0")
     monkeypatch.setenv("FREE_ONLY_MODE", "true")

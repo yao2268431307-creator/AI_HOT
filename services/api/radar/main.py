@@ -93,7 +93,7 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         repository = PostgresRepository(production_dsn) if production_dsn else InMemoryRepository()
     repo = seed_repository(repository) if isinstance(repository, InMemoryRepository) else repository
     app = FastAPI(title="SIGNAL//AI Radar API", version=__version__, docs_url="/docs")
-    origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip()]
+    origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:3210,http://127.0.0.1:3210").split(",") if origin.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
     app.state.repository = repo
     app.state.http_status_classes = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}

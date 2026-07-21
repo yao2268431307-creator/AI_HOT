@@ -52,7 +52,7 @@ def validate_local_access_configuration() -> None:
     origins = [
         value.strip()
         for value in os.getenv(
-            "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000",
+            "CORS_ORIGINS", "http://localhost:3210,http://127.0.0.1:3210",
         ).split(",")
         if value.strip()
     ]

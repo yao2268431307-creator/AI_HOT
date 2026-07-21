@@ -30,6 +30,14 @@ if ($env:AUTH_REQUIRED -ne "false") {
 if ($env:FREE_ONLY_MODE -ne "true" -or [double]$env:EXTERNAL_DATA_BUDGET_RMB -ne 0) {
   throw "local mode requires FREE_ONLY_MODE=true and a zero external-data budget"
 }
+$WebHost = if ($env:RADAR_WEB_HOST) { $env:RADAR_WEB_HOST } else { "127.0.0.1" }
+$WebPort = if ($env:RADAR_WEB_PORT) { [int]$env:RADAR_WEB_PORT } else { 3210 }
+if ($WebHost -notin @("127.0.0.1", "localhost", "::1")) {
+  throw "local single-user mode requires RADAR_WEB_HOST to be a loopback host"
+}
+if ($WebPort -lt 1 -or $WebPort -gt 65535) {
+  throw "RADAR_WEB_PORT must be between 1 and 65535"
+}
 
 & docker info *> $null
 if ($LASTEXITCODE -ne 0) { throw "Docker Desktop is not running" }
@@ -101,15 +109,6 @@ function Start-RadarProcess([string]$Name, [string]$Program, [string[]]$Argument
   }
   if ($Port -gt 0) {
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if ($listener -and $Name -eq "web") {
-      try {
-        $existingWeb = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port" -TimeoutSec 3
-        if ($existingWeb.StatusCode -eq 200) {
-          Write-Host "Using the existing local web preview on port $Port."
-          return $null
-        }
-      } catch { }
-    }
     if ($listener) { throw "Port $Port is already in use; stop the existing local service first" }
   }
   $process = Start-Process -FilePath $Program -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory `
@@ -122,7 +121,7 @@ function Start-RadarProcess([string]$Name, [string]$Program, [string[]]$Argument
 
 Start-RadarProcess "api" $Python @("services/api/run.py") $Root 8017 | Out-Null
 Start-RadarProcess "worker" $Python @("-m", "radar.runner", "--interval-seconds", "900") $Root | Out-Null
-Start-RadarProcess "web" "npm.cmd" @("run", "dev", "--", "--host", "127.0.0.1", "--port", "3000") (Join-Path $Root "web") 3000 | Out-Null
+Start-RadarProcess "web" "npm.cmd" @("run", "dev", "--", "--host", $WebHost, "--port", "$WebPort") (Join-Path $Root "web") $WebPort | Out-Null
 
 $apiReady = $false
 for ($attempt = 0; $attempt -lt 60; $attempt++) {
@@ -134,6 +133,6 @@ for ($attempt = 0; $attempt -lt 60; $attempt++) {
 }
 if (-not $apiReady) { throw "Local API did not become ready; inspect .data/run/api.stderr.log" }
 
-if (-not $NoBrowser) { Start-Process "http://127.0.0.1:3000" | Out-Null }
-Write-Host "AI Hot Radar is running locally at http://127.0.0.1:3000"
+if (-not $NoBrowser) { Start-Process "http://${WebHost}:$WebPort" | Out-Null }
+Write-Host "AI Hot Radar is running locally at http://${WebHost}:$WebPort"
 Write-Host "No Redis, R2, OIDC, or metered connector is enabled."

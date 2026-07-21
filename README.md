@@ -40,7 +40,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\start-local.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\stop-local.ps1
 ```
 
-访问 `http://127.0.0.1:3000/`。API 文档位于 `http://127.0.0.1:8017/docs`。
+访问 `http://localhost:3210/`。API 文档位于 `http://127.0.0.1:8017/docs`。
 
 本地备份、恢复验证和 72 小时连续采集：
 
