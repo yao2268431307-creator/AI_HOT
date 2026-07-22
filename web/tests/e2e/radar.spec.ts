@@ -108,6 +108,22 @@ test("review queue separates latest arrivals from priority triage", async ({ pag
   await expect(page.getByText("优先级不等于最终结论")).toBeVisible();
 });
 
+test("review queue sorts the full result set from table headers", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/");
+  await expect(page.getByText("LIVE PIPELINE")).toBeVisible();
+  for (const label of ["阶段", "证据", "速度", "新增证据", "行为", "讨论"]) {
+    await expect(page.locator("thead").getByRole("button", { name: new RegExp(`^${label}当前`) })).toBeVisible();
+  }
+  const discussionSort = page.locator("thead").getByRole("button", { name: /^讨论当前/ });
+  await discussionSort.click();
+  await expect(discussionSort).toHaveAccessibleName("讨论当前高到低，点击切换为低到高");
+  await expect(page.locator(".event-title").first()).toContainText("开放权重多模态模型");
+  await discussionSort.click();
+  await expect(discussionSort).toHaveAccessibleName("讨论当前低到高，点击切换为高到低");
+  await expect(page.locator(".event-title").first()).toContainText("单平台 AI 视频演示");
+});
+
 test("mobile user can filter, watch and accept with dialog focus containment", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await mockApi(page);

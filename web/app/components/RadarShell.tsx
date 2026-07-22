@@ -874,7 +874,7 @@ export function RadarShell() {
                 <div className="queue-mode-explainer"><i className={queueMode === "latest" ? "freshness-dot" : "priority-dot"} /><span>{queueMode === "latest" ? `过去 ${windowSize} 采集到 ${payload.totalEvents} 个候选${newestArrivalAt ? ` · 最近一条 ${timeAgo(newestArrivalAt)}` : ""}` : "按新增证据、生命周期变化和关注状态排序"}</span><small>{queueMode === "latest" ? "新到不等于热点" : "优先级不等于最终结论"}</small></div>
               </div>
               <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input ref={searchInput} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索事件、平台或信源…" aria-label="搜索事件" /></div><button className={`filter-button watch-toggle ${showWatched ? "active" : ""}`} aria-pressed={showWatched} onClick={() => setShowWatched((value) => !value)}><Bell size={14} />只看关注 <span>{watchedIds.size}</span></button><FilterDialog filters={filters} onChange={applyFilters} /><div className="queue-count">显示 {events.length} / {payload.totalEvents}</div></div>
-              <QueueTable key={`${queueMode}:${query}:${filters.state}:${filters.eventType}:${filters.evidence}:${showWatched}`} events={events} selectedId={selectedId} windowSize={windowSize} mode={queueMode} onSelect={selectEvent} />
+              <QueueTable key={queueMode} events={events} selectedId={selectedId} windowSize={windowSize} mode={queueMode} scopeKey={`${query}:${filters.state}:${filters.eventType}:${filters.evidence}:${showWatched}`} onSelect={selectEvent} />
             </section>
           </div>}
           {view === "radar" && <div className="content-view radar-view">

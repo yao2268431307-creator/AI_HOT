@@ -1,8 +1,13 @@
 "use client";
 
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
-import { useEffect, useMemo, useState } from "react";
+import { ArrowDown, ArrowUp, ChevronsUpDown } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { RadarEvent } from "../lib/types";
+
+type SortKey = "state" | "evidence" | "velocity" | "newEvidence" | "behavior" | "attention";
+type SortDirection = "desc" | "asc";
+type QueueSort = { key: SortKey; direction: SortDirection } | null;
 
 const stateName: Record<string, string> = {
   accelerating: "加速",
@@ -29,12 +34,43 @@ const labelName: Record<string, string> = {
   official_source_led: "官方首发", low_source_diversity: "多样性低", reactivated: "再次活跃",
 };
 
+const stateRank: Record<string, number> = {
+  established: 7, accelerating: 6, emerging: 5, detected: 4,
+  cooling: 3, dormant: 2, noise: 1, insufficient_data: 0,
+};
+const evidenceRank = { low: 0, medium: 1, high: 2 } as const;
 const timeAgo = (iso: string) => {
   const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
   if (minutes < 60) return `${Math.max(1, minutes)} 分钟前`;
   if (minutes < 1440) return `${Math.round(minutes / 60)} 小时前`;
   return `${Math.round(minutes / 1440)} 天前`;
 };
+
+const discussionObserved = (event: RadarEvent) => event.discussionEvidenceState === undefined
+  ? event.evidence.some((item) => item.kind === "discussion")
+  : event.discussionEvidenceState === "observed";
+const behaviorObserved = (event: RadarEvent) => event.behaviorEvidenceState === undefined
+  ? event.evidence.some((item) => item.kind === "behavior")
+  : event.behaviorEvidenceState === "observed";
+
+const sortValue = (event: RadarEvent, key: SortKey): number | null => {
+  if (key === "state") return stateRank[event.state] ?? 0;
+  if (key === "evidence") return evidenceRank[event.evidenceStrength] * 101 + event.evidenceScore;
+  if (key === "velocity") return event.velocity;
+  if (key === "newEvidence") return event.newEvidenceCount ?? 0;
+  if (key === "behavior") return behaviorObserved(event) ? event.behavior : null;
+  return discussionObserved(event) ? event.attention : null;
+};
+
+function SortHeader({ label, sortKey, sort, onToggle }: { label: string; sortKey: SortKey; sort: QueueSort; onToggle: (key: SortKey) => void }) {
+  const active = sort?.key === sortKey;
+  const direction = active ? sort.direction : null;
+  const current = direction === "desc" ? "高到低" : direction === "asc" ? "低到高" : "未排序";
+  const next = direction === "desc" ? "低到高" : "高到低";
+  return <button type="button" className={`sort-header ${active ? "active" : ""}`} onClick={() => onToggle(sortKey)} aria-label={`${label}当前${current}，点击切换为${next}`} title={`${label}：${current}`}>
+    <span>{label}</span>{active && <small>{current}</small>}{direction === "desc" ? <ArrowDown size={12} aria-hidden="true" /> : direction === "asc" ? <ArrowUp size={12} aria-hidden="true" /> : <ChevronsUpDown size={12} aria-hidden="true" />}
+  </button>;
+}
 
 function Sparkline({ event, windowSize }: { event: RadarEvent; windowSize: string }) {
   const width = 78;
@@ -44,8 +80,8 @@ function Sparkline({ event, windowSize }: { event: RadarEvent; windowSize: strin
     const y = height - (p[key] / 100) * height;
     return `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
-  const hasDiscussion = event.discussionEvidenceState === undefined ? event.evidence.some((item) => item.kind === "discussion") : event.discussionEvidenceState === "observed";
-  const hasBehavior = event.behaviorEvidenceState === undefined ? event.evidence.some((item) => item.kind === "behavior") : event.behaviorEvidenceState === "observed";
+  const hasDiscussion = discussionObserved(event);
+  const hasBehavior = behaviorObserved(event);
   return (
     <svg className="sparkline" viewBox={`0 0 ${width} ${height}`} aria-label={`${windowSize} 可用信号走势`}>
       {hasDiscussion && <path d={path("attention")} className="spark-attention" />}
@@ -54,16 +90,36 @@ function Sparkline({ event, windowSize }: { event: RadarEvent; windowSize: strin
   );
 }
 
-export function QueueTable({ events, selectedId, windowSize, mode, onSelect }: { events: RadarEvent[]; selectedId: string; windowSize: string; mode: "latest" | "priority"; onSelect: (id: string) => void }) {
+export function QueueTable({ events, selectedId, windowSize, mode, scopeKey, onSelect }: { events: RadarEvent[]; selectedId: string; windowSize: string; mode: "latest" | "priority"; scopeKey: string; onSelect: (id: string) => void }) {
   const pageSize = 15;
   const pageCount = Math.max(1, Math.ceil(events.length / pageSize));
   const [page, setPage] = useState(0);
+  const [sort, setSort] = useState<QueueSort>(null);
   useEffect(() => {
     setPage((current) => Math.min(current, pageCount - 1));
   }, [pageCount]);
+  useEffect(() => setPage(0), [scopeKey]);
+  const toggleSort = useCallback((key: SortKey) => {
+    setSort((current) => current?.key === key
+      ? { key, direction: current.direction === "desc" ? "asc" : "desc" }
+      : { key, direction: "desc" });
+    setPage(0);
+  }, []);
+  const sortedEvents = useMemo(() => {
+    if (!sort) return events;
+    return events.map((event, index) => ({ event, index, value: sortValue(event, sort.key) }))
+      .sort((a, b) => {
+        if (a.value === null && b.value === null) return a.index - b.index;
+        if (a.value === null) return 1;
+        if (b.value === null) return -1;
+        const difference = a.value - b.value;
+        return difference === 0 ? a.index - b.index : sort.direction === "desc" ? -difference : difference;
+      })
+      .map(({ event }) => event);
+  }, [events, sort]);
   const visibleEvents = useMemo(
-    () => events.slice(page * pageSize, (page + 1) * pageSize),
-    [events, page],
+    () => sortedEvents.slice(page * pageSize, (page + 1) * pageSize),
+    [page, sortedEvents],
   );
   const columns = useMemo<ColumnDef<RadarEvent>[]>(() => [
     {
@@ -77,20 +133,17 @@ export function QueueTable({ events, selectedId, windowSize, mode, onSelect }: {
         </button>
       ),
     },
-    { accessorKey: "state", header: "阶段", cell: ({ row }) => <span className={`state-pill state-${row.original.state}`}>{stateName[row.original.state]}</span> },
-    { id: "signal", header: "讨论 / 行为", cell: ({ row }) => {
-      const hasDiscussion = row.original.discussionEvidenceState === undefined ? row.original.evidence.some((item) => item.kind === "discussion") : row.original.discussionEvidenceState === "observed";
-      const hasBehavior = row.original.behaviorEvidenceState === undefined ? row.original.evidence.some((item) => item.kind === "behavior") : row.original.behaviorEvidenceState === "observed";
-      return <div className="metric-pair"><b>{hasDiscussion ? row.original.attention : "N/A"}</b><span>/</span><b>{hasBehavior ? row.original.behavior : "N/A"}</b></div>;
-    } },
+    { id: "state", header: () => <SortHeader label="阶段" sortKey="state" sort={sort} onToggle={toggleSort} />, cell: ({ row }) => <span className={`state-pill state-${row.original.state}`}>{stateName[row.original.state]}</span> },
+    { id: "attention", header: () => <SortHeader label="讨论" sortKey="attention" sort={sort} onToggle={toggleSort} />, cell: ({ row }) => <span className="metric-value metric-discussion">{discussionObserved(row.original) ? row.original.attention : "N/A"}</span> },
+    { id: "behavior", header: () => <SortHeader label="行为" sortKey="behavior" sort={sort} onToggle={toggleSort} />, cell: ({ row }) => <span className="metric-value metric-behavior">{behaviorObserved(row.original) ? row.original.behavior : "N/A"}</span> },
     { id: "trend", header: `${windowSize} 轨迹`, cell: ({ row }) => <Sparkline event={row.original} windowSize={windowSize} /> },
-    { accessorKey: "evidenceStrength", header: "证据 / 缺口", cell: ({ row }) => {
+    { id: "evidence", header: () => <SortHeader label="证据" sortKey="evidence" sort={sort} onToggle={toggleSort} />, cell: ({ row }) => {
       const missing = [row.original.discussionEvidenceState === "missing" ? "讨论" : "", row.original.behaviorEvidenceState === "missing" ? "行为" : ""].filter(Boolean);
       return <div className="confidence"><span>{({ low: "低", medium: "中", high: "高" })[row.original.evidenceStrength]} · {row.original.evidenceCount ?? row.original.evidence.length} 项</span><i><em style={{ width: `${row.original.evidenceScore}%` }} /></i><small>{missing.length ? `缺 ${missing.join("、")}` : "关键轴已覆盖"}</small></div>;
     } },
-    { id: "priority", header: "新增证据 / 优先理由", cell: ({ row }) => <div className="priority-reason"><b>+{row.original.newEvidenceCount ?? 0}</b><small>{row.original.queuePriorityReasons?.[0] ?? "常规复核"}</small></div> },
-    { accessorKey: "velocity", header: "速度", cell: ({ row }) => <span className="velocity">{row.original.velocity > 0 ? "+" : ""}{row.original.velocity}</span> },
-  ], [mode, onSelect, selectedId, windowSize]);
+    { id: "newEvidence", header: () => <SortHeader label="新增证据" sortKey="newEvidence" sort={sort} onToggle={toggleSort} />, cell: ({ row }) => <div className="priority-reason"><b>+{row.original.newEvidenceCount ?? 0}</b><small>{row.original.queuePriorityReasons?.[0] ?? "常规复核"}</small></div> },
+    { id: "velocity", header: () => <SortHeader label="速度" sortKey="velocity" sort={sort} onToggle={toggleSort} />, cell: ({ row }) => <span className="velocity">{row.original.velocity > 0 ? "+" : ""}{row.original.velocity}</span> },
+  ], [mode, onSelect, selectedId, sort, toggleSort, windowSize]);
   // TanStack Table intentionally returns callable table state; it is safe here because
   // the instance remains local and no returned function crosses a memoized boundary.
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -100,7 +153,7 @@ export function QueueTable({ events, selectedId, windowSize, mode, onSelect }: {
     <div className="queue-table-frame">
       <div className="table-scroll">
         <table className="queue-table">
-          <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
+          <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id} aria-sort={sort?.key === header.column.id ? (sort.direction === "asc" ? "ascending" : "descending") : undefined}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
           <tbody>{table.getRowModel().rows.map((row) => (
             <tr key={row.id} className={row.original.id === selectedId ? "selected" : ""}>
               {row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}

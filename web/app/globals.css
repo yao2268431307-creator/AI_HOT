@@ -129,8 +129,14 @@ button:active:not(:disabled), [role="button"]:active { transform: scale(.985); }
 .queue-count { margin-left: auto; color: var(--faint); font: 9px var(--mono); }
 .queue-table-frame { min-width: 0; }
 .table-scroll { overflow-x: auto; }
-.queue-table { width: 100%; min-width: 1010px; border-collapse: collapse; }
+.queue-table { width: 100%; min-width: 1120px; border-collapse: collapse; }
 .queue-table th { position: sticky; top: 0; z-index: 1; height: 38px; padding: 0 15px; text-align: left; color: var(--faint); background: #f5f7f9; border-bottom: 1px solid var(--line); font: 8px var(--mono); letter-spacing: .055em; text-transform: uppercase; }
+.sort-header { min-height: 28px; margin-left: -7px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; white-space: nowrap; cursor: pointer; }
+.sort-header.active { color: var(--blue); background: rgba(40, 85, 217, .065); }
+.sort-header small { color: inherit; font: 7px var(--mono); letter-spacing: 0; text-transform: none; }
+.sort-header svg { flex: none; }
+.sort-header:focus-visible { outline: 2px solid rgba(40, 85, 217, .42); outline-offset: 1px; }
+@media (hover: hover) and (pointer: fine) { .sort-header:hover { color: var(--blue); background: rgba(40, 85, 217, .045); } }
 .queue-table td { height: 76px; padding: 11px 15px; border-bottom: 1px solid var(--line-soft); color: var(--muted); }
 .queue-table tbody tr:last-child td { border-bottom: 0; }
 .queue-table tr { outline: none; }
@@ -150,10 +156,9 @@ button:active:not(:disabled), [role="button"]:active { transform: scale(.985); }
 .state-emerging { color: var(--amber); border-color: rgba(154, 104, 27, .22); background: rgba(154, 104, 27, .06); }
 .state-detected { color: var(--purple); border-color: rgba(109, 91, 208, .22); background: rgba(109, 91, 208, .06); }
 .state-cooling, .state-dormant, .state-noise, .state-insufficient_data { color: #5f6876; border-color: var(--line); background: var(--panel-2); }
-.metric-pair { display: flex; align-items: baseline; gap: 6px; font: 12px var(--mono); }
-.metric-pair b:first-child { color: var(--blue); }
-.metric-pair b:last-child { color: var(--green); }
-.metric-pair span { color: var(--line-strong); }
+.metric-value { font: 12px var(--mono); }
+.metric-discussion { color: var(--blue); }
+.metric-behavior { color: var(--green); }
 .sparkline { width: 78px; height: 28px; overflow: visible; }
 .sparkline path { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .spark-attention { stroke: var(--blue); }
