@@ -8,6 +8,7 @@
 - FastAPI：`127.0.0.1:8017`
 - 15 分钟采集/评分 Worker
 - Docker 本地 PostgreSQL + pgvector
+- PostgreSQL 本地连接池（默认 1–4 个连接，避免 Windows 短连接耗尽）
 - `.data/evidence` 原始证据目录
 - `.data/models` 本地 BGE-M3 模型
 

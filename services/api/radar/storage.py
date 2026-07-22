@@ -1477,15 +1477,50 @@ class InMemoryRepository:
 class PostgresRepository:
     """PostgreSQL repository. psycopg is imported lazily so scoring tests stay lightweight."""
 
+    _pools: dict[str, object] = {}
+    _pools_lock = threading.Lock()
+
     def __init__(self, dsn: str, deletion_dsn: str | None = None) -> None:
         self.dsn = dsn
         self.deletion_dsn = deletion_dsn or os.getenv("DELETION_DATABASE_URL")
 
+    @classmethod
+    def _pool_for(cls, dsn: str) -> object:
+        pool = cls._pools.get(dsn)
+        if pool is not None:
+            return pool
+        with cls._pools_lock:
+            pool = cls._pools.get(dsn)
+            if pool is not None:
+                return pool
+            from psycopg_pool import ConnectionPool
+
+            min_size = int(os.getenv("POSTGRES_POOL_MIN_SIZE", "1"))
+            max_size = int(os.getenv("POSTGRES_POOL_MAX_SIZE", "4"))
+            timeout = float(os.getenv("POSTGRES_POOL_TIMEOUT_SECONDS", "30"))
+            if min_size < 0 or max_size < 1 or min_size > max_size:
+                raise RuntimeError(
+                    "PostgreSQL pool sizes require 0 <= POSTGRES_POOL_MIN_SIZE <= "
+                    "POSTGRES_POOL_MAX_SIZE and POSTGRES_POOL_MAX_SIZE >= 1",
+                )
+            if timeout <= 0:
+                raise RuntimeError("POSTGRES_POOL_TIMEOUT_SECONDS must be positive")
+            pool = ConnectionPool(
+                conninfo=dsn,
+                min_size=min_size,
+                max_size=max_size,
+                timeout=timeout,
+                open=False,
+                name="ai-hot-postgres",
+            )
+            pool.open()
+            cls._pools[dsn] = pool
+            return pool
+
     @contextmanager
     def connection(self) -> Iterator[object]:
-        import psycopg
-
-        with psycopg.connect(self.dsn) as connection:
+        pool = self._pool_for(self.dsn)
+        with pool.connection() as connection:
             yield connection
 
     @contextmanager
