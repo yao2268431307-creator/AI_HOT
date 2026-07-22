@@ -83,7 +83,6 @@ test("desktop keyboard flow and chart data alternative pass WCAG AA scan", async
 
   await page.keyboard.press("/");
   await expect(page.getByLabel("搜索事件")).toBeFocused();
-  await page.getByLabel("关闭详情").click();
   const firstRow = page.locator(".event-select").first();
   await firstRow.focus();
   await page.keyboard.press("Enter");
@@ -101,8 +100,6 @@ test("mobile user can filter, watch and accept with dialog focus containment", a
   await page.goto("/");
 
   const dialog = page.getByRole("dialog");
-  await expect(dialog).toBeVisible();
-  await page.getByLabel("关闭详情").click();
   await expect(dialog).toBeHidden();
   await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
 

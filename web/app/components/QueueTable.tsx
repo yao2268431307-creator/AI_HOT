@@ -1,7 +1,7 @@
 "use client";
 
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from "@tanstack/react-table";
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { RadarEvent } from "../lib/types";
 
 const stateName: Record<string, string> = {
@@ -55,6 +55,16 @@ function Sparkline({ event, windowSize }: { event: RadarEvent; windowSize: strin
 }
 
 export function QueueTable({ events, selectedId, windowSize, onSelect }: { events: RadarEvent[]; selectedId: string; windowSize: string; onSelect: (id: string) => void }) {
+  const pageSize = 15;
+  const pageCount = Math.max(1, Math.ceil(events.length / pageSize));
+  const [page, setPage] = useState(0);
+  useEffect(() => {
+    setPage((current) => Math.min(current, pageCount - 1));
+  }, [pageCount]);
+  const visibleEvents = useMemo(
+    () => events.slice(page * pageSize, (page + 1) * pageSize),
+    [events, page],
+  );
   const columns = useMemo<ColumnDef<RadarEvent>[]>(() => [
     {
       id: "event",
@@ -84,18 +94,27 @@ export function QueueTable({ events, selectedId, windowSize, onSelect }: { event
   // TanStack Table intentionally returns callable table state; it is safe here because
   // the instance remains local and no returned function crosses a memoized boundary.
   // eslint-disable-next-line react-hooks/incompatible-library
-  const table = useReactTable({ data: events, columns, getCoreRowModel: getCoreRowModel() });
+  const table = useReactTable({ data: visibleEvents, columns, getCoreRowModel: getCoreRowModel() });
 
   return (
-    <div className="table-scroll">
-      <table className="queue-table">
-        <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
-        <tbody>{table.getRowModel().rows.map((row) => (
-          <tr key={row.id} className={row.original.id === selectedId ? "selected" : ""}>
-            {row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}
-          </tr>
-        ))}{table.getRowModel().rows.length === 0 && <tr><td colSpan={columns.length} className="empty-directory">没有符合当前筛选条件的事件。</td></tr>}</tbody>
-      </table>
+    <div className="queue-table-frame">
+      <div className="table-scroll">
+        <table className="queue-table">
+          <thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
+          <tbody>{table.getRowModel().rows.map((row) => (
+            <tr key={row.id} className={row.original.id === selectedId ? "selected" : ""}>
+              {row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}
+            </tr>
+          ))}{table.getRowModel().rows.length === 0 && <tr><td colSpan={columns.length} className="empty-directory">没有符合当前筛选条件的事件。</td></tr>}</tbody>
+        </table>
+      </div>
+      {events.length > pageSize && <nav className="queue-pagination" aria-label="研判队列分页">
+        <span>第 {page + 1} / {pageCount} 页</span>
+        <div>
+          <button type="button" disabled={page === 0} onClick={() => setPage((current) => current - 1)}>上一页</button>
+          <button type="button" disabled={page >= pageCount - 1} onClick={() => setPage((current) => current + 1)}>下一页</button>
+        </div>
+      </nav>}
     </div>
   );
 }

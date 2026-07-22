@@ -23,8 +23,8 @@ test("server-renders the intelligence workspace", async () => {
   assert.match(html, /RECORDED DEMO/);
   assert.match(html, /覆盖置信度/);
   assert.match(html, /开发者与研究生态信号 Beta/);
-  assert.match(html, /反向信号与可信边界/);
-  assert.match(html, /24H 结果/);
+  assert.match(html, /加速 \/ 已建立/);
+  assert.match(html, /只看关注/);
 });
 
 test("ships the required product views and responsive safety", async () => {
