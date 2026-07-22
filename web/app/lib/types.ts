@@ -75,6 +75,7 @@ export interface RadarEvent {
   gapResidual: number;
   firstSeen: string;
   updatedAt: string;
+  latestEvidenceAt?: string | null;
   independentSources: number;
   platforms: string[];
   signalFamilies?: Array<"discussion" | "behavior" | "official" | "research">;
@@ -165,6 +166,7 @@ export interface RadarPayload {
   generatedAt: string;
   dataMode: "live" | "recorded_demo";
   window: string;
+  sort: "priority" | "latest";
   events: RadarEvent[];
   connectors: ConnectorStatus[];
   totalEvents: number;

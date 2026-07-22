@@ -54,7 +54,7 @@ function Sparkline({ event, windowSize }: { event: RadarEvent; windowSize: strin
   );
 }
 
-export function QueueTable({ events, selectedId, windowSize, onSelect }: { events: RadarEvent[]; selectedId: string; windowSize: string; onSelect: (id: string) => void }) {
+export function QueueTable({ events, selectedId, windowSize, mode, onSelect }: { events: RadarEvent[]; selectedId: string; windowSize: string; mode: "latest" | "priority"; onSelect: (id: string) => void }) {
   const pageSize = 15;
   const pageCount = Math.max(1, Math.ceil(events.length / pageSize));
   const [page, setPage] = useState(0);
@@ -71,8 +71,8 @@ export function QueueTable({ events, selectedId, windowSize, onSelect }: { event
       header: "研判对象",
       cell: ({ row }) => (
         <button type="button" className="event-cell event-select" aria-current={row.original.id === selectedId} onClick={() => onSelect(row.original.id)}>
-          <div className="event-title">{row.original.title}</div>
-          <div className="event-meta"><span>{typeName[row.original.eventType]}</span><span>{row.original.independentSources} 个独立信源</span><span>首见 {timeAgo(row.original.firstSeen)}</span><span>变化 {timeAgo(row.original.updatedAt)}</span></div>
+          <div className="event-title">{mode === "latest" && row.original.latestEvidenceAt && Date.now() - new Date(row.original.latestEvidenceAt).getTime() <= 20 * 60_000 && <span className="new-arrival-badge">新到</span>}{row.original.title}</div>
+          <div className="event-meta"><span>{typeName[row.original.eventType]}</span><span>{row.original.independentSources} 个独立信源</span><span>首见 {timeAgo(row.original.firstSeen)}</span><span>{mode === "latest" ? "采集" : "变化"} {timeAgo(mode === "latest" ? (row.original.latestEvidenceAt ?? row.original.updatedAt) : row.original.updatedAt)}</span></div>
           <div className="row-labels">{row.original.classificationStatus === "unsupported" && <span>未支持分类</span>}{row.original.labels.slice(0, 3).map((label) => <span key={label}>{labelName[label]}</span>)}</div>
         </button>
       ),
@@ -90,7 +90,7 @@ export function QueueTable({ events, selectedId, windowSize, onSelect }: { event
     } },
     { id: "priority", header: "新增证据 / 优先理由", cell: ({ row }) => <div className="priority-reason"><b>+{row.original.newEvidenceCount ?? 0}</b><small>{row.original.queuePriorityReasons?.[0] ?? "常规复核"}</small></div> },
     { accessorKey: "velocity", header: "速度", cell: ({ row }) => <span className="velocity">{row.original.velocity > 0 ? "+" : ""}{row.original.velocity}</span> },
-  ], [onSelect, selectedId, windowSize]);
+  ], [mode, onSelect, selectedId, windowSize]);
   // TanStack Table intentionally returns callable table state; it is safe here because
   // the instance remains local and no returned function crosses a memoized boundary.
   // eslint-disable-next-line react-hooks/incompatible-library

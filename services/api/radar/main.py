@@ -9,6 +9,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -116,7 +117,9 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             app.state.http_status_classes[bucket] = app.state.http_status_classes.get(bucket, 0) + 1
             app.state.http_durations_seconds.append(time.perf_counter() - started)
 
-    def prioritized_events(events, principal: Principal):
+    def prioritized_events(
+        events, principal: Principal, sort_mode: Literal["priority", "latest"] = "priority"
+    ):
         minimum = datetime.min.replace(tzinfo=timezone.utc)
         entries = repo.list_review_queue_entries(minimum)
         event_ids = {event.id for event in events}
@@ -156,6 +159,9 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             anchor = event_anchors[event.id]
             context = priority_context.get(event.id, {})
             new_evidence_count = int(context.get("newEvidenceCount", 0))
+            latest_evidence_at = context.get("latestEvidenceAt")
+            if not isinstance(latest_evidence_at, datetime):
+                latest_evidence_at = event.updated_at if isinstance(repo, InMemoryRepository) else None
             reasons: list[str] = []
             ranks: list[int] = []
             if new_evidence_count > 0 and event.evidence_strength.value == "high":
@@ -185,7 +191,17 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             prioritized.append(event.model_copy(update={
                 "new_evidence_count": new_evidence_count, "queue_priority_score": round(priority, 2),
                 "queue_priority_reasons": reasons, "review_anchor_at": anchor,
+                "latest_evidence_at": latest_evidence_at,
             }))
+        if sort_mode == "latest":
+            return sorted(
+                prioritized,
+                key=lambda event: (
+                    -(event.latest_evidence_at or event.first_seen).timestamp(),
+                    -event.queue_priority_score,
+                    event.id,
+                ),
+            )
         return sorted(prioritized, key=lambda event: (-event.queue_priority_score, -event.updated_at.timestamp(), event.id))
 
     def runtime_health_details() -> dict[str, object]:
@@ -451,6 +467,7 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
     @app.get("/api/v1/radar", response_model=RadarPayload, response_model_by_alias=True)
     async def radar(
         window: str = Query(default="6h", pattern=r"^(1h|6h|24h|7d)$"),
+        sort: Literal["priority", "latest"] = Query(default="priority"),
         limit: int = Query(default=200, ge=1, le=500),
         principal: Principal = Depends(current_principal),
     ) -> RadarPayload:
@@ -463,11 +480,16 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
             points = [point for point in event.timeline if point.at >= cutoff]
             if event.updated_at >= cutoff or points:
                 events.append(event.model_copy(update={"timeline": points}))
-        prioritized = prioritized_events(events, principal)
+        prioritized = prioritized_events(events, principal, sort)
+        if sort == "latest":
+            prioritized = [
+                event for event in prioritized
+                if event.latest_evidence_at is not None and event.latest_evidence_at >= cutoff
+            ]
         return RadarPayload(
             generatedAt=generated_at,
             dataMode="recorded_demo" if isinstance(repo, InMemoryRepository) else "live",
-            window=window, events=prioritized[:limit], connectors=connectors,
+            window=window, sort=sort, events=prioritized[:limit], connectors=connectors,
             totalEvents=len(prioritized), limit=limit, hasMore=len(prioritized) > limit,
         )
 

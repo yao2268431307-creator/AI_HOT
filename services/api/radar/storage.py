@@ -513,16 +513,24 @@ class InMemoryRepository:
             result: dict[str, dict[str, object]] = {}
             for event_id, anchor in event_anchors.items():
                 observation_ids = self.event_observations.get(event_id, {})
-                new_evidence_count = len({
-                    observation_id
+                trusted_observations = [
+                    observation
                     for observation_id in observation_ids
                     if (observation := self.observations.get(observation_id)) is not None
                     and observation.provenance_level != "unverified_discovery"
-                    and observation.collected_at > anchor
+                ]
+                new_evidence_count = len({
+                    observation.id
+                    for observation in trusted_observations
+                    if observation.collected_at > anchor
                 })
                 runs = self.list_score_runs(event_id)[-2:]
                 result[event_id] = {
                     "newEvidenceCount": new_evidence_count,
+                    "latestEvidenceAt": max(
+                        (observation.collected_at for observation in trusted_observations),
+                        default=None,
+                    ),
                     "scoreRuns": [
                         {"payload": item.payload, "inputTo": item.input_to}
                         for item in runs
@@ -2262,14 +2270,17 @@ class PostgresRepository:
                     """WITH anchors(event_id,anchor_at) AS (
                       SELECT * FROM unnest(%s::text[],%s::timestamptz[])
                     )
-                    SELECT anchors.event_id,count(DISTINCT observations.id)
+                    SELECT anchors.event_id,
+                      count(DISTINCT observations.id) FILTER (
+                        WHERE observations.collected_at>anchors.anchor_at
+                      ),
+                      max(observations.collected_at)
                     FROM anchors
                     LEFT JOIN event_observations
                       ON event_observations.event_id=anchors.event_id
                     LEFT JOIN observations
-                      ON observations.id=event_observations.observation_id
+                     ON observations.id=event_observations.observation_id
                      AND observations.provenance_level<>'unverified_discovery'
-                     AND observations.collected_at>anchors.anchor_at
                     GROUP BY anchors.event_id""",
                     (event_ids, anchors),
                 )
@@ -2288,11 +2299,12 @@ class PostgresRepository:
                 )
                 score_rows = cursor.fetchall()
         result = {
-            event_id: {"newEvidenceCount": 0, "scoreRuns": []}
+            event_id: {"newEvidenceCount": 0, "latestEvidenceAt": None, "scoreRuns": []}
             for event_id in event_ids
         }
-        for event_id, count in evidence_rows:
+        for event_id, count, latest_evidence_at in evidence_rows:
             result[str(event_id)]["newEvidenceCount"] = int(count)
+            result[str(event_id)]["latestEvidenceAt"] = latest_evidence_at
         for event_id, payload, input_to, _ in score_rows:
             score_runs = result[str(event_id)]["scoreRuns"]
             assert isinstance(score_runs, list)

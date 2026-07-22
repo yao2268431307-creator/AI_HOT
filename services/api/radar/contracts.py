@@ -261,6 +261,7 @@ class RadarEvent(BaseModel):
     gap_residual: float = Field(alias="gapResidual")
     first_seen: datetime = Field(alias="firstSeen")
     updated_at: datetime = Field(alias="updatedAt")
+    latest_evidence_at: datetime | None = Field(default=None, alias="latestEvidenceAt")
     independent_sources: int = Field(alias="independentSources", ge=0)
     platforms: list[str]
     signal_families: list[Literal["discussion", "behavior", "official", "research"]] = Field(default_factory=list, alias="signalFamilies")
@@ -331,6 +332,7 @@ class RadarPayload(BaseModel):
     generated_at: datetime = Field(alias="generatedAt")
     data_mode: Literal["live", "recorded_demo"] = Field(alias="dataMode")
     window: str
+    sort: Literal["priority", "latest"] = "priority"
     events: list[RadarEvent]
     connectors: list[ConnectorStatus]
     total_events: int = Field(alias="totalEvents", ge=0)

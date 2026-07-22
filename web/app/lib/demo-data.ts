@@ -9,6 +9,7 @@ export const demoPayload: RadarPayload = {
   generatedAt: demoRecordedAt.toISOString(),
   dataMode: "recorded_demo",
   window: "6h",
+  sort: "latest",
   totalEvents: 5,
   limit: 200,
   hasMore: false,

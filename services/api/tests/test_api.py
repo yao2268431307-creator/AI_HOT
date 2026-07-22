@@ -36,6 +36,7 @@ def test_radar_contract_and_evidence_traceability() -> None:
         payload = response.json()
         assert payload["window"] == "6h"
         assert payload["dataMode"] == "recorded_demo"
+        assert payload["sort"] == "priority"
         assert payload["totalEvents"] == len(payload["events"])
         assert payload["limit"] == 200
         assert payload["hasMore"] is False
@@ -43,7 +44,7 @@ def test_radar_contract_and_evidence_traceability() -> None:
         assert [event["queuePriorityScore"] for event in payload["events"]] == sorted(
             (event["queuePriorityScore"] for event in payload["events"]), reverse=True,
         )
-        assert all("newEvidenceCount" in event and "queuePriorityReasons" in event for event in payload["events"])
+        assert all("newEvidenceCount" in event and "queuePriorityReasons" in event and event["latestEvidenceAt"] for event in payload["events"])
         confirmed = next(event for event in payload["events"] if event["state"] == "accelerating")
         assert len(confirmed["evidence"]) >= 3
         assert confirmed["scoreVersion"]
@@ -52,6 +53,20 @@ def test_radar_contract_and_evidence_traceability() -> None:
         evidence = http.get(f"/api/v1/topics/{confirmed['id']}/evidence")
         assert evidence.status_code == 200
         assert len(evidence.json()["items"]) >= 3
+
+
+def test_radar_latest_sort_exposes_newly_collected_order() -> None:
+    with client() as http:
+        response = http.get("/api/v1/radar?window=7d&sort=latest")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["sort"] == "latest"
+        collected_at = [
+            datetime.fromisoformat(event["latestEvidenceAt"])
+            for event in payload["events"]
+        ]
+        assert collected_at == sorted(collected_at, reverse=True)
+        assert http.get("/api/v1/radar?sort=unknown").status_code == 422
 
 
 def test_prometheus_metrics_expose_bounded_operational_signals(monkeypatch) -> None:

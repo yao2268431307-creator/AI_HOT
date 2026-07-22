@@ -35,7 +35,8 @@ async function mockApi(page: Page) {
     const url = new URL(request.url());
     const path = url.pathname;
     if (path === "/api/v1/radar") {
-      await route.fulfill({ json: { ...demoPayload, generatedAt: now, dataMode: "live" } });
+      const sort = url.searchParams.get("sort") === "priority" ? "priority" : "latest";
+      await route.fulfill({ json: { ...demoPayload, generatedAt: now, dataMode: "live", sort } });
       return;
     }
     if (path === "/api/v1/stream") {
@@ -92,6 +93,19 @@ test("desktop keyboard flow and chart data alternative pass WCAG AA scan", async
   await page.getByText("查看图表数据表").click();
   await expect(page.getByRole("table").last()).toContainText("讨论");
   await assertNoWcagAaViolations(page);
+});
+
+test("review queue separates latest arrivals from priority triage", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/");
+  await expect(page.getByText("LIVE PIPELINE")).toBeVisible();
+  const latest = page.getByRole("button", { name: "最新进入" });
+  const priority = page.getByRole("button", { name: "研判优先" });
+  await expect(latest).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText("新到不等于热点")).toBeVisible();
+  await priority.click();
+  await expect(priority).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText("优先级不等于最终结论")).toBeVisible();
 });
 
 test("mobile user can filter, watch and accept with dialog focus containment", async ({ page }) => {

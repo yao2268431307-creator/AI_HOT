@@ -575,6 +575,7 @@ export function RadarShell() {
   const [sourceReviewing, setSourceReviewing] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [windowSize, setWindowSize] = useState("6H");
+  const [queueMode, setQueueMode] = useState<"latest" | "priority">("latest");
   const [mobileNav, setMobileNav] = useState(false);
   const [mobileDetail, setMobileDetail] = useState(false);
   const [filters, setFilters] = useState<Filters>({ state: "all", eventType: "all", evidence: "all" });
@@ -630,7 +631,7 @@ export function RadarShell() {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 2500);
       try {
-        const response = await fetch(`${base}/api/v1/radar?window=${windowSize.toLowerCase()}`, { signal: controller.signal });
+        const response = await fetch(`${base}/api/v1/radar?window=${windowSize.toLowerCase()}&sort=${queueMode}`, { signal: controller.signal });
         if (!response.ok) throw new Error("API unavailable");
         const data = await response.json() as RadarPayload;
         if (!disposed && Array.isArray(data.events)) {
@@ -651,7 +652,7 @@ export function RadarShell() {
     stream.addEventListener("radar", () => void load());
     stream.onerror = () => { if (hasLiveData) setDataMode("stale"); };
     return () => { disposed = true; window.clearInterval(poll); stream.close(); };
-  }, [windowSize]);
+  }, [queueMode, windowSize]);
 
   useEffect(() => {
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
@@ -789,7 +790,11 @@ export function RadarShell() {
   const gap = payload.events.filter((e) => e.labels.includes("attention_behavior_gap")).length;
   const concentrated = payload.events.filter((e) => e.labels.includes("platform_concentrated")).length;
   const generatedAtMs = new Date(payload.generatedAt).getTime();
-  const recentlyUpdated = payload.events.filter((event) => generatedAtMs - new Date(event.updatedAt).getTime() <= 3_600_000).length;
+  const recentlyUpdated = payload.events.filter((event) => generatedAtMs - new Date(queueMode === "latest" ? (event.latestEvidenceAt ?? event.updatedAt) : event.updatedAt).getTime() <= 3_600_000).length;
+  const newestArrivalAt = payload.events.reduce<string | null>((latest, event) => {
+    const candidate = event.latestEvidenceAt ?? event.updatedAt;
+    return latest === null || new Date(candidate).getTime() > new Date(latest).getTime() ? candidate : latest;
+  }, null);
   const selectEvent = useCallback((id: string) => {
     detailTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (id !== selectedId) {
@@ -853,16 +858,23 @@ export function RadarShell() {
             {(embeddingDegraded || storageLimited || dataMode === "stale") && <p>{storageLimited ? "本地证据已达到容量上限；大体积正文将只保存占位记录。" : embeddingDegraded ? "多语模型暂不可用；系统已降低覆盖置信度，不会输出低证据强告警。" : "采集链路暂时失联，当前页面保留最后一次成功快照。"}</p>}
           </section>}
           {view === "queue" && <div className="content-view queue-view">
-            <div className="view-heading"><div><div className="eyebrow">REVIEW QUEUE / {windowSize}</div><h1>AI 热点研判队列</h1><p>优先处理高速度、高证据、状态刚发生变化的事件。</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} aria-pressed={windowSize === item} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
+            <div className="view-heading"><div><div className="eyebrow">INTELLIGENCE QUEUE / {windowSize}</div><h1>AI 热点研判队列</h1><p>{queueMode === "latest" ? "先看刚进入系统的候选情报，再判断它是否构成热点。" : "优先处理高速度、高证据、状态刚发生变化的事件。"}</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} aria-pressed={windowSize === item} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
             <div className="summary-grid">
-              <div className="summary-card"><span>待研判事件</span><b>{payload.events.length}</b><small><i className="dot-blue" /> {recentlyUpdated} 个事件在 1 小时内更新</small></div>
+              <div className="summary-card"><span>{queueMode === "latest" ? "窗口内新情报" : "待研判事件"}</span><b>{payload.totalEvents}</b><small><i className="dot-blue" /> {recentlyUpdated} 个事件在 1 小时内{queueMode === "latest" ? "采集" : "更新"}</small></div>
               <div className="summary-card"><span>加速 / 已建立</span><b className="tone-green">{strongLifecycle}</b><small>满足对应事件类型的阶段门槛</small></div>
               <div className="summary-card"><span>剪刀差风险</span><b className="tone-red">{gap}</b><small>含协同发布风险</small></div>
               <div className="summary-card"><span>单平台集中</span><b className="tone-amber">{concentrated}</b><small>尚未跨平台迁移</small></div>
             </div>
             <section className="queue-section">
-              <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input ref={searchInput} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索事件、平台或信源…" aria-label="搜索事件" /></div><button className={`filter-button watch-toggle ${showWatched ? "active" : ""}`} aria-pressed={showWatched} onClick={() => setShowWatched((value) => !value)}><Bell size={14} />只看关注 <span>{watchedIds.size}</span></button><FilterDialog filters={filters} onChange={applyFilters} /><div className="queue-count">显示 {events.length} / {payload.events.length}</div></div>
-              <QueueTable key={`${query}:${filters.state}:${filters.eventType}:${filters.evidence}:${showWatched}`} events={events} selectedId={selectedId} windowSize={windowSize} onSelect={selectEvent} />
+              <div className="queue-mode-bar">
+                <div className="queue-mode-switch" role="group" aria-label="队列排序方式">
+                  <button type="button" className={queueMode === "latest" ? "active" : ""} aria-pressed={queueMode === "latest"} onClick={() => setQueueMode("latest")}>最新进入</button>
+                  <button type="button" className={queueMode === "priority" ? "active" : ""} aria-pressed={queueMode === "priority"} onClick={() => setQueueMode("priority")}>研判优先</button>
+                </div>
+                <div className="queue-mode-explainer"><i className={queueMode === "latest" ? "freshness-dot" : "priority-dot"} /><span>{queueMode === "latest" ? `过去 ${windowSize} 采集到 ${payload.totalEvents} 个候选${newestArrivalAt ? ` · 最近一条 ${timeAgo(newestArrivalAt)}` : ""}` : "按新增证据、生命周期变化和关注状态排序"}</span><small>{queueMode === "latest" ? "新到不等于热点" : "优先级不等于最终结论"}</small></div>
+              </div>
+              <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input ref={searchInput} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索事件、平台或信源…" aria-label="搜索事件" /></div><button className={`filter-button watch-toggle ${showWatched ? "active" : ""}`} aria-pressed={showWatched} onClick={() => setShowWatched((value) => !value)}><Bell size={14} />只看关注 <span>{watchedIds.size}</span></button><FilterDialog filters={filters} onChange={applyFilters} /><div className="queue-count">显示 {events.length} / {payload.totalEvents}</div></div>
+              <QueueTable key={`${queueMode}:${query}:${filters.state}:${filters.eventType}:${filters.evidence}:${showWatched}`} events={events} selectedId={selectedId} windowSize={windowSize} mode={queueMode} onSelect={selectEvent} />
             </section>
           </div>}
           {view === "radar" && <div className="content-view radar-view">
