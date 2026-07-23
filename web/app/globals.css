@@ -51,6 +51,8 @@ button:active:not(:disabled), [role="button"]:active { transform: scale(.985); }
 .system-status i { width: 7px; height: 7px; border-radius: 50%; }
 .pulse-live { background: var(--green); }
 .pulse-demo { background: var(--amber); }
+.pulse-loading { background: var(--blue); }
+.pulse-offline { background: var(--red); }
 .system-status em { color: var(--line-strong); font-style: normal; }
 .top-actions { margin-left: auto; padding-right: 18px; display: flex; align-items: center; gap: 9px; }
 .icon-button { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); cursor: pointer; }
@@ -128,6 +130,11 @@ button:active:not(:disabled), [role="button"]:active { transform: scale(.985); }
 .watch-toggle.active, .action-watched { border-color: rgba(22, 124, 105, .30) !important; color: var(--green) !important; background: rgba(22, 124, 105, .055) !important; }
 .queue-count { margin-left: auto; color: var(--faint); font: 9px var(--mono); }
 .queue-table-frame { min-width: 0; }
+.data-connection-state { min-height: 230px; padding: 32px; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--faint); text-align: left; }
+.data-connection-state svg { flex: none; color: var(--blue); }
+.data-connection-state b, .data-connection-state span { display: block; }
+.data-connection-state b { color: var(--text); font-size: 12px; }
+.data-connection-state span { margin-top: 5px; font-size: 10px; }
 .table-scroll { overflow-x: auto; }
 .queue-table { width: 100%; min-width: 1120px; border-collapse: collapse; }
 .queue-table th { position: sticky; top: 0; z-index: 1; height: 38px; padding: 0 15px; text-align: left; color: var(--faint); background: #f5f7f9; border-bottom: 1px solid var(--line); font: 8px var(--mono); letter-spacing: .055em; text-transform: uppercase; }

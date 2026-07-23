@@ -69,6 +69,24 @@ def test_radar_latest_sort_exposes_newly_collected_order() -> None:
         assert http.get("/api/v1/radar?sort=unknown").status_code == 422
 
 
+def test_radar_latest_limits_full_priority_work_to_returned_events() -> None:
+    class TrackingRepository(InMemoryRepository):
+        reviewed_event_count = 0
+
+        def review_priority_context(self, event_anchors: dict[str, datetime]):
+            self.reviewed_event_count = len(event_anchors)
+            return super().review_priority_context(event_anchors)
+
+    repository = TrackingRepository()
+    with TestClient(create_app(repository)) as http:
+        response = http.get("/api/v1/radar?window=7d&sort=latest&limit=1")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totalEvents"] >= 5
+    assert len(payload["events"]) == 1
+    assert repository.reviewed_event_count == 1
+
+
 def test_prometheus_metrics_expose_bounded_operational_signals(monkeypatch) -> None:
     repository = InMemoryRepository()
     app = create_app(repository)

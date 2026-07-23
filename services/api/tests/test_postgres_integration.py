@@ -445,6 +445,7 @@ async def test_postgres_score_revisions_are_append_only_replayable_and_bind_avai
         assert runs[-1].feature_registry_digest.startswith("sha256:")
         priority = repository.review_priority_context({event.id: first.collected_at})[event.id]
         assert len(priority["scoreRuns"]) == 2
+        assert repository.latest_evidence_times({event.id})[event.id] == second.collected_at
         embedding = [1.0, *([0.0] * 1023)]
         repository.save_event_embedding(event.id, "integration-bge:1024", event.title, embedding)
         loaded_embeddings = repository.load_event_embeddings(

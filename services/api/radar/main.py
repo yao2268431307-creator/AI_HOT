@@ -475,17 +475,37 @@ def create_app(repository: InMemoryRepository | PostgresRepository | None = None
         generated_at = datetime.now(timezone.utc)
         window_delta = {"1h": timedelta(hours=1), "6h": timedelta(hours=6), "24h": timedelta(hours=24), "7d": timedelta(days=7)}[window]
         cutoff = generated_at - window_delta
+        stored_events = repo.list_events()
+        if sort == "latest":
+            latest_times = repo.latest_evidence_times({event.id for event in stored_events})
+            latest_candidates = [
+                event.model_copy(update={
+                    "timeline": [point for point in event.timeline if point.at >= cutoff],
+                    "latest_evidence_at": latest_times[event.id],
+                })
+                for event in stored_events
+                if event.id in latest_times and latest_times[event.id] >= cutoff
+            ]
+            latest_candidates.sort(key=lambda event: (-(event.latest_evidence_at or event.first_seen).timestamp(), event.id))
+            total_events = len(latest_candidates)
+            if total_events > limit:
+                boundary_at = latest_candidates[limit - 1].latest_evidence_at
+                selected = [event for event in latest_candidates if event.latest_evidence_at >= boundary_at]
+            else:
+                selected = latest_candidates
+            prioritized = prioritized_events(selected, principal, sort)[:limit]
+            return RadarPayload(
+                generatedAt=generated_at,
+                dataMode="recorded_demo" if isinstance(repo, InMemoryRepository) else "live",
+                window=window, sort=sort, events=prioritized, connectors=connectors,
+                totalEvents=total_events, limit=limit, hasMore=total_events > limit,
+            )
         events = []
-        for event in repo.list_events():
+        for event in stored_events:
             points = [point for point in event.timeline if point.at >= cutoff]
             if event.updated_at >= cutoff or points:
                 events.append(event.model_copy(update={"timeline": points}))
         prioritized = prioritized_events(events, principal, sort)
-        if sort == "latest":
-            prioritized = [
-                event for event in prioritized
-                if event.latest_evidence_at is not None and event.latest_evidence_at >= cutoff
-            ]
         return RadarPayload(
             generatedAt=generated_at,
             dataMode="recorded_demo" if isinstance(repo, InMemoryRepository) else "live",

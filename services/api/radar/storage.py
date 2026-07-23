@@ -538,6 +538,22 @@ class InMemoryRepository:
                 }
             return result
 
+    def latest_evidence_times(self, event_ids: set[str]) -> dict[str, datetime]:
+        with self._lock:
+            result: dict[str, datetime] = {}
+            for event_id in event_ids:
+                trusted_times = [
+                    observation.collected_at
+                    for observation_id in self.event_observations.get(event_id, {})
+                    if (observation := self.observations.get(observation_id)) is not None
+                    and observation.provenance_level != "unverified_discovery"
+                ]
+                event = self.events.get(event_id)
+                latest = max(trusted_times, default=event.updated_at if event else None)
+                if latest is not None:
+                    result[event_id] = latest
+            return result
+
     def load_event_embeddings(
         self, event_titles: dict[str, str], model_version: str, dimensions: int
     ) -> dict[str, list[float]]:
@@ -2310,6 +2326,23 @@ class PostgresRepository:
             assert isinstance(score_runs, list)
             score_runs.append({"payload": payload, "inputTo": input_to})
         return result
+
+    def latest_evidence_times(self, event_ids: set[str]) -> dict[str, datetime]:
+        if not event_ids:
+            return {}
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT event_observations.event_id,max(observations.collected_at)
+                    FROM event_observations
+                    JOIN observations ON observations.id=event_observations.observation_id
+                    WHERE event_observations.event_id=ANY(%s)
+                      AND observations.provenance_level<>'unverified_discovery'
+                    GROUP BY event_observations.event_id""",
+                    (list(event_ids),),
+                )
+                rows = cursor.fetchall()
+        return {str(event_id): collected_at for event_id, collected_at in rows}
 
     def load_event_embeddings(
         self, event_titles: dict[str, str], model_version: str, dimensions: int

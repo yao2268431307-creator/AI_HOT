@@ -7,7 +7,7 @@ const receipt = (operation: string) => ({
   id: crypto.randomUUID(), status: "completed", operation, createdAt: now,
 });
 
-async function mockApi(page: Page) {
+async function mockApi(page: Page, options: { radarStatus?: number } = {}) {
   await page.addInitScript(() => {
     class StableEventSource {
       static readonly CONNECTING = 0;
@@ -35,6 +35,10 @@ async function mockApi(page: Page) {
     const url = new URL(request.url());
     const path = url.pathname;
     if (path === "/api/v1/radar") {
+      if (options.radarStatus) {
+        await route.fulfill({ status: options.radarStatus, json: { detail: "radar unavailable" } });
+        return;
+      }
       const sort = url.searchParams.get("sort") === "priority" ? "priority" : "latest";
       await route.fulfill({ json: { ...demoPayload, generatedAt: now, dataMode: "live", sort } });
       return;
@@ -106,6 +110,15 @@ test("review queue separates latest arrivals from priority triage", async ({ pag
   await priority.click();
   await expect(priority).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByText("优先级不等于最终结论")).toBeVisible();
+});
+
+test("radar failure shows an honest offline state without demo rows", async ({ page }) => {
+  await mockApi(page, { radarStatus: 503 });
+  await page.goto("/");
+  await expect(page.getByText("DATA OFFLINE")).toBeVisible();
+  await expect(page.getByText("真实数据暂不可用", { exact: true })).toBeVisible();
+  await expect(page.locator(".event-select")).toHaveCount(0);
+  await expect(page.getByText("RECORDED DEMO")).toHaveCount(0);
 });
 
 test("review queue sorts the full result set from table headers", async ({ page }) => {

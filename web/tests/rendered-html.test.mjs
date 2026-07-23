@@ -20,7 +20,7 @@ test("server-renders the intelligence workspace", async () => {
   assert.match(html, /AI 热点研判队列/);
   assert.match(html, /研判队列/);
   assert.match(html, /信源治理/);
-  assert.match(html, /RECORDED DEMO/);
+  assert.match(html, /CONNECTING/);
   assert.match(html, /覆盖置信度/);
   assert.match(html, /开发者与研究生态信号 Beta/);
   assert.match(html, /加速 \/ 已建立/);

@@ -12,6 +12,7 @@ import { QueueTable } from "./QueueTable";
 const RadarChart = lazy(() => import("./RadarChart").then((module) => ({ default: module.RadarChart })));
 
 type View = "queue" | "radar" | "sources" | "coverage" | "method";
+type DataMode = "loading" | "live" | "stale" | "offline" | "demo";
 type Filters = { state: "all" | LifecycleState; eventType: "all" | RadarEvent["eventType"]; evidence: "all" | RadarEvent["evidenceStrength"] };
 type InteractionPayload = {
   kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled";
@@ -21,6 +22,7 @@ type InteractionPayload = {
   metadata: Record<string, string | number | boolean>;
 };
 const interactionOutboxKey = "signal-ai-interaction-outbox-v1";
+const initialPayload: RadarPayload = { ...demoPayload, events: [], totalEvents: 0, hasMore: false };
 
 function readInteractionOutbox(): InteractionPayload[] {
   try {
@@ -555,11 +557,11 @@ function MethodView() {
 }
 
 export function RadarShell() {
-  const [payload, setPayload] = useState<RadarPayload>(demoPayload);
-  const [dataMode, setDataMode] = useState<"live" | "stale" | "demo">("demo");
+  const [payload, setPayload] = useState<RadarPayload>(initialPayload);
+  const [dataMode, setDataMode] = useState<DataMode>("loading");
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
   const [view, setView] = useState<View>("queue");
-  const [selectedId, setSelectedId] = useState(demoPayload.events[0].id);
+  const [selectedId, setSelectedId] = useState("");
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailAssessment, setDetailAssessment] = useState<EventAssessment | null>(null);
   const [detailDecisionContext, setDetailDecisionContext] = useState<DecisionContext | null>(null);
@@ -585,6 +587,7 @@ export function RadarShell() {
   const menuButton = useRef<HTMLButtonElement>(null);
   const detailTrigger = useRef<HTMLElement | null>(null);
   const interactionSession = useRef("");
+  const liveDataSeen = useRef(false);
   const recordInteraction = useCallback(async (kind: "detail_opened" | "evidence_opened" | "triage_submitted" | "review_segment_closed" | "review_heartbeat" | "watch_toggled", eventId: string, metadata: Record<string, string | number | boolean> = {}) => {
     if (!interactionSession.current) {
       const existing = window.sessionStorage.getItem("signal-ai-review-session");
@@ -626,31 +629,34 @@ export function RadarShell() {
   useEffect(() => {
     const base = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8017";
     let disposed = false;
-    let hasLiveData = false;
+    let requestInFlight = false;
     const load = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
       const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 2500);
+      const timeout = window.setTimeout(() => controller.abort(), 15_000);
       try {
         const response = await fetch(`${base}/api/v1/radar?window=${windowSize.toLowerCase()}&sort=${queueMode}`, { signal: controller.signal });
         if (!response.ok) throw new Error("API unavailable");
         const data = await response.json() as RadarPayload;
         if (!disposed && Array.isArray(data.events)) {
-          hasLiveData = data.dataMode === "live";
+          if (data.dataMode === "live") liveDataSeen.current = true;
           setPayload(data);
           setSelectedId((current) => data.events.some((item) => item.id === current) ? current : (data.events[0]?.id ?? ""));
           setDataMode(data.dataMode === "recorded_demo" ? "demo" : "live");
         }
       } catch {
-        if (!disposed) setDataMode(hasLiveData ? "stale" : "demo");
+        if (!disposed) setDataMode(liveDataSeen.current ? "stale" : "offline");
       } finally {
         window.clearTimeout(timeout);
+        requestInFlight = false;
       }
     };
     void load();
     const poll = window.setInterval(load, 60_000);
     const stream = new EventSource(`${base}/api/v1/stream`);
     stream.addEventListener("radar", () => void load());
-    stream.onerror = () => { if (hasLiveData) setDataMode("stale"); };
+    stream.onerror = () => { if (liveDataSeen.current) setDataMode("stale"); };
     return () => { disposed = true; window.clearInterval(poll); stream.close(); };
   }, [queueMode, windowSize]);
 
@@ -784,6 +790,7 @@ export function RadarShell() {
   ), [events]);
   const selected = events.find((event) => event.id === selectedId);
   const localMode = runtimeHealth?.runtimeProfile === "local";
+  const connectionIssue = dataMode === "stale" || dataMode === "offline";
   const embeddingDegraded = localMode && ["degraded", "disabled"].includes(runtimeHealth?.embedding.state ?? "not_started");
   const storageLimited = runtimeHealth?.evidenceStorage?.capacityState === "limited";
   const strongLifecycle = payload.events.filter((e) => e.state === "accelerating" || e.state === "established").length;
@@ -819,6 +826,14 @@ export function RadarShell() {
     if (watched) next.add(eventId); else next.delete(eventId);
     return next;
   }), []);
+  const pipelineLabel = dataMode === "live" ? (localMode ? "LOCAL PIPELINE" : "LIVE PIPELINE")
+    : dataMode === "stale" ? "POLLING / STALE"
+      : dataMode === "offline" ? "DATA OFFLINE"
+        : dataMode === "loading" ? "CONNECTING" : "RECORDED DEMO";
+  const mobilePipelineLabel = dataMode === "live" ? (localMode ? "LOCAL" : "LIVE")
+    : dataMode === "stale" ? "STALE" : dataMode === "offline" ? "OFFLINE" : dataMode === "loading" ? "CONNECT" : "DEMO";
+  const pipelineTime = dataMode === "loading" ? "等待真实数据"
+    : dataMode === "offline" ? "真实数据不可用" : `更新 ${timeAgo(payload.generatedAt)}`;
 
   return (
     <Tooltip.Provider delayDuration={250}>
@@ -826,8 +841,8 @@ export function RadarShell() {
         <header className="topbar">
           <button ref={menuButton} className="mobile-menu icon-button" onClick={() => setMobileNav((v) => !v)} aria-label={mobileNav ? "关闭导航" : "打开导航"} aria-expanded={mobileNav} aria-controls="mobile-navigation"><Menu size={19} /></button>
           <div className="brand"><span className="brand-mark"><Radar size={19} /></span><b>SIGNAL<span>{"//"}</span>AI</b><small>开发者与研究生态信号 Beta</small></div>
-          <div className="system-status"><i className={dataMode === "live" ? "pulse-live" : "pulse-demo"} /><span>{dataMode === "live" ? (localMode ? "LOCAL PIPELINE" : "LIVE PIPELINE") : dataMode === "stale" ? "POLLING / STALE" : "RECORDED DEMO"}</span><em>·</em><span>更新 {timeAgo(payload.generatedAt)}</span></div>
-          <span className="mobile-pipeline-status">{dataMode === "live" ? (localMode ? "LOCAL" : "LIVE") : dataMode === "stale" ? "STALE" : "DEMO"}</span>
+          <div className="system-status"><i className={dataMode === "live" ? "pulse-live" : dataMode === "loading" ? "pulse-loading" : dataMode === "demo" ? "pulse-demo" : "pulse-offline"} /><span>{pipelineLabel}</span><em>·</em><span>{pipelineTime}</span></div>
+          <span className="mobile-pipeline-status">{mobilePipelineLabel}</span>
           <div className="top-actions">
             <Tooltip.Root><Tooltip.Trigger asChild><button className="icon-button" aria-label="搜索" onClick={() => { setView("queue"); window.setTimeout(() => searchInput.current?.focus(), 0); }}><Search size={17} /></button></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip">快捷搜索 <kbd>/</kbd><Tooltip.Arrow className="tooltip-arrow" /></Tooltip.Content></Tooltip.Portal></Tooltip.Root>
             <AlertRuleDialog localMode={localMode} />
@@ -848,14 +863,14 @@ export function RadarShell() {
         </aside>
 
         <main className={`main ${detailOpen && (view === "queue" || view === "radar") ? "with-detail" : ""}`}>
-          {localMode && <section className={`local-runtime-banner ${embeddingDegraded || storageLimited || dataMode === "stale" ? "local-runtime-warning" : ""}`} aria-live="polite">
+          {localMode && <section className={`local-runtime-banner ${embeddingDegraded || storageLimited || connectionIssue ? "local-runtime-warning" : ""}`} aria-live="polite">
             <div><ShieldCheck size={16} /><b>本地零订阅模式</b><span>PostgreSQL + 本地证据 + 本地多语模型</span></div>
             <div className="local-runtime-facts">
               <span>外部预算 <b>¥0</b></span>
               <span>模型 <b>{runtimeHealth?.embedding.state === "ready" ? `就绪 · ${runtimeHealth.embedding.device ?? "auto"}` : runtimeHealth?.embedding.state === "not_loaded" ? "等待首次采集" : "降级"}</b></span>
               <span>采集 <b>{runtimeHealth?.lastCollectionFinishedAt ? timeAgo(runtimeHealth.lastCollectionFinishedAt) : "等待首轮"}</b></span>
             </div>
-            {(embeddingDegraded || storageLimited || dataMode === "stale") && <p>{storageLimited ? "本地证据已达到容量上限；大体积正文将只保存占位记录。" : embeddingDegraded ? "多语模型暂不可用；系统已降低覆盖置信度，不会输出低证据强告警。" : "采集链路暂时失联，当前页面保留最后一次成功快照。"}</p>}
+            {(embeddingDegraded || storageLimited || connectionIssue) && <p>{storageLimited ? "本地证据已达到容量上限；大体积正文将只保存占位记录。" : dataMode === "offline" ? "真实数据接口暂不可用；页面不会使用演示数据冒充实时结果，将继续自动重试。" : dataMode === "stale" ? "实时接口暂时失联；当前页面保留最后一次成功的真实快照。" : "多语模型暂不可用；系统已降低覆盖置信度，不会输出低证据强告警。"}</p>}
           </section>}
           {view === "queue" && <div className="content-view queue-view">
             <div className="view-heading"><div><div className="eyebrow">INTELLIGENCE QUEUE / {windowSize}</div><h1>AI 热点研判队列</h1><p>{queueMode === "latest" ? "先看刚进入系统的候选情报，再判断它是否构成热点。" : "优先处理高速度、高证据、状态刚发生变化的事件。"}</p></div><div className="window-switch">{["1H", "6H", "24H", "7D"].map((item) => <button className={windowSize === item ? "active" : ""} aria-pressed={windowSize === item} onClick={() => setWindowSize(item)} key={item}>{item}</button>)}</div></div>
@@ -871,10 +886,12 @@ export function RadarShell() {
                   <button type="button" className={queueMode === "latest" ? "active" : ""} aria-pressed={queueMode === "latest"} onClick={() => setQueueMode("latest")}>最新进入</button>
                   <button type="button" className={queueMode === "priority" ? "active" : ""} aria-pressed={queueMode === "priority"} onClick={() => setQueueMode("priority")}>研判优先</button>
                 </div>
-                <div className="queue-mode-explainer"><i className={queueMode === "latest" ? "freshness-dot" : "priority-dot"} /><span>{queueMode === "latest" ? `过去 ${windowSize} 采集到 ${payload.totalEvents} 个候选${newestArrivalAt ? ` · 最近一条 ${timeAgo(newestArrivalAt)}` : ""}` : "按新增证据、生命周期变化和关注状态排序"}</span><small>{queueMode === "latest" ? "新到不等于热点" : "优先级不等于最终结论"}</small></div>
+                <div className="queue-mode-explainer"><i className={queueMode === "latest" ? "freshness-dot" : "priority-dot"} /><span>{dataMode === "loading" ? "正在连接真实热点数据…" : dataMode === "offline" ? "真实数据暂不可用；未使用演示内容替代" : queueMode === "latest" ? `过去 ${windowSize} 采集到 ${payload.totalEvents} 个候选${newestArrivalAt ? ` · 最近一条 ${timeAgo(newestArrivalAt)}` : ""}` : "按新增证据、生命周期变化和关注状态排序"}</span><small>{queueMode === "latest" ? "新到不等于热点" : "优先级不等于最终结论"}</small></div>
               </div>
               <div className="queue-toolbar"><div className="search-box"><Search size={15} /><input ref={searchInput} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索事件、平台或信源…" aria-label="搜索事件" /></div><button className={`filter-button watch-toggle ${showWatched ? "active" : ""}`} aria-pressed={showWatched} onClick={() => setShowWatched((value) => !value)}><Bell size={14} />只看关注 <span>{watchedIds.size}</span></button><FilterDialog filters={filters} onChange={applyFilters} /><div className="queue-count">显示 {events.length} / {payload.totalEvents}</div></div>
-              <QueueTable key={queueMode} events={events} selectedId={selectedId} windowSize={windowSize} mode={queueMode} scopeKey={`${query}:${filters.state}:${filters.eventType}:${filters.evidence}:${showWatched}`} onSelect={selectEvent} />
+              {events.length === 0 && (dataMode === "loading" || dataMode === "offline")
+                ? <div className="data-connection-state" role="status"><Activity size={18} /><div><b>{dataMode === "loading" ? "正在读取真实数据" : "真实数据暂不可用"}</b><span>{dataMode === "loading" ? "首次连接可能需要几秒，页面不会先展示演示条目。" : "系统每分钟自动重试；数据库内容没有被清空。"}</span></div></div>
+                : <QueueTable key={queueMode} events={events} selectedId={selectedId} windowSize={windowSize} mode={queueMode} scopeKey={`${query}:${filters.state}:${filters.eventType}:${filters.evidence}:${showWatched}`} onSelect={selectEvent} />}
             </section>
           </div>}
           {view === "radar" && <div className="content-view radar-view">
